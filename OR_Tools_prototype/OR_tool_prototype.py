@@ -1,0 +1,569 @@
+INITIAL_GRACE_PERIOD = 600  # 10 minutes
+from ortools.constraint_solver import routing_enums_pb2
+from ortools.constraint_solver import pywrapcp
+import numpy as np
+import json
+from typing import Dict, Any, List
+from datetime import datetime, timezone, timedelta
+
+def parse_iso_to_seconds_from_now(iso_time: str, grace_period=INITIAL_GRACE_PERIOD):
+    """Convert ISO time string to seconds from now, and flag if already late.
+    If late, return (0, grace_period) as the time window.
+    """
+    if iso_time is None:
+        return None, False
+    dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00")).astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    diff = (dt - now).total_seconds()
+    print(f"[DEBUG] Parsed time for {iso_time}: {diff} seconds from now")
+    is_late = diff < 0
+    if is_late:
+        return (0, grace_period), True
+    return max(0, int(diff)), False
+
+def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], current_tasks: List[Dict[str, Any]], grace_period=INITIAL_GRACE_PERIOD):
+    """
+    Build data model dictionary compatible with solve_single_agent_routing() from structured inputs.
+    """
+    data = {}
+
+    # Build coordinates list and map agent_id to index
+    coordinates = []
+    agent_starts = []
+    agent_id_to_index = {}
+    for idx, agent in enumerate(agents):
+        loc = agent.get("current_location", None)
+        if loc is None or len(loc) != 2:
+            raise ValueError(f"Agent {agent.get('driver_id', idx)} missing or invalid location")
+        coordinates.append(tuple(loc))
+        agent_starts.append(idx)
+        agent_id_to_index[agent.get("driver_id", str(idx))] = idx
+
+    # Tasks: Each task has pickup and delivery locations and time windows
+    # We will create unique locations list for pickups and deliveries
+    # Also build pickups_deliveries tuples referencing indices in coordinates list
+
+    # Start indices for tasks will be after agent start locations
+    location_index = len(coordinates)
+    location_map = {}  # (type, task_id) -> index in coordinates
+
+    pickups_deliveries = []
+    time_windows = {}
+    
+    # NEW: Track node metadata for detailed route output
+    node_metadata = {}  # node_index -> {task_id, type, deadline_iso, is_new_task}
+
+    # Helper to add location if not already added
+    def add_location(loc_tuple):
+        nonlocal location_index
+        if loc_tuple not in location_map:
+            location_map[loc_tuple] = location_index
+            coordinates.append(loc_tuple)
+            location_index += 1
+        return location_map[loc_tuple]
+
+    # Process all current tasks plus the new task (for time windows, we need all tasks)
+    all_tasks = current_tasks.copy()
+    # Only add new_task if not already in current_tasks by id
+    if all(t.get("id") != new_task.get("id") for t in current_tasks):
+        all_tasks.append(new_task)
+
+    # We will map id to (pickup_index, delivery_index) or (None, delivery_index) for DELIVERY_ONLY
+    task_id_to_indices = {}
+
+    # For time windows, we will convert ISO time strings to seconds from now, with 0 as earliest start
+    # We will set a large max window (e.g. 5000) for upper bound if no limit or far future
+
+    MAX_TIME = 5000
+    late_flags = {}
+
+    for task in all_tasks:
+        tid = task.get("id")
+        ttype = task.get("job_type", "PAIRED")
+        pickup_loc = task.get("restaurant_location")
+        delivery_loc = task.get("delivery_location")
+        pickup_before = task.get("pickup_before")
+        delivery_before = task.get("delivery_before")
+        is_new_task = tid == new_task.get("id")
+
+        pickup_index = None
+        delivery_index = None
+
+        if ttype == "DELIVERY_ONLY":
+            # Only delivery location and window
+            if delivery_loc is None or len(delivery_loc) != 2:
+                raise ValueError(f"Task {tid} missing valid delivery_location")
+            delivery_index = add_location(tuple(delivery_loc))
+            
+            # Store metadata
+            node_metadata[delivery_index] = {
+                "task_id": tid,
+                "type": "delivery",
+                "deadline_iso": delivery_before,
+                "is_new_task": is_new_task
+            }
+            
+            # Time window only for delivery
+            if delivery_before:
+                delivery_tw_end, delivery_late = parse_iso_to_seconds_from_now(delivery_before, grace_period)
+                if isinstance(delivery_tw_end, tuple):  # For late: (0, grace_period)
+                    delivery_tw = delivery_tw_end
+                    # Compute and store the actual deadline value, even if negative, clamped to 0
+                    dt = datetime.fromisoformat(delivery_before.replace("Z", "+00:00")).astimezone(timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    deadline_seconds = int((dt - now).total_seconds())
+                    late_flags[delivery_index] = max(deadline_seconds, 0)
+                else:
+                    delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
+                    late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
+            else:
+                delivery_tw, _ = (0, MAX_TIME), False
+                late_flags[delivery_index] = MAX_TIME
+            time_windows[delivery_index] = delivery_tw
+            task_id_to_indices[tid] = (None, delivery_index)
+        else:
+            # PAIRED or default: both pickup and delivery
+            if pickup_loc is None or len(pickup_loc) != 2:
+                raise ValueError(f"Task {tid} missing valid restaurant_location")
+            if delivery_loc is None or len(delivery_loc) != 2:
+                raise ValueError(f"Task {tid} missing valid delivery_location")
+            pickup_index = add_location(tuple(pickup_loc))
+            delivery_index = add_location(tuple(delivery_loc))
+
+            # Store metadata
+            node_metadata[pickup_index] = {
+                "task_id": tid,
+                "type": "pickup",
+                "deadline_iso": pickup_before,
+                "is_new_task": is_new_task
+            }
+            node_metadata[delivery_index] = {
+                "task_id": tid,
+                "type": "delivery", 
+                "deadline_iso": delivery_before,
+                "is_new_task": is_new_task
+            }
+
+            if pickup_before:
+                pickup_tw_end, pickup_late = parse_iso_to_seconds_from_now(pickup_before, grace_period)
+                if isinstance(pickup_tw_end, tuple):
+                    pickup_tw = pickup_tw_end
+                    dt = datetime.fromisoformat(pickup_before.replace("Z", "+00:00")).astimezone(timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    deadline_seconds = int((dt - now).total_seconds())
+                    late_flags[pickup_index] = max(deadline_seconds, 0)
+                else:
+                    pickup_tw = (0, pickup_tw_end if pickup_tw_end is not None else MAX_TIME)
+                    late_flags[pickup_index] = pickup_tw_end if pickup_tw_end is not None else MAX_TIME
+            else:
+                pickup_tw, _ = (0, MAX_TIME), False
+                late_flags[pickup_index] = MAX_TIME
+            if delivery_before:
+                delivery_tw_end, delivery_late = parse_iso_to_seconds_from_now(delivery_before, grace_period)
+                if isinstance(delivery_tw_end, tuple):
+                    delivery_tw = delivery_tw_end
+                    dt = datetime.fromisoformat(delivery_before.replace("Z", "+00:00")).astimezone(timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    deadline_seconds = int((dt - now).total_seconds())
+                    late_flags[delivery_index] = max(deadline_seconds, 0)
+                else:
+                    delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
+                    late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
+            else:
+                delivery_tw, _ = (0, MAX_TIME), False
+                late_flags[delivery_index] = MAX_TIME
+
+            time_windows[pickup_index] = pickup_tw
+            time_windows[delivery_index] = delivery_tw
+
+            task_id_to_indices[tid] = (pickup_index, delivery_index)
+
+    # Build pickups_deliveries list for all tasks (only those with pickup and delivery)
+    for tid, (pidx, didx) in task_id_to_indices.items():
+        if pidx is not None and didx is not None:
+            pickups_deliveries.append((pidx, didx))
+
+    # Build time matrix using OSRM for all coordinates
+    from osrm_tables_test import build_osrm_time_matrix
+    time_matrix_raw = build_osrm_time_matrix(coordinates)
+    time_matrix = [[int(round(cell)) for cell in row] for row in time_matrix_raw]
+
+    # Compose data dict
+    data['agent_starts'] = agent_starts
+    data['pickups_deliveries'] = pickups_deliveries
+    data['time_windows'] = time_windows
+    data['time_matrix'] = time_matrix
+    data['num_agents'] = len(agent_starts)
+    data['num_locations'] = len(coordinates)
+    data['late_flags'] = late_flags
+    data['node_metadata'] = node_metadata  # NEW
+
+    # Map agent indices to agents info for output
+    agents_info = {}
+    for i, agent in enumerate(agents):
+        driver_id = agent.get("driver_id", f"Agent{i}")
+        name = agent.get("name", f"Agent {i}")
+        agents_info[i] = {"driver_id": driver_id, "name": name}
+    data['agents_info'] = agents_info
+
+    # Prepare assigned tasks per agent from current_tasks
+    # Map from agent index to list of (pickup_index, delivery_index) tuples
+    assigned_tasks_per_agent = {i: [] for i in range(data['num_agents'])}
+    # We assume each task has an assigned_driver that matches driver_id in agents
+    driver_id_to_agent_index = {agent.get("driver_id", str(i)): i for i, agent in enumerate(agents)}
+
+    for task in current_tasks:
+        assigned_driver = task.get("assigned_driver")
+        if assigned_driver is None:
+            continue
+        agent_idx = driver_id_to_agent_index.get(assigned_driver)
+        if agent_idx is None:
+            continue
+        tid = task.get("id")
+        if tid not in task_id_to_indices:
+            continue
+        pidx, didx = task_id_to_indices[tid]
+        if pidx is not None and didx is not None:
+            assigned_tasks_per_agent[agent_idx].append((pidx, didx))
+        elif didx is not None:
+            assigned_tasks_per_agent[agent_idx].append((None, didx))  # Handle DELIVERY_ONLY properly
+
+    # Prepare new_task indices tuple for recommendation call
+    new_tid = new_task.get("id")
+    new_task_indices = task_id_to_indices.get(new_tid)
+
+    # Print debug info for time windows before returning
+    print(f"[DEBUG] Final time windows: {time_windows}")
+    # Return all needed data structures
+    return data, assigned_tasks_per_agent, new_task_indices
+
+def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
+    """
+    Build and solve routing model for a single agent with assigned tasks plus the new task.
+    assigned_tasks: list of (pickup, delivery) tuples currently assigned to the agent
+    new_task: (pickup, delivery) tuple to consider adding, pickup or delivery may be None for DELIVERY_ONLY
+    Returns: dict with keys 'route_time', 'route_sequence', 'lateness', 'feasible', 'detailed_route'
+    """
+    # Combine assigned tasks and new task
+    tasks = assigned_tasks.copy()
+    if new_task is not None:
+        tasks.append(new_task)
+
+    # Nodes involved: agent start + all pickups/deliveries in tasks
+    # Build list of unique nodes
+    nodes = set()
+    for p, d in tasks:
+        if p is not None:
+            nodes.add(p)
+        if d is not None:
+            nodes.add(d)
+    nodes = list(nodes)
+
+    # Map original node index to local index in routing model
+    node_to_local = {node: idx+1 for idx, node in enumerate(nodes)}  # index 0 reserved for start
+    local_to_node = {idx+1: node for idx, node in enumerate(nodes)}
+
+    # Build time matrix for this subset including start node
+    size = len(nodes) + 1
+    time_matrix = [[0]*size for _ in range(size)]
+
+    start_node = data['agent_starts'][agent_id]
+
+    # Fill time matrix:
+    # Row 0 and col 0 correspond to start_node
+    for i in range(size):
+        for j in range(size):
+            if i == 0 and j == 0:
+                time_matrix[i][j] = 0
+            elif i == 0:
+                # from start_node to node j
+                to_node = local_to_node[j]
+                time_matrix[i][j] = data['time_matrix'][start_node][to_node]
+            elif j == 0:
+                # from node i to start_node (not used but set to 0)
+                time_matrix[i][j] = 0
+            else:
+                from_node = local_to_node[i]
+                to_node = local_to_node[j]
+                time_matrix[i][j] = data['time_matrix'][from_node][to_node]
+
+    # Create routing index manager and model for single vehicle
+    manager = pywrapcp.RoutingIndexManager(size, 1, 0)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def time_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return time_matrix[from_node][to_node]
+
+    transit_callback_index = routing.RegisterTransitCallback(time_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    # Add time dimension
+    routing.AddDimension(
+        transit_callback_index,
+        600,  # allow waiting
+        10000,  # increased max time per route
+        False,
+        'Time'
+    )
+    time_dimension = routing.GetDimensionOrDie('Time')
+
+    # Add pickup and delivery pairs
+    for p, d in tasks:
+        # Skip pairs where either pickup or delivery is None (e.g. DELIVERY_ONLY pickup is None)
+        if p is None or d is None:
+            continue
+        pickup_index = manager.NodeToIndex(node_to_local[p])
+        delivery_index = manager.NodeToIndex(node_to_local[d])
+        routing.AddPickupAndDelivery(pickup_index, delivery_index)
+        routing.solver().Add(routing.VehicleVar(pickup_index) == routing.VehicleVar(delivery_index))
+        routing.solver().Add(time_dimension.CumulVar(pickup_index) <= time_dimension.CumulVar(delivery_index))
+
+    # Apply time windows for pickups and deliveries
+    for node in nodes:
+        local_idx = node_to_local[node]
+        idx = manager.NodeToIndex(local_idx)
+        if node in data['time_windows']:
+            start, end = data['time_windows'][node]
+            time_dimension.CumulVar(idx).SetRange(start, end)
+        else:
+            # If no window, allow full range
+            time_dimension.CumulVar(idx).SetRange(0, 5000)
+
+    # Search parameters
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_parameters.time_limit.FromSeconds(2)
+    search_parameters.use_full_propagation = True
+
+    solution = routing.SolveWithParameters(search_parameters)
+
+    if solution:
+        route_time = solution.Value(time_dimension.CumulVar(routing.End(0)))
+        route_sequence = []
+        detailed_route = []
+        lateness = 0
+        already_late_count = 0
+        index = routing.Start(0)
+        current_time = datetime.now(timezone.utc)
+        
+        while not routing.IsEnd(index):
+            node_idx = manager.IndexToNode(index)
+            arrival_seconds = solution.Value(time_dimension.CumulVar(index))
+            
+            if node_idx == 0:
+                route_sequence.append(f"Start({start_node})")
+                detailed_route.append({
+                    "type": "start",
+                    "index": start_node
+                })
+            else:
+                orig_node = local_to_node[node_idx]
+                route_sequence.append(f"Node {orig_node}")
+                
+                # Get metadata for this node
+                metadata = data['node_metadata'].get(orig_node, {})
+                task_id = metadata.get("task_id")
+                node_type = metadata.get("type")
+                deadline_iso = metadata.get("deadline_iso")
+                is_new_task = metadata.get("is_new_task", False)
+                
+                # Calculate arrival time
+                arrival_time = current_time + timedelta(seconds=arrival_seconds)
+                
+                # Calculate deadline and lateness
+                deadline_dt = None
+                lateness_seconds = 0
+                if deadline_iso:
+                    deadline_dt = datetime.fromisoformat(deadline_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+                    if arrival_time > deadline_dt:
+                        lateness_seconds = int((arrival_time - deadline_dt).total_seconds())
+                        lateness += lateness_seconds
+                        already_late_count += 1
+                
+                # Determine route entry type
+                if is_new_task and node_type == "pickup":
+                    entry_type = "new_task_pickup"
+                elif is_new_task and node_type == "delivery":
+                    entry_type = "new_task_delivery"
+                elif not is_new_task and node_type == "pickup":
+                    entry_type = "existing_task_pickup"
+                elif not is_new_task and node_type == "delivery":
+                    entry_type = "existing_task_delivery"
+                else:
+                    entry_type = "unknown"
+                
+                # Format timestamps in YYYY-MM-DDThh:mm:ssZ format
+                arrival_time_str = arrival_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                route_entry = {
+                    "type": entry_type,
+                    "task_id": task_id,
+                    f"{node_type}_index": orig_node,
+                    "arrival_time": arrival_time_str,
+                    "lateness": lateness_seconds
+                }
+                
+                if deadline_dt:
+                    deadline_str = deadline_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    route_entry["deadline"] = deadline_str
+                
+                detailed_route.append(route_entry)
+                
+                # Check lateness using late_flags deadline if present
+                if 'late_flags' in data and orig_node in data['late_flags']:
+                    deadline = data['late_flags'][orig_node]
+                    print(f"[DEBUG] Arrival at node {orig_node}: {arrival_seconds}, Deadline: {deadline}, Lateness: {max(0, arrival_seconds - deadline)}")
+                    
+            index = solution.Value(routing.NextVar(index))
+            
+        # Add end node
+        node_idx = manager.IndexToNode(index)
+        route_sequence.append(f"End({start_node})")
+        detailed_route.append({
+            "type": "end", 
+            "index": start_node
+        })
+
+        return {
+            'route_time': route_time,
+            'route_sequence': route_sequence,
+            'lateness': lateness,
+            'feasible': True,
+            'already_late_count': already_late_count,
+            'detailed_route': detailed_route
+        }
+    else:
+        # No feasible solution
+        return {
+            'route_time': None,
+            'route_sequence': [],
+            'lateness': None,
+            'feasible': False,
+            'already_late_count': 0,
+            'detailed_route': []
+        }
+
+def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], current_tasks: List[Dict[str, Any]]):
+    """
+    Recommend top 3 agents for the new task based on routing optimization.
+    new_task: dict with task info
+    agents: list of agent dicts
+    current_tasks: list of task dicts
+    Returns JSON string with task and top agents info.
+    """
+    grace_period = INITIAL_GRACE_PERIOD
+    max_grace = 1800  # 30 minutes
+    while grace_period <= max_grace:
+        data, assigned_tasks_per_agent, new_task_indices = build_data_model(new_task, agents, current_tasks, grace_period)
+
+        # === DEBUG BLOCK START ===
+        print("=== DEBUG INFO ===")
+        print("Agents:", [a["driver_id"] for a in agents])
+        print("New Task:", new_task["id"], new_task["job_type"])
+        print("Task indices:", new_task_indices)
+        print("Assigned tasks per agent:", assigned_tasks_per_agent)
+        print("Time windows:", data["time_windows"])
+        print("Time matrix:")
+        for row in data["time_matrix"]:
+            print(row)
+        # === DEBUG BLOCK END ===
+
+        base_route_times = {}
+        # Calculate base route times for each agent with current assigned tasks only
+        for agent in range(data['num_agents']):
+            res = solve_single_agent_routing(data, agent, assigned_tasks_per_agent.get(agent, []), None)
+            base_route_times[agent] = res['route_time'] if res['feasible'] else float('inf')
+
+        recommendations = []
+        feasible_found = False
+
+        for agent in range(data['num_agents']):
+            assigned = assigned_tasks_per_agent.get(agent, [])
+            res = solve_single_agent_routing(data, agent, assigned, new_task_indices)
+            if not res['feasible']:
+                score = 0
+                additional_time_minutes = 0
+                lateness_penalty_seconds = 0
+                already_late_stops = 0
+                route = []
+            else:
+                feasible_found = True
+                additional_time = res['route_time'] - base_route_times[agent]
+                additional_time_minutes = round(additional_time / 60.0, 1)
+                lateness_penalty_seconds = res['lateness']
+                already_late_stops = res['already_late_count']
+                route = res['detailed_route']
+
+                # Normalize scores using flexible thresholds
+                MAX_ADDITIONAL_TIME = 600  # 10 minutes
+                MAX_LATENESS = 600         # 10 minutes
+
+                TIME_WEIGHT = 0.7
+                LATENESS_WEIGHT = 0.3
+
+                norm_time = min(additional_time / MAX_ADDITIONAL_TIME, 1.0)
+                norm_late = min(lateness_penalty_seconds / MAX_LATENESS, 1.0)
+
+                penalty = (norm_time * TIME_WEIGHT) + (norm_late * LATENESS_WEIGHT)
+                score = round((1.0 - penalty) * 100)
+
+            agent_info = data['agents_info'].get(agent, {"driver_id": f"Agent{agent}", "name": f"Agent {agent}"})
+            recommendations.append({
+                "driver_id": agent_info["driver_id"],
+                "name": agent_info["name"],
+                "score": score,
+                "additional_time_minutes": additional_time_minutes,
+                "lateness_penalty_seconds": lateness_penalty_seconds,
+                "already_late_stops": already_late_stops,
+                "route": route
+            })
+
+        if feasible_found:
+            # Sort by score descending and pick top 3
+            recommendations.sort(key=lambda x: x['score'], reverse=True)
+            top_recommendations = recommendations[:3]
+            output = {
+                "task_id": new_task.get("id", "unknown"),
+                "recommendations": top_recommendations
+            }
+            return json.dumps(output, indent=2)
+        else:
+            grace_period += 600  # Increase by 10 minutes
+            # Also extend the new task's delivery time window
+            if new_task_indices and new_task_indices[1] is not None:
+                delivery_idx = new_task_indices[1]
+                current_window = data["time_windows"].get(delivery_idx, (0, INITIAL_GRACE_PERIOD))
+                new_window = (current_window[0], current_window[1] + 600)
+                data["time_windows"][delivery_idx] = new_window
+
+    # If no feasible solution found after increasing grace period
+    recommendations.sort(key=lambda x: x['score'], reverse=True)
+    top_recommendations = recommendations[:3]
+    output = {
+        "task_id": new_task.get("id", "unknown"),
+        "recommendations": top_recommendations
+    }
+    return json.dumps(output, indent=2)
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) != 4:
+        print("Usage: python OR_tool_prototype.py new_task.json agents.json current_tasks.json")
+        sys.exit(1)
+
+    new_task_file = sys.argv[1]
+    agents_file = sys.argv[2]
+    current_tasks_file = sys.argv[3]
+
+    with open(new_task_file, 'r') as f:
+        new_task = json.load(f)
+    with open(agents_file, 'r') as f:
+        agents = json.load(f)
+    with open(current_tasks_file, 'r') as f:
+        current_tasks = json.load(f)
+
+    recommendations_json = recommend_agents(new_task, agents, current_tasks)
+    print(recommendations_json)

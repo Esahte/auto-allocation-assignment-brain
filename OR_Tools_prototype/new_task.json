@@ -1,0 +1,15 @@
+{
+    "id": 123,
+    "order_id": "ORDER123",
+    "job_type": "PAIRED",
+    "restaurant_location": [17.12345, -61.84567],
+    "delivery_location": [17.12456, -61.84678],
+    "pickup_before": "2025-05-29T21:50:00Z",
+    "delivery_before": "2025-05-29T22:20:00Z",
+    "status": "Unassigned",
+    "assigned_driver": null,
+    "payment_type": "CARD",
+    "customer_name": "Jane Doe",
+    "restaurant_name": "Pizza Place",
+    "notes": "Leave at the door"
+  }

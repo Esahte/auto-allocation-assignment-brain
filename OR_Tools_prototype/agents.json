@@ -1,0 +1,26 @@
+[
+    {
+      "driver_id": "A1",
+      "name": "John Doe",
+      "current_location": [17.12000, -61.84000],
+      "status": "online",
+      "phone": "555-1234",
+      "email": "john@example.com",
+      "has_tag_no_cash": false,
+      "team_id": "T1",
+      "team_name": "Downtown",
+      "last_update": "2025-05-29T21:35:00Z"
+    },
+    {
+      "driver_id": "A2",
+      "name": "Jane Smith",
+      "current_location": [17.11950, -61.83900],
+      "status": "online",
+      "phone": "555-5678",
+      "email": "jane@example.com",
+      "has_tag_no_cash": true,
+      "team_id": "T2",
+      "team_name": "Uptown",
+      "last_update": "2025-05-29T21:35:00Z"
+    }
+  ]
