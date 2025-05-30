@@ -448,6 +448,61 @@ def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
             'detailed_route': []
         }
 
+def calculate_agent_score(
+    grace_penalty_seconds: float,
+    additional_time_minutes: float, 
+    current_task_count: int,
+    already_late_stops: int,
+    total_route_time: int,
+    max_grace_period: int
+) -> int:
+    """
+    Calculate a comprehensive score for an agent considering multiple factors.
+    Returns a score from 0-100, where 100 is the best possible score.
+    """
+    
+    # Start with perfect score
+    score = 100.0
+    
+    # Factor 1: Grace period penalty (25% weight)
+    # Penalize agents who need grace periods for late tasks
+    if grace_penalty_seconds > 0:
+        grace_penalty_ratio = min(grace_penalty_seconds / max_grace_period, 1.0)
+        score -= grace_penalty_ratio * 25
+    
+    # Factor 2: Additional time penalty (30% weight)
+    # Penalize agents who need significantly more time
+    # Normalize against a reasonable maximum (e.g., 60 minutes additional time)
+    max_reasonable_additional_time = 60.0
+    additional_time_penalty = min(additional_time_minutes / max_reasonable_additional_time, 1.0)
+    score -= additional_time_penalty * 30
+    
+    # Factor 3: Workload penalty (20% weight)
+    # Penalize agents who already have many tasks
+    # Normalize against a reasonable maximum (e.g., 8 tasks)
+    max_reasonable_tasks = 8
+    workload_penalty = min(current_task_count / max_reasonable_tasks, 1.0)
+    score -= workload_penalty * 20
+    
+    # Factor 4: Route efficiency penalty (15% weight)
+    # Penalize very long total routes
+    # Normalize against a reasonable maximum route time (e.g., 8 hours = 28800 seconds)
+    max_reasonable_route_time = 28800  # 8 hours in seconds
+    route_efficiency_penalty = min(total_route_time / max_reasonable_route_time, 1.0)
+    score -= route_efficiency_penalty * 15
+    
+    # Factor 5: Late stops penalty (10% weight)
+    # Additional penalty for agents who already have late stops
+    # Normalize against a reasonable maximum (e.g., 3 late stops)
+    max_reasonable_late_stops = 3
+    late_stops_penalty = min(already_late_stops / max_reasonable_late_stops, 1.0)
+    score -= late_stops_penalty * 10
+    
+    # Ensure score doesn't go below 0 and round to integer
+    final_score = max(0, round(score))
+    
+    return final_score
+
 def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], current_tasks: List[Dict[str, Any]], max_grace_period: int = DEFAULT_MAX_GRACE_PERIOD):
     """
     Recommend top 3 agents for the new task based on routing optimization.
@@ -519,13 +574,26 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                             grace_penalty_seconds += grace_used
                             already_late_stops += 1
 
-                # Simplified scoring: Only based on grace period usage
-                if grace_penalty_seconds == 0:
-                    score = 100  # Perfect score when no grace periods used
-                else:
-                    # Normalize grace period penalty using the configured max_grace_period
-                    norm_grace = min(grace_penalty_seconds / max_grace_period, 1.0)
-                    score = round((1.0 - norm_grace) * 100)
+                # Enhanced scoring system with multiple factors
+                score = calculate_agent_score(
+                    grace_penalty_seconds=grace_penalty_seconds,
+                    additional_time_minutes=additional_time_minutes,
+                    current_task_count=len(assigned),
+                    already_late_stops=already_late_stops,
+                    total_route_time=res['route_time'],
+                    max_grace_period=max_grace_period
+                )
+                
+                # Debug: Print score breakdown for analysis
+                agent_info = data['agents_info'].get(agent, {"driver_id": f"Agent{agent}", "name": f"Agent {agent}"})
+                print(f"Agent {agent_info['driver_id']} Score Breakdown:")
+                print(f"  - Grace penalty: {grace_penalty_seconds}s")
+                print(f"  - Additional time: {additional_time_minutes} min")
+                print(f"  - Current tasks: {len(assigned)}")
+                print(f"  - Already late stops: {already_late_stops}")
+                print(f"  - Total route time: {res['route_time']}s")
+                print(f"  - Final score: {score}")
+                print("---")
 
             agent_info = data['agents_info'].get(agent, {"driver_id": f"Agent{agent}", "name": f"Agent {agent}"})
             recommendations.append({
@@ -535,6 +603,8 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                 "additional_time_minutes": additional_time_minutes,
                 "grace_penalty_seconds": grace_penalty_seconds,
                 "already_late_stops": already_late_stops,
+                "current_task_count": len(assigned),
+                "total_route_time_seconds": res['route_time'] if res['feasible'] else 0,
                 "route": route
             })
 
