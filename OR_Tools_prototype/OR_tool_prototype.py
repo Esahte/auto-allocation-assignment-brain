@@ -1,4 +1,5 @@
 INITIAL_GRACE_PERIOD = 600  # 10 minutes
+DEFAULT_MAX_GRACE_PERIOD = 3600  # 60 minutes
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import numpy as np
@@ -447,17 +448,17 @@ def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
             'detailed_route': []
         }
 
-def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], current_tasks: List[Dict[str, Any]]):
+def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], current_tasks: List[Dict[str, Any]], max_grace_period: int = DEFAULT_MAX_GRACE_PERIOD):
     """
     Recommend top 3 agents for the new task based on routing optimization.
     new_task: dict with task info
     agents: list of agent dicts
     current_tasks: list of task dicts
+    max_grace_period: maximum grace period in seconds (default: 1800 = 30 minutes)
     Returns JSON string with task and top agents info.
     """
     grace_period = INITIAL_GRACE_PERIOD
-    max_grace = 1800  # 30 minutes
-    while grace_period <= max_grace:
+    while grace_period <= max_grace_period:
         data, assigned_tasks_per_agent, new_task_indices = build_data_model(new_task, agents, current_tasks, grace_period)
 
         # === DEBUG BLOCK START ===
@@ -487,7 +488,6 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
             if not res['feasible']:
                 score = 0
                 additional_time_minutes = 0
-                lateness_penalty_seconds = 0
                 grace_penalty_seconds = 0
                 already_late_stops = 0
                 route = []
@@ -519,16 +519,12 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                             grace_penalty_seconds += grace_used
                             already_late_stops += 1
 
-                # lateness_penalty_seconds is now the total grace period time used
-                lateness_penalty_seconds = grace_penalty_seconds
-
                 # Simplified scoring: Only based on grace period usage
                 if grace_penalty_seconds == 0:
                     score = 100  # Perfect score when no grace periods used
                 else:
-                    # Normalize grace period penalty (max 30 minutes worth)
-                    MAX_GRACE_PENALTY = 1800  # 30 minutes worth of grace period
-                    norm_grace = min(grace_penalty_seconds / MAX_GRACE_PENALTY, 1.0)
+                    # Normalize grace period penalty using the configured max_grace_period
+                    norm_grace = min(grace_penalty_seconds / max_grace_period, 1.0)
                     score = round((1.0 - norm_grace) * 100)
 
             agent_info = data['agents_info'].get(agent, {"driver_id": f"Agent{agent}", "name": f"Agent {agent}"})
@@ -537,7 +533,6 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                 "name": agent_info["name"],
                 "score": score,
                 "additional_time_minutes": additional_time_minutes,
-                "lateness_penalty_seconds": lateness_penalty_seconds,
                 "grace_penalty_seconds": grace_penalty_seconds,
                 "already_late_stops": already_late_stops,
                 "route": route

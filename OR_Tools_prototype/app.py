@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from OR_tool_prototype import recommend_agents
+from OR_tool_prototype import recommend_agents, DEFAULT_MAX_GRACE_PERIOD
 import json
 import os
 
@@ -25,8 +25,11 @@ def recommend():
         agents = data['agents']
         current_tasks = data['current_tasks']
         
+        # Get optional max_grace_period parameter
+        max_grace_period = data.get('max_grace_period', DEFAULT_MAX_GRACE_PERIOD)
+        
         # Call the recommendation service
-        recommendations = recommend_agents(new_task, agents, current_tasks)
+        recommendations = recommend_agents(new_task, agents, current_tasks, max_grace_period)
         
         # Parse the JSON string back to a dict
         recommendations_dict = json.loads(recommendations)

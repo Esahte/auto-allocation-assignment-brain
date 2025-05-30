@@ -2,6 +2,8 @@ import requests
 import json
 import random
 from datetime import datetime, timedelta, timezone
+import time
+from requests.exceptions import RequestException
 
 # Antigua coordinates (roughly)
 ANTIGUA_LAT_RANGE = (17.05, 17.20)
@@ -66,7 +68,30 @@ def generate_current_tasks(agents, max_tasks_per_agent=5, base_time=None):
             task_counter += 1
     return current_tasks
 
+def wait_for_service(url, max_retries=5, retry_delay=2):
+    """Wait for the service to be ready by checking the health endpoint."""
+    health_url = url.replace('/recommend', '/health')
+    for i in range(max_retries):
+        try:
+            response = requests.get(health_url)
+            if response.status_code == 200:
+                print("Service is ready!")
+                return True
+        except RequestException:
+            pass
+        print(f"Waiting for service to be ready... (attempt {i+1}/{max_retries})")
+        time.sleep(retry_delay)
+    return False
+
 def test_recommendation():
+    # URL of your running application
+    url = "http://localhost:8081/recommend"
+    
+    # Wait for service to be ready
+    if not wait_for_service(url):
+        print("Service failed to start. Please check the Docker logs.")
+        return
+    
     # Randomize scenario
     num_agents = random.randint(5, 12)
     num_new_tasks = random.randint(1, 6)
@@ -81,7 +106,6 @@ def test_recommendation():
             "agents": agents,
             "current_tasks": current_tasks
         }
-        url = "http://localhost:8081/recommend"
         print(f"\n--- Scenario {i+1} ---")
         print("Sending request to:", url)
         print("Request data:", json.dumps(test_data, indent=2))
