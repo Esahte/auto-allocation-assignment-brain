@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  recommendation-app:
+    build:
+      context: ./OR_Tools_prototype
+    ports:
+      - "8081:8081"
+    environment:
+      - PORT=8081
+    restart: unless-stopped

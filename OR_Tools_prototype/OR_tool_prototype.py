@@ -8,18 +8,20 @@ from datetime import datetime, timezone, timedelta
 
 def parse_iso_to_seconds_from_now(iso_time: str, grace_period=INITIAL_GRACE_PERIOD):
     """Convert ISO time string to seconds from now, and flag if already late.
-    If late, return (0, grace_period) as the time window.
+    If late, return (0, grace_period) as the time window and the grace period used.
+    Returns: (time_window, grace_period_used)
     """
     if iso_time is None:
-        return None, False
+        return None, 0
     dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00")).astimezone(timezone.utc)
     now = datetime.now(timezone.utc)
     diff = (dt - now).total_seconds()
     print(f"[DEBUG] Parsed time for {iso_time}: {diff} seconds from now")
     is_late = diff < 0
     if is_late:
-        return (0, grace_period), True
-    return max(0, int(diff)), False
+        grace_used = abs(diff)  # How much past deadline
+        return (0, grace_period), grace_used
+    return max(0, int(diff)), 0
 
 def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], current_tasks: List[Dict[str, Any]], grace_period=INITIAL_GRACE_PERIOD):
     """
@@ -76,6 +78,7 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
 
     MAX_TIME = 5000
     late_flags = {}
+    grace_penalties = {}  # Track grace period usage per task/node
 
     for task in all_tasks:
         tid = task.get("id")
@@ -105,7 +108,8 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
             
             # Time window only for delivery
             if delivery_before:
-                delivery_tw_end, delivery_late = parse_iso_to_seconds_from_now(delivery_before, grace_period)
+                delivery_tw_end, grace_used = parse_iso_to_seconds_from_now(delivery_before, grace_period)
+                grace_penalties[delivery_index] = grace_used
                 if isinstance(delivery_tw_end, tuple):  # For late: (0, grace_period)
                     delivery_tw = delivery_tw_end
                     # Compute and store the actual deadline value, even if negative, clamped to 0
@@ -117,8 +121,9 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                     delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
                     late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
             else:
-                delivery_tw, _ = (0, MAX_TIME), False
+                delivery_tw = (0, MAX_TIME)
                 late_flags[delivery_index] = MAX_TIME
+                grace_penalties[delivery_index] = 0
             time_windows[delivery_index] = delivery_tw
             task_id_to_indices[tid] = (None, delivery_index)
         else:
@@ -145,7 +150,8 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
             }
 
             if pickup_before:
-                pickup_tw_end, pickup_late = parse_iso_to_seconds_from_now(pickup_before, grace_period)
+                pickup_tw_end, grace_used = parse_iso_to_seconds_from_now(pickup_before, grace_period)
+                grace_penalties[pickup_index] = grace_used
                 if isinstance(pickup_tw_end, tuple):
                     pickup_tw = pickup_tw_end
                     dt = datetime.fromisoformat(pickup_before.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -156,10 +162,12 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                     pickup_tw = (0, pickup_tw_end if pickup_tw_end is not None else MAX_TIME)
                     late_flags[pickup_index] = pickup_tw_end if pickup_tw_end is not None else MAX_TIME
             else:
-                pickup_tw, _ = (0, MAX_TIME), False
+                pickup_tw = (0, MAX_TIME)
                 late_flags[pickup_index] = MAX_TIME
+                grace_penalties[pickup_index] = 0
             if delivery_before:
-                delivery_tw_end, delivery_late = parse_iso_to_seconds_from_now(delivery_before, grace_period)
+                delivery_tw_end, grace_used = parse_iso_to_seconds_from_now(delivery_before, grace_period)
+                grace_penalties[delivery_index] = grace_used
                 if isinstance(delivery_tw_end, tuple):
                     delivery_tw = delivery_tw_end
                     dt = datetime.fromisoformat(delivery_before.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -170,8 +178,9 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                     delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
                     late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
             else:
-                delivery_tw, _ = (0, MAX_TIME), False
+                delivery_tw = (0, MAX_TIME)
                 late_flags[delivery_index] = MAX_TIME
+                grace_penalties[delivery_index] = 0
 
             time_windows[pickup_index] = pickup_tw
             time_windows[delivery_index] = delivery_tw
@@ -197,6 +206,7 @@ def build_data_model(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
     data['num_locations'] = len(coordinates)
     data['late_flags'] = late_flags
     data['node_metadata'] = node_metadata  # NEW
+    data['grace_penalties'] = grace_penalties  # NEW: Track grace period usage
 
     # Map agent indices to agents info for output
     agents_info = {}
@@ -344,10 +354,9 @@ def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
         route_time = solution.Value(time_dimension.CumulVar(routing.End(0)))
         route_sequence = []
         detailed_route = []
-        lateness = 0
-        already_late_count = 0
-        index = routing.Start(0)
         current_time = datetime.now(timezone.utc)
+        
+        index = routing.Start(0)
         
         while not routing.IsEnd(index):
             node_idx = manager.IndexToNode(index)
@@ -373,15 +382,12 @@ def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
                 # Calculate arrival time
                 arrival_time = current_time + timedelta(seconds=arrival_seconds)
                 
-                # Calculate deadline and lateness
-                deadline_dt = None
-                lateness_seconds = 0
+                # No lateness calculation needed - grace periods handle all deadline issues
+                lateness_seconds = 0  # Always 0 since grace periods handle everything
+                
+                # For display purposes, still show original deadline
                 if deadline_iso:
                     deadline_dt = datetime.fromisoformat(deadline_iso.replace("Z", "+00:00")).astimezone(timezone.utc)
-                    if arrival_time > deadline_dt:
-                        lateness_seconds = int((arrival_time - deadline_dt).total_seconds())
-                        lateness += lateness_seconds
-                        already_late_count += 1
                 
                 # Determine route entry type
                 if is_new_task and node_type == "pickup":
@@ -412,11 +418,6 @@ def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
                 
                 detailed_route.append(route_entry)
                 
-                # Check lateness using late_flags deadline if present
-                if 'late_flags' in data and orig_node in data['late_flags']:
-                    deadline = data['late_flags'][orig_node]
-                    print(f"[DEBUG] Arrival at node {orig_node}: {arrival_seconds}, Deadline: {deadline}, Lateness: {max(0, arrival_seconds - deadline)}")
-                    
             index = solution.Value(routing.NextVar(index))
             
         # Add end node
@@ -430,9 +431,9 @@ def solve_single_agent_routing(data, agent_id, assigned_tasks, new_task):
         return {
             'route_time': route_time,
             'route_sequence': route_sequence,
-            'lateness': lateness,
+            'lateness': 0,  # Always 0 now
             'feasible': True,
-            'already_late_count': already_late_count,
+            'already_late_count': 0,  # Not used anymore
             'detailed_route': detailed_route
         }
     else:
@@ -487,28 +488,48 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                 score = 0
                 additional_time_minutes = 0
                 lateness_penalty_seconds = 0
+                grace_penalty_seconds = 0
                 already_late_stops = 0
                 route = []
             else:
                 feasible_found = True
                 additional_time = res['route_time'] - base_route_times[agent]
                 additional_time_minutes = round(additional_time / 60.0, 1)
-                lateness_penalty_seconds = res['lateness']
-                already_late_stops = res['already_late_count']
                 route = res['detailed_route']
 
-                # Normalize scores using flexible thresholds
-                MAX_ADDITIONAL_TIME = 600  # 10 minutes
-                MAX_LATENESS = 600         # 10 minutes
+                # Calculate grace period penalties and statistics for all tasks assigned to this agent
+                grace_penalty_seconds = 0
+                already_late_stops = 0  # Count of tasks that needed grace periods
+                agent_tasks = assigned + ([new_task_indices] if new_task_indices else [])
+                
+                for task_tuple in agent_tasks:
+                    pickup_idx, delivery_idx = task_tuple if isinstance(task_tuple, tuple) else (task_tuple, None)
+                    
+                    # Check pickup
+                    if pickup_idx and pickup_idx in data['grace_penalties']:
+                        grace_used = data['grace_penalties'][pickup_idx]
+                        if grace_used > 0:
+                            grace_penalty_seconds += grace_used
+                            already_late_stops += 1
+                    
+                    # Check delivery  
+                    if delivery_idx and delivery_idx in data['grace_penalties']:
+                        grace_used = data['grace_penalties'][delivery_idx]
+                        if grace_used > 0:
+                            grace_penalty_seconds += grace_used
+                            already_late_stops += 1
 
-                TIME_WEIGHT = 0.7
-                LATENESS_WEIGHT = 0.3
+                # lateness_penalty_seconds is now the total grace period time used
+                lateness_penalty_seconds = grace_penalty_seconds
 
-                norm_time = min(additional_time / MAX_ADDITIONAL_TIME, 1.0)
-                norm_late = min(lateness_penalty_seconds / MAX_LATENESS, 1.0)
-
-                penalty = (norm_time * TIME_WEIGHT) + (norm_late * LATENESS_WEIGHT)
-                score = round((1.0 - penalty) * 100)
+                # Simplified scoring: Only based on grace period usage
+                if grace_penalty_seconds == 0:
+                    score = 100  # Perfect score when no grace periods used
+                else:
+                    # Normalize grace period penalty (max 30 minutes worth)
+                    MAX_GRACE_PENALTY = 1800  # 30 minutes worth of grace period
+                    norm_grace = min(grace_penalty_seconds / MAX_GRACE_PENALTY, 1.0)
+                    score = round((1.0 - norm_grace) * 100)
 
             agent_info = data['agents_info'].get(agent, {"driver_id": f"Agent{agent}", "name": f"Agent {agent}"})
             recommendations.append({
@@ -517,6 +538,7 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], cur
                 "score": score,
                 "additional_time_minutes": additional_time_minutes,
                 "lateness_penalty_seconds": lateness_penalty_seconds,
+                "grace_penalty_seconds": grace_penalty_seconds,
                 "already_late_stops": already_late_stops,
                 "route": route
             })
