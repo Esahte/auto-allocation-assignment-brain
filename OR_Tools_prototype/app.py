@@ -37,9 +37,11 @@ def recommend():
         return jsonify(recommendations_dict), 200
         
     except Exception as e:
+        app.logger.error(f"Error processing request: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # Get port from environment variable or default to 8081
-    port = int(os.environ.get('PORT', 8081))
+    # Get port from environment variable or default to 8080
+    port = int(os.environ.get('PORT', 8080))
+    # Use 0.0.0.0 to listen on all available network interfaces
     app.run(host='0.0.0.0', port=port) 
