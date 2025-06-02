@@ -89,18 +89,12 @@ def recommend():
                 # Fallback for simple driver ID responses
                 recommendations_dict = {
                     "task_id": new_task.get("id", "unknown"),
-                    "recommended_driver": recommendations,
-                    "algorithm_used": algorithm,
-                    "execution_time_seconds": round(time.time() - start_time, 3),
                     "recommendations": []
                 }
         else:
             # Handle case where it's already a dict
             recommendations_dict = recommendations if isinstance(recommendations, dict) else {
                 "task_id": new_task.get("id", "unknown"),
-                "recommended_driver": str(recommendations),
-                "algorithm_used": algorithm,
-                "execution_time_seconds": round(time.time() - start_time, 3),
                 "recommendations": []
             }
         
@@ -110,10 +104,6 @@ def recommend():
             (performance_stats["average_response_time"] * (performance_stats["total_requests"] - 1) + execution_time) 
             / performance_stats["total_requests"]
         )
-        
-        # Add performance metadata to response (preserve existing structure)
-        recommendations_dict["api_response_time_seconds"] = round(execution_time, 3)
-        recommendations_dict["algorithm_used"] = algorithm
         
         # Ensure task_id is present
         if "task_id" not in recommendations_dict:
@@ -125,9 +115,7 @@ def recommend():
         execution_time = time.time() - start_time
         app.logger.error(f"Error processing request in {execution_time:.3f}s: {str(e)}")
         return jsonify({
-            "error": str(e),
-            "execution_time_seconds": round(execution_time, 3),
-            "algorithm_used": algorithm if 'algorithm' in locals() else "unknown"
+            "error": str(e)
         }), 500
 
 @app.route('/recommend/fixed-optimized', methods=['POST'])
