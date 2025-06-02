@@ -8,9 +8,8 @@ app = Flask(__name__)
 # Performance monitoring
 performance_stats = {
     "total_requests": 0,
-    "ultra_fast_requests": 0,
-    "optimized_requests": 0,
-    "original_requests": 0,
+    "fixed_optimized_requests": 0,
+    "light_optimized_requests": 0,
     "average_response_time": 0.0,
     "cache_hits": 0
 }
@@ -20,7 +19,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "performance_stats": performance_stats,
-        "available_algorithms": ["ultra_fast", "optimized", "original"]
+        "available_algorithms": ["fixed_optimized", "light_optimized", "auto"]
     }), 200
 
 @app.route('/recommend', methods=['POST'])
@@ -45,7 +44,7 @@ def recommend():
         
         # Get optional parameters
         max_grace_period = data.get('max_grace_period', 3600)
-        algorithm = data.get('algorithm', 'auto')  # auto, ultra_fast, optimized, original
+        algorithm = data.get('algorithm', 'auto')  # auto, fixed_optimized, light_optimized
         enable_debug = data.get('enable_debug', False)
         
         # Auto-select algorithm based on dataset size and requirements
@@ -53,43 +52,57 @@ def recommend():
             num_agents = len(agents)
             num_tasks = len(current_tasks)
             
-            if num_agents <= 10 and num_tasks <= 20:
-                algorithm = 'original'    # Best accuracy for small datasets
-            elif num_agents <= 50 and num_tasks <= 100:
-                algorithm = 'optimized'   # Good balance for medium datasets
+            # Use light_optimized for smaller datasets (original solver settings with caching)
+            # Use fixed_optimized for larger datasets (adaptive timeouts and algorithm selection)
+            if num_agents <= 20 and num_tasks <= 50:
+                algorithm = 'light_optimized'    # Good for smaller datasets with caching benefits
             else:
-                algorithm = 'ultra_fast'  # Only practical choice for large datasets
+                algorithm = 'fixed_optimized'    # Best for larger datasets with adaptive optimizations
         
         # Call the appropriate recommendation service
-        if algorithm == 'ultra_fast':
-            from OR_tool_prototype_ultra_fast import recommend_agents_ultra_fast
-            recommendations = recommend_agents_ultra_fast(
-                new_task, agents, current_tasks, max_grace_period
-            )
-            performance_stats["ultra_fast_requests"] += 1
-            
-        elif algorithm == 'optimized':
-            from OR_tool_prototype_optimized import recommend_agents_optimized
-            recommendations = recommend_agents_optimized(
-                new_task, agents, current_tasks, max_grace_period, enable_debug
-            )
-            performance_stats["optimized_requests"] += 1
-            
-        elif algorithm == 'original':
-            from OR_tool_prototype import recommend_agents
+        if algorithm == 'fixed_optimized':
+            from OR_tool_prototype_optimized_fixed import recommend_agents
             recommendations = recommend_agents(
                 new_task, agents, current_tasks, max_grace_period
             )
-            performance_stats["original_requests"] += 1
+            performance_stats["fixed_optimized_requests"] += 1
+            
+        elif algorithm == 'light_optimized':
+            from OR_tool_prototype_light_optimized import recommend_agents
+            recommendations = recommend_agents(
+                new_task, agents, current_tasks, max_grace_period
+            )
+            performance_stats["light_optimized_requests"] += 1
             
         else:
             return jsonify({
                 "error": f"Unknown algorithm: {algorithm}",
-                "available_algorithms": ["ultra_fast", "optimized", "original", "auto"]
+                "available_algorithms": ["fixed_optimized", "light_optimized", "auto"]
             }), 400
         
-        # Parse the JSON string back to a dict
-        recommendations_dict = json.loads(recommendations)
+        # Handle detailed JSON response from optimized models
+        if isinstance(recommendations, str):
+            try:
+                # Parse the JSON response from the models
+                recommendations_dict = json.loads(recommendations)
+            except json.JSONDecodeError:
+                # Fallback for simple driver ID responses
+                recommendations_dict = {
+                    "task_id": new_task.get("id", "unknown"),
+                    "recommended_driver": recommendations,
+                    "algorithm_used": algorithm,
+                    "execution_time_seconds": round(time.time() - start_time, 3),
+                    "recommendations": []
+                }
+        else:
+            # Handle case where it's already a dict
+            recommendations_dict = recommendations if isinstance(recommendations, dict) else {
+                "task_id": new_task.get("id", "unknown"),
+                "recommended_driver": str(recommendations),
+                "algorithm_used": algorithm,
+                "execution_time_seconds": round(time.time() - start_time, 3),
+                "recommendations": []
+            }
         
         # Update performance stats
         execution_time = time.time() - start_time
@@ -97,11 +110,14 @@ def recommend():
             (performance_stats["average_response_time"] * (performance_stats["total_requests"] - 1) + execution_time) 
             / performance_stats["total_requests"]
         )
-        performance_stats["cache_hits"] = recommendations_dict.get("cache_hits", 0)
         
-        # Add performance metadata to response
+        # Add performance metadata to response (preserve existing structure)
         recommendations_dict["api_response_time_seconds"] = round(execution_time, 3)
         recommendations_dict["algorithm_used"] = algorithm
+        
+        # Ensure task_id is present
+        if "task_id" not in recommendations_dict:
+            recommendations_dict["task_id"] = new_task.get("id", "unknown")
         
         return jsonify(recommendations_dict), 200
         
@@ -114,45 +130,41 @@ def recommend():
             "algorithm_used": algorithm if 'algorithm' in locals() else "unknown"
         }), 500
 
-@app.route('/recommend/ultra-fast', methods=['POST'])
-def recommend_ultra_fast():
-    """Endpoint specifically for ultra-fast recommendations."""
+@app.route('/recommend/fixed-optimized', methods=['POST'])
+def recommend_fixed_optimized():
+    """Endpoint specifically for fixed optimized recommendations."""
     data = request.get_json()
-    data['algorithm'] = 'ultra_fast'
+    data['algorithm'] = 'fixed_optimized'
     return recommend()
 
-@app.route('/recommend/optimized', methods=['POST'])
-def recommend_optimized():
-    """Endpoint specifically for optimized recommendations."""
+@app.route('/recommend/light-optimized', methods=['POST'])
+def recommend_light_optimized():
+    """Endpoint specifically for light optimized recommendations."""
     data = request.get_json()
-    data['algorithm'] = 'optimized'
+    data['algorithm'] = 'light_optimized'
     return recommend()
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
     """Get detailed performance statistics."""
-    from OR_tool_prototype_ultra_fast import _osrm_cache as ultra_cache
-    
     try:
-        from OR_tool_prototype_optimized import _osrm_cache as opt_cache
+        from OR_tool_prototype_light_optimized import _osrm_cache as light_cache
         cache_info = {
-            "ultra_fast_cache_size": len(ultra_cache),
-            "optimized_cache_size": len(opt_cache),
-            "total_cache_entries": len(ultra_cache) + len(opt_cache)
+            "light_optimized_cache_size": len(light_cache),
+            "total_cache_entries": len(light_cache)
         }
-    except ImportError:
+    except (ImportError, AttributeError):
         cache_info = {
-            "ultra_fast_cache_size": len(ultra_cache),
-            "total_cache_entries": len(ultra_cache)
+            "light_optimized_cache_size": 0,
+            "total_cache_entries": 0
         }
     
     return jsonify({
         **performance_stats,
         **cache_info,
         "algorithm_usage": {
-            "ultra_fast_percentage": round(performance_stats["ultra_fast_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
-            "optimized_percentage": round(performance_stats["optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
-            "original_percentage": round(performance_stats["original_requests"] / max(performance_stats["total_requests"], 1) * 100, 1)
+            "fixed_optimized_percentage": round(performance_stats["fixed_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
+            "light_optimized_percentage": round(performance_stats["light_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1)
         }
     }), 200
 
@@ -160,28 +172,19 @@ def get_stats():
 def clear_cache():
     """Clear all caches."""
     try:
-        from OR_tool_prototype_ultra_fast import _osrm_cache as ultra_cache
-        ultra_cache.clear()
-        
-        try:
-            from OR_tool_prototype_optimized import _osrm_cache as opt_cache
-            opt_cache.clear()
-            return jsonify({
-                "message": "All caches cleared successfully",
-                "caches_cleared": ["ultra_fast", "optimized"]
-            }), 200
-        except ImportError:
-            return jsonify({
-                "message": "Ultra-fast cache cleared",
-                "caches_cleared": ["ultra_fast"]
-            }), 200
+        from OR_tool_prototype_light_optimized import _osrm_cache as light_cache
+        light_cache.clear()
+        return jsonify({
+            "message": "Light optimized cache cleared successfully",
+            "caches_cleared": ["light_optimized"]
+        }), 200
             
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/benchmark', methods=['POST'])
 def benchmark():
-    """Run a quick benchmark comparing all available algorithms."""
+    """Run a quick benchmark comparing both available algorithms."""
     try:
         data = request.get_json()
         required_fields = ['new_task', 'agents', 'current_tasks']
@@ -195,40 +198,51 @@ def benchmark():
         
         results = {}
         
-        # Test ultra-fast
+        # Test fixed optimized
         try:
             start_time = time.time()
-            from OR_tool_prototype_ultra_fast import recommend_agents_ultra_fast
-            ultra_result = recommend_agents_ultra_fast(new_task, agents, current_tasks)
-            ultra_time = time.time() - start_time
-            results["ultra_fast"] = {
-                "execution_time": round(ultra_time, 3),
+            from OR_tool_prototype_optimized_fixed import recommend_agents
+            fixed_result = recommend_agents(new_task, agents, current_tasks)
+            fixed_time = time.time() - start_time
+            results["fixed_optimized"] = {
+                "execution_time": round(fixed_time, 3),
                 "success": True,
-                "top_score": json.loads(ultra_result)["recommendations"][0]["score"] if ultra_result else 0
+                "recommended_driver": fixed_result
             }
         except Exception as e:
-            results["ultra_fast"] = {"execution_time": 0, "success": False, "error": str(e)}
+            results["fixed_optimized"] = {"execution_time": 0, "success": False, "error": str(e)}
         
-        # Test optimized (with short timeout)
+        # Test light optimized
         try:
             start_time = time.time()
-            from OR_tool_prototype_optimized import recommend_agents_optimized
-            opt_result = recommend_agents_optimized(new_task, agents, current_tasks)
-            opt_time = time.time() - start_time
-            results["optimized"] = {
-                "execution_time": round(opt_time, 3),
+            from OR_tool_prototype_light_optimized import recommend_agents
+            light_result = recommend_agents(new_task, agents, current_tasks)
+            light_time = time.time() - start_time
+            results["light_optimized"] = {
+                "execution_time": round(light_time, 3),
                 "success": True,
-                "top_score": json.loads(opt_result)["recommendations"][0]["score"] if opt_result else 0
+                "recommended_driver": light_result
             }
         except Exception as e:
-            results["optimized"] = {"execution_time": 0, "success": False, "error": str(e)}
+            results["light_optimized"] = {"execution_time": 0, "success": False, "error": str(e)}
         
         # Add comparison
-        if results["ultra_fast"]["success"] and results["optimized"]["success"]:
-            speedup = results["optimized"]["execution_time"] / max(results["ultra_fast"]["execution_time"], 0.001)
+        if results["fixed_optimized"]["success"] and results["light_optimized"]["success"]:
+            fixed_time = results["fixed_optimized"]["execution_time"]
+            light_time = results["light_optimized"]["execution_time"]
+            
+            if fixed_time < light_time:
+                speedup = light_time / max(fixed_time, 0.001)
+                faster_algorithm = "fixed_optimized"
+            else:
+                speedup = fixed_time / max(light_time, 0.001)
+                faster_algorithm = "light_optimized"
+                
             results["comparison"] = {
-                "ultra_fast_speedup": f"{speedup:.1f}x faster",
-                "time_saved_ms": round((results["optimized"]["execution_time"] - results["ultra_fast"]["execution_time"]) * 1000)
+                "faster_algorithm": faster_algorithm,
+                "speedup": f"{speedup:.1f}x faster",
+                "time_difference_ms": round(abs(fixed_time - light_time) * 1000),
+                "both_recommend_same_driver": results["fixed_optimized"]["recommended_driver"] == results["light_optimized"]["recommended_driver"]
             }
         
         return jsonify(results), 200
