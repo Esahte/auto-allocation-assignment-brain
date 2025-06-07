@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import json
 import os
 import time
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -11,8 +12,18 @@ performance_stats = {
     "fixed_optimized_requests": 0,
     "light_optimized_requests": 0,
     "average_response_time": 0.0,
-    "cache_hits": 0
+    "cache_hits": 0,
+    "algorithm_usage": {},
+    "response_times": []
 }
+
+# Add import for new batch optimization
+try:
+    from OR_tool_prototype_batch_optimized import recommend_agents_batch_optimized, clear_cache
+    BATCH_AVAILABLE = True
+except ImportError:
+    BATCH_AVAILABLE = False
+    print("Warning: Batch optimization not available")
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -52,15 +63,28 @@ def recommend():
             num_agents = len(agents)
             num_tasks = len(current_tasks)
             
-            # Use light_optimized for smaller datasets (original solver settings with caching)
-            # Use fixed_optimized for larger datasets (adaptive timeouts and algorithm selection)
-            if num_agents <= 20 and num_tasks <= 50:
+            # Enhanced auto-selection with batch optimization preference
+            if BATCH_AVAILABLE and num_agents >= 5 and num_tasks >= 2:
+                algorithm = 'batch_optimized'   # Use batch optimization for multiple agents/tasks
+            elif num_agents <= 20 and num_tasks <= 50:
                 algorithm = 'light_optimized'    # Good for smaller datasets with caching benefits
             else:
                 algorithm = 'fixed_optimized'    # Best for larger datasets with adaptive optimizations
         
         # Call the appropriate recommendation service
-        if algorithm == 'fixed_optimized':
+        if algorithm == 'batch_optimized' and BATCH_AVAILABLE:
+            recommendations = recommend_agents_batch_optimized(
+                new_task=new_task,
+                agents=agents,
+                current_tasks=current_tasks,
+                max_grace_period=max_grace_period,
+                enable_debug=enable_debug
+            )
+            if "algorithm_usage" not in performance_stats:
+                performance_stats["algorithm_usage"] = {}
+            performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
+            
+        elif algorithm == 'fixed_optimized':
             from OR_tool_prototype_optimized_fixed import recommend_agents
             recommendations = recommend_agents(
                 new_task, agents, current_tasks, max_grace_period
@@ -77,7 +101,7 @@ def recommend():
         else:
             return jsonify({
                 "error": f"Unknown algorithm: {algorithm}",
-                "available_algorithms": ["fixed_optimized", "light_optimized", "auto"]
+                "available_algorithms": ["batch_optimized", "fixed_optimized", "light_optimized", "auto"]
             }), 400
         
         # Handle detailed JSON response from optimized models
@@ -132,6 +156,73 @@ def recommend_light_optimized():
     data['algorithm'] = 'light_optimized'
     return recommend()
 
+@app.route('/recommend/batch-optimized', methods=['POST'])
+def recommend_batch_optimized():
+    """
+    Batch-optimized recommendation using native multi-vehicle VRP capabilities.
+    Processes ALL agents simultaneously instead of sequential optimization.
+    """
+    if not BATCH_AVAILABLE:
+        return jsonify({
+            "error": "Batch optimization not available",
+            "message": "OR_tool_prototype_batch_optimized module not found"
+        }), 503
+    
+    try:
+        # Parse request
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        new_task = data.get('new_task')
+        agents = data.get('agents', [])
+        current_tasks = data.get('current_tasks', [])
+        max_grace_period = data.get('max_grace_period', 3600)
+        
+        if not new_task or not agents:
+            return jsonify({"error": "Missing required fields: new_task, agents"}), 400
+        
+        enable_debug = data.get('debug', False)
+        
+        start_time = time.time()
+        
+        # Run batch optimization
+        result = recommend_agents_batch_optimized(
+            new_task=new_task,
+            agents=agents,
+            current_tasks=current_tasks,
+            max_grace_period=max_grace_period,
+            enable_debug=enable_debug
+        )
+        
+        execution_time = time.time() - start_time
+        
+        # Update statistics
+        performance_stats["total_requests"] += 1
+        performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
+        performance_stats["response_times"].append(execution_time)
+        if len(performance_stats["response_times"]) > 100:
+            performance_stats["response_times"] = performance_stats["response_times"][-100:]
+        
+        # Add metadata
+        result['metadata'] = {
+            'algorithm': 'batch_optimized',
+            'execution_time': execution_time,
+            'agents_count': len(agents),
+            'current_tasks_count': len(current_tasks),
+            'optimization_method': 'native_multi_vehicle_vrp'
+        }
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        execution_time = time.time() - start_time
+        app.logger.error(f"Error processing request in {execution_time:.3f}s: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "algorithm": "batch_optimized"
+        }), 500
+
 @app.route('/stats', methods=['GET'])
 def get_stats():
     """Get detailed performance statistics."""
@@ -152,23 +243,34 @@ def get_stats():
         **cache_info,
         "algorithm_usage": {
             "fixed_optimized_percentage": round(performance_stats["fixed_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
-            "light_optimized_percentage": round(performance_stats["light_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1)
+            "light_optimized_percentage": round(performance_stats["light_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
+            "batch_optimized_percentage": round(performance_stats["algorithm_usage"].get("batch_optimized", 0) / max(performance_stats["total_requests"], 1) * 100, 1)
         }
     }), 200
 
 @app.route('/cache/clear', methods=['POST'])
-def clear_cache():
-    """Clear all caches."""
+def clear_caches():
+    """Clear all optimization caches."""
     try:
-        from OR_tool_prototype_light_optimized import _osrm_cache as light_cache
-        light_cache.clear()
+        cleared_caches = []
+        
+        # Clear batch optimization cache if available
+        if BATCH_AVAILABLE:
+            clear_cache()
+            cleared_caches.append("batch_optimization_cache")
+        
+        # Clear any other caches here in the future
+        
         return jsonify({
-            "message": "Light optimized cache cleared successfully",
-            "caches_cleared": ["light_optimized"]
-        }), 200
-            
+            "message": "Caches cleared successfully",
+            "cleared_caches": cleared_caches,
+            "timestamp": datetime.now().isoformat()
+        })
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": f"Failed to clear caches: {str(e)}"
+        }), 500
 
 @app.route('/benchmark', methods=['POST'])
 def benchmark():
