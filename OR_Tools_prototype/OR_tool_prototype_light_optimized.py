@@ -12,11 +12,12 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import numpy as np
 import json
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, timezone, timedelta
 import hashlib
 import time
 import math
+import requests
 
 # OSRM cache for API calls - especially useful for grace period loops
 _osrm_cache = {}
@@ -36,6 +37,65 @@ def is_cache_valid(timestamp: float) -> bool:
     """Check if cache entry is still valid."""
     return time.time() - timestamp < _cache_timeout
 
+def build_osrm_time_matrix_internal(coordinates: List[Tuple[float, float]]) -> List[List[float]]:
+    """
+    Build time matrix using OSRM API.
+    Returns travel times in seconds between all coordinate pairs.
+    """
+    import requests
+    
+    if len(coordinates) <= 1:
+        return [[0.0]]
+    
+    try:
+        # Format coordinates for OSRM API
+        coords_str = ";".join([f"{lng},{lat}" for lat, lng in coordinates])
+        url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=duration"
+        
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get('code') != 'Ok':
+            raise Exception(f"OSRM API error: {data.get('message', 'Unknown error')}")
+        
+        # Convert to float seconds
+        durations = data['durations']
+        return [[float(duration) for duration in row] for row in durations]
+        
+    except Exception as e:
+        print(f"OSRM API call failed: {e}")
+        # Fallback to approximate distances
+        return build_approximate_time_matrix_light(coordinates)
+
+def build_approximate_time_matrix_light(coordinates: List[Tuple[float, float]]) -> List[List[float]]:
+    """Fallback approximate time matrix based on Haversine distance."""
+    def haversine_distance(lat1, lng1, lat2, lng2):
+        R = 6371  # Earth's radius in kilometers
+        import math
+        dlat = math.radians(lat2 - lat1)
+        dlng = math.radians(lng2 - lng1)
+        a = (math.sin(dlat/2)**2 + 
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng/2)**2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return R * c
+
+    n = len(coordinates)
+    matrix = [[0.0] * n for _ in range(n)]
+    
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                lat1, lng1 = coordinates[i]
+                lat2, lng2 = coordinates[j]
+                distance_km = haversine_distance(lat1, lng1, lat2, lng2)
+                # Assume average speed of 30 km/h in urban areas
+                time_seconds = (distance_km / 30) * 3600
+                matrix[i][j] = time_seconds
+    
+    return matrix
+
 def build_osrm_time_matrix_cached(coordinates: List[Tuple[float, float]]) -> List[List[float]]:
     """
     Cached OSRM matrix building - avoids repeated API calls for same coordinate sets.
@@ -53,8 +113,7 @@ def build_osrm_time_matrix_cached(coordinates: List[Tuple[float, float]]) -> Lis
             del _osrm_cache[cache_key]
     
     # If not cached or expired, make API call
-    from osrm_tables_test import build_osrm_time_matrix
-    matrix = build_osrm_time_matrix(coordinates)
+    matrix = build_osrm_time_matrix_internal(coordinates)
     
     # Cache the result
     _osrm_cache[cache_key] = (matrix, time.time())
@@ -518,12 +577,6 @@ def calculate_agent_score(grace_penalty_seconds: float, additional_time_minutes:
     """
     score = 100.0
     
-    print(f"  - Grace penalty: {grace_penalty_seconds:.5f}s")
-    print(f"  - Additional time: {additional_time_minutes} min")
-    print(f"  - Current tasks: {current_task_count}")
-    print(f"  - Already late stops: {already_late_stops}")
-    print(f"  - Total route time: {total_route_time}s")
-    
     # Grace period penalty (0-25 points)
     if grace_penalty_seconds > 0:
         grace_penalty_ratio = min(grace_penalty_seconds / max_grace_period, 1.0)
@@ -550,7 +603,6 @@ def calculate_agent_score(grace_penalty_seconds: float, additional_time_minutes:
     score -= late_stops_penalty * 10
     
     final_score = max(0, round(score))
-    print(f"  - Final score: {final_score}")
     
     return final_score
 
