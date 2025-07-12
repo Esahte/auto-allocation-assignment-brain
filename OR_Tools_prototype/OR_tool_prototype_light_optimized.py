@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 import hashlib
 import time
+import math
 
 # OSRM cache for API calls - especially useful for grace period loops
 _osrm_cache = {}
@@ -555,35 +556,66 @@ def calculate_agent_score(grace_penalty_seconds: float, additional_time_minutes:
 
 def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], 
                     current_tasks: List[Dict[str, Any]], 
-                    max_grace_period: int = DEFAULT_MAX_GRACE_PERIOD):
+                    max_grace_period: int = DEFAULT_MAX_GRACE_PERIOD,
+                    use_proximity: bool = True,
+                    area_type: str = "urban",
+                    enable_debug: bool = False,
+                    max_distance_km: Optional[float] = None):
     """
-    Main recommendation function with light optimizations.
+    Main recommendation function with light optimizations and proximity filtering.
+    
+    Args:
+        use_proximity: Enable proximity-based agent filtering (default: True)
+        area_type: "urban" or "rural" - affects proximity settings
+        enable_debug: Enable debug output
+        max_distance_km: Maximum distance in kilometers for agent selection (default: None, allows up to 50km)
     """
     start_time = time.time()
     grace_period = INITIAL_GRACE_PERIOD
     best_recommendations = []
+    agents_evaluated = 0
+
+    # Proximity-based agent filtering BEFORE data model building
+    if use_proximity and len(agents) > 1:  # Changed from > 5 to > 1 to allow proximity filtering with smaller fleets
+        proximity_config = get_proximity_config(len(agents), area_type)
+        candidate_agents_data = get_proximate_agents(
+            new_task, agents, 
+            max_candidates=proximity_config["max_candidates"],
+            initial_radius_km=proximity_config["initial_radius_km"],
+            enable_debug=enable_debug,
+            max_distance_km=max_distance_km
+        )
+        agents_to_evaluate = [agent for _, agent, _ in candidate_agents_data]
+        agent_distance_map = {agent['driver_id']: distance for _, agent, distance in candidate_agents_data}
+    else:
+        agents_to_evaluate = agents
+        candidate_agents_data = [(i, agent, 0) for i, agent in enumerate(agents)]
+        agent_distance_map = {agent['driver_id']: 0 for agent in agents}
 
     while grace_period <= max_grace_period:
-        print(f"=== DEBUG INFO ===")
-        print(f"Agents: {[a.get('driver_id') for a in agents]}")
-        print(f"New Task: {new_task.get('id')} {new_task.get('job_type')}")
+        if enable_debug:
+            print(f"=== DEBUG INFO ===")
+            print(f"Agents: {[a.get('driver_id') for a in agents_to_evaluate]} (from {len(agents)} total)")
+            print(f"New Task: {new_task.get('id')} {new_task.get('job_type')}")
         
-        # Use incremental data model building
+        # Use incremental data model building with filtered agents
         data, assigned_tasks_per_agent, new_task_indices = build_data_model_incremental(
-            new_task, agents, current_tasks, grace_period)
+            new_task, agents_to_evaluate, current_tasks, grace_period)
 
         if new_task_indices is None:
-            print(f"Warning: new task {new_task.get('id')} not found in data model")
+            if enable_debug:
+                print(f"Warning: new task {new_task.get('id')} not found in data model")
             break
 
-        print(f"Task indices: {new_task_indices}")
-        print(f"Assigned tasks per agent: {assigned_tasks_per_agent}")
-        print(f"Time windows: {data['time_windows']}")
-        
-        # Print time matrix for debugging
-        print(f"Time matrix:")
-        for row in data['time_matrix']:
-            print(row)
+        if enable_debug:
+            print(f"Task indices: {new_task_indices}")
+            print(f"Assigned tasks per agent: {assigned_tasks_per_agent}")
+            print(f"Time windows: {data['time_windows']}")
+            
+            # Print time matrix for debugging
+            print(f"Time matrix:")
+            for row in data['time_matrix']:
+                print(row)
 
         # Calculate base route times for all agents (without new task)
         base_route_times = {}
@@ -595,8 +627,10 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
         # Evaluate each agent for the new task
         recommendations = []
         feasible_found = False
+        high_score_threshold = 75
 
         for agent in range(data['num_agents']):
+            agents_evaluated += 1
             assigned = assigned_tasks_per_agent.get(agent, [])
             result = solve_single_agent_routing(data, agent, assigned, new_task_indices)
             
@@ -632,8 +666,6 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
                                 grace_penalty_seconds += grace_used
                                 already_late_stops += 1
 
-                agent_info = data['agents_info'][agent]
-                print(f"Agent {agent_info['driver_id']} Score Breakdown:")
                 score = calculate_agent_score(
                     grace_penalty_seconds=grace_penalty_seconds,
                     additional_time_minutes=additional_time_minutes,
@@ -642,7 +674,20 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
                     total_route_time=result['route_time'],
                     max_grace_period=max_grace_period
                 )
-                print("---")
+                
+                # Add proximity bonus
+                agent_info = data['agents_info'][agent]
+                distance_km = agent_distance_map.get(agent_info['driver_id'], 0)
+                proximity_bonus = max(0, 5 * (1 - distance_km / 20))
+                score = int(score + proximity_bonus)
+                
+                if enable_debug:
+                    print(f"Agent {agent_info['driver_id']} Score Breakdown:")
+                    print(f"  Base Score: {score - proximity_bonus:.1f}")
+                    print(f"  Distance: {distance_km:.1f}km")
+                    print(f"  Proximity Bonus: {proximity_bonus:.1f}")
+                    print(f"  Final Score: {score}")
+                    print("---")
 
             agent_info = data['agents_info'][agent]
             recommendations.append({
@@ -652,32 +697,52 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
                 "additional_time_minutes": additional_time_minutes,
                 "grace_penalty_seconds": grace_penalty_seconds,
                 "already_late_stops": already_late_stops,
+                "distance_km": agent_distance_map.get(agent_info['driver_id'], 0),
+                "proximity_bonus": max(0, 5 * (1 - agent_distance_map.get(agent_info['driver_id'], 0) / 20)),
                 "route": route
             })
 
         if feasible_found:
             recommendations.sort(key=lambda x: x['score'], reverse=True)
             best_recommendations = recommendations
-            break
+            
+            # Early termination if we have high-quality candidates
+            if len(best_recommendations) >= 3 and best_recommendations[0]['score'] >= high_score_threshold:
+                if enable_debug:
+                    print(f"Early termination: found high-quality candidates (score >= {high_score_threshold})")
+                break
 
         # Increase grace period for next iteration
         grace_period = min(grace_period * 2, max_grace_period)
 
     execution_time = time.time() - start_time
-    
     task_id = new_task.get("id", "unknown")
     
     if best_recommendations:
         result = {
             "task_id": task_id,
-            "recommendations": best_recommendations
+            "recommendations": best_recommendations[:3],  # Top 3
+            "performance": {
+                "execution_time_seconds": round(execution_time, 3),
+                "agents_evaluated": len(agents_to_evaluate),
+                "total_agents": len(agents),
+                "proximity_filtering": use_proximity,
+                "or_tools_optimizations": agents_evaluated
+            }
         }
         return json.dumps(result, indent=2)
     else:
         result = {
             "task_id": task_id,
             "recommendations": [],
-            "error": "No feasible assignment found"
+            "error": "No feasible assignment found",
+            "performance": {
+                "execution_time_seconds": round(execution_time, 3),
+                "agents_evaluated": len(agents_to_evaluate),
+                "total_agents": len(agents),
+                "proximity_filtering": use_proximity,
+                "or_tools_optimizations": agents_evaluated
+            }
         }
         return json.dumps(result, indent=2)
 
@@ -771,4 +836,99 @@ def convert_route_to_old_format(detailed_route, agent_index, data):
         "index": agent_index
     })
     
-    return converted_route 
+    return converted_route
+
+def haversine_distance_km(lat1_lng1: Tuple[float, float], lat2_lng2: Tuple[float, float]) -> float:
+    """
+    Calculate the great circle distance in kilometers between two points 
+    on the earth (specified in decimal degrees)
+    """
+    lat1, lng1 = lat1_lng1
+    lat2, lng2 = lat2_lng2
+    
+    # Convert decimal degrees to radians
+    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
+
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Radius of earth in kilometers
+    r = 6371
+    return c * r
+
+def get_proximate_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], 
+                        max_candidates: int = 8, initial_radius_km: float = 5.0,
+                        enable_debug: bool = False, max_distance_km: Optional[float] = None) -> List[Tuple[int, Dict[str, Any], float]]:
+    """
+    Get agents sorted by proximity to new task, expanding radius as needed.
+    Returns: List of (original_agent_index, agent_data, distance_km)
+    """
+    # Use restaurant location as primary proximity point
+    task_location = tuple(new_task['restaurant_location'])
+    
+    # Calculate distances to all agents
+    agent_distances = []
+    for i, agent in enumerate(agents):
+        agent_loc = tuple(agent['current_location'])
+        distance_km = haversine_distance_km(task_location, agent_loc)
+        agent_distances.append((i, agent, distance_km))
+    
+    # Sort by distance
+    agent_distances.sort(key=lambda x: x[2])
+    
+    # Start with closest agents, expand radius if needed
+    radius_km = initial_radius_km
+    selected_agents = []
+    min_candidates = min(3, len(agents))  # Ensure we have at least 3 candidates
+    
+    # Determine maximum allowed radius (either user-specified or default 50km)
+    max_radius_km = max_distance_km if max_distance_km is not None else 50
+    
+    while len(selected_agents) < max_candidates and radius_km <= max_radius_km:
+        for agent_idx, agent, distance in agent_distances:
+            if distance <= radius_km and len(selected_agents) < max_candidates:
+                # Check if agent not already selected
+                if not any(a[0] == agent_idx for a in selected_agents):
+                    selected_agents.append((agent_idx, agent, distance))
+        
+        # If we have minimum candidates and some are reasonably close, we can stop
+        if len(selected_agents) >= min_candidates and selected_agents[-1][2] <= 15:
+            break
+            
+        # If we have max candidates, stop
+        if len(selected_agents) >= max_candidates:
+            break
+            
+        radius_km *= 1.5  # Expand by 50%
+    
+    # If still no candidates and max_distance_km is not set, take the closest ones regardless of distance
+    if len(selected_agents) < min_candidates and max_distance_km is None:
+        selected_agents = agent_distances[:min_candidates]
+    elif len(selected_agents) < min_candidates and max_distance_km is not None:
+        # With max_distance_km set, only take agents within the limit
+        selected_agents = [(idx, agent, dist) for idx, agent, dist in agent_distances 
+                          if dist <= max_distance_km][:min_candidates]
+    
+    if enable_debug:
+        distances = [dist for _, _, dist in selected_agents]
+        print(f"Proximity filtering: {len(agents)} -> {len(selected_agents)} agents")
+        if distances:
+            print(f"Distance range: {min(distances):.1f}km - {max(distances):.1f}km")
+    
+    return selected_agents
+
+def get_proximity_config(num_agents: int, area_type: str = "urban") -> dict:
+    """Get optimal proximity settings based on fleet size and area."""
+    if area_type == "urban":
+        return {
+            "initial_radius_km": 3.0,
+            "max_candidates": min(10, max(4, num_agents // 10))  # Smaller for OR-Tools
+        }
+    else:  # rural
+        return {
+            "initial_radius_km": 15.0, 
+            "max_candidates": min(12, max(6, num_agents // 8))
+        } 

@@ -57,6 +57,18 @@ def recommend():
         max_grace_period = data.get('max_grace_period', 3600)
         algorithm = data.get('algorithm', 'auto')  # auto, fixed_optimized, light_optimized
         enable_debug = data.get('enable_debug', False)
+        use_proximity = data.get('use_proximity', True)
+        area_type = data.get('area_type', 'urban')  # 'urban' or 'rural'
+        max_distance_km = data.get('max_distance_km', None)  # Maximum distance for agent selection
+        
+        # Validate max_distance_km parameter
+        if max_distance_km is not None:
+            if not isinstance(max_distance_km, (int, float)):
+                return jsonify({"error": "max_distance_km must be a number"}), 400
+            if max_distance_km <= 0:
+                return jsonify({"error": "max_distance_km must be positive"}), 400
+            if max_distance_km > 200:  # Reasonable upper limit
+                return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
         
         # Auto-select algorithm based on dataset size and requirements
         if algorithm == 'auto':
@@ -78,7 +90,10 @@ def recommend():
                 agents=agents,
                 current_tasks=current_tasks,
                 max_grace_period=max_grace_period,
-                enable_debug=enable_debug
+                enable_debug=enable_debug,
+                use_proximity=use_proximity,
+                area_type=area_type,
+                max_distance_km=max_distance_km
             )
             if "algorithm_usage" not in performance_stats:
                 performance_stats["algorithm_usage"] = {}
@@ -94,7 +109,8 @@ def recommend():
         elif algorithm == 'light_optimized':
             from OR_tool_prototype_light_optimized import recommend_agents
             recommendations = recommend_agents(
-                new_task, agents, current_tasks, max_grace_period
+                new_task, agents, current_tasks, max_grace_period, 
+                use_proximity, area_type, enable_debug, max_distance_km
             )
             performance_stats["light_optimized_requests"] += 1
             
@@ -178,9 +194,21 @@ def recommend_batch_optimized():
         agents = data.get('agents', [])
         current_tasks = data.get('current_tasks', [])
         max_grace_period = data.get('max_grace_period', 3600)
+        use_proximity = data.get('use_proximity', True)
+        area_type = data.get('area_type', 'urban')
+        max_distance_km = data.get('max_distance_km', None)
         
         if not new_task or not agents:
             return jsonify({"error": "Missing required fields: new_task, agents"}), 400
+        
+        # Validate max_distance_km parameter
+        if max_distance_km is not None:
+            if not isinstance(max_distance_km, (int, float)):
+                return jsonify({"error": "max_distance_km must be a number"}), 400
+            if max_distance_km <= 0:
+                return jsonify({"error": "max_distance_km must be positive"}), 400
+            if max_distance_km > 200:  # Reasonable upper limit
+                return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
         
         enable_debug = data.get('debug', False)
         
@@ -192,7 +220,10 @@ def recommend_batch_optimized():
             agents=agents,
             current_tasks=current_tasks,
             max_grace_period=max_grace_period,
-            enable_debug=enable_debug
+            enable_debug=enable_debug,
+            use_proximity=use_proximity,
+            area_type=area_type,
+            max_distance_km=max_distance_km
         )
         
         execution_time = time.time() - start_time

@@ -409,13 +409,8 @@ def recommend_agents_optimized_fixed(new_task: Dict[str, Any], agents: List[Dict
     start_time = time.time()
     cache_hits = 0
     
-    # For small problems, use simpler approach with single grace period
-    is_small_problem = len(agents) <= 3 and len(current_tasks) <= 2
-    
-    if is_small_problem:
-        grace_periods = [INITIAL_GRACE_PERIOD]
-    else:
-        grace_periods = [INITIAL_GRACE_PERIOD, INITIAL_GRACE_PERIOD * 2, max_grace_period]
+    # Use single grace period for all problems to avoid multiple optimization cycles
+    grace_periods = [INITIAL_GRACE_PERIOD]
     
     best_recommendations = []
     
@@ -497,7 +492,7 @@ def recommend_agents_optimized_fixed(new_task: Dict[str, Any], agents: List[Dict
         if feasible_found:
             recommendations.sort(key=lambda x: x['score'], reverse=True)
             best_recommendations = recommendations
-            break  # Early exit for small problems
+            break  # Exit after first successful optimization
 
     execution_time = time.time() - start_time
     
