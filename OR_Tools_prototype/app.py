@@ -70,6 +70,9 @@ def recommend():
             if max_distance_km > 200:  # Reasonable upper limit
                 return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
         
+        # Optimization mode flag (backward compatible)
+        optimization_mode = data.get('optimization_mode', 'current')
+        
         # Auto-select algorithm based on dataset size and requirements
         if algorithm == 'auto':
             num_agents = len(agents)
@@ -93,7 +96,8 @@ def recommend():
                 enable_debug=enable_debug,
                 use_proximity=use_proximity,
                 area_type=area_type,
-                max_distance_km=max_distance_km
+                max_distance_km=max_distance_km,
+                optimization_mode=optimization_mode
             )
             if "algorithm_usage" not in performance_stats:
                 performance_stats["algorithm_usage"] = {}
@@ -197,6 +201,7 @@ def recommend_batch_optimized():
         use_proximity = data.get('use_proximity', True)
         area_type = data.get('area_type', 'urban')
         max_distance_km = data.get('max_distance_km', None)
+        optimization_mode = data.get('optimization_mode', 'current')
         
         if not new_task or not agents:
             return jsonify({"error": "Missing required fields: new_task, agents"}), 400
@@ -223,7 +228,8 @@ def recommend_batch_optimized():
             enable_debug=enable_debug,
             use_proximity=use_proximity,
             area_type=area_type,
-            max_distance_km=max_distance_km
+            max_distance_km=max_distance_km,
+            optimization_mode=optimization_mode
         )
         
         execution_time = time.time() - start_time

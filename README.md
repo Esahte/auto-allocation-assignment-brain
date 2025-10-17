@@ -25,7 +25,7 @@ A high-performance delivery agent recommendation system using Google OR-Tools op
 - **Platform**: Google Cloud Run (us-central1)
 - **Configuration**: 2GB memory, 2 CPU cores, max 10 instances
 - **Uptime**: 99.9% availability with auto-scaling
-- **Latest Update**: 🎯 **Proximity-based filtering now live** (deployed June 2025)
+- **Latest Update**: 🎯 **Delivery-only tasks support now live** (deployed October 2025)
 - **Testing**: Full API compatibility validated with comprehensive test suite
 
 ### **Production API Usage**
@@ -217,6 +217,55 @@ curl -X POST https://or-tools-recommender-95621826490.us-central1.run.app/recomm
   "area_type": "urban",
   "max_distance_km": 10
 }
+```
+
+### **🆕 Delivery-Only Tasks Support**
+
+The system now supports **delivery-only tasks** for scenarios where pickups have already been completed. This is useful when an agent has already picked up an order and only needs to deliver it.
+
+**Use the `pickup_completed` flag:**
+
+```json
+{
+  "current_tasks": [
+    {
+      "id": "task_A",
+      "job_type": "PAIRED",
+      "restaurant_location": [17.130, -61.870],  // Optional when pickup_completed=true
+      "delivery_location": [17.145, -61.885],     // Required
+      "pickup_before": "2025-05-30T16:30:00Z",    // Optional when pickup_completed=true
+      "delivery_before": "2025-05-30T17:00:00Z",  // Required
+      "assigned_driver": "driver_001",
+      "pickup_completed": true  // 🆕 NEW FLAG - marks pickup as completed
+    },
+    {
+      "id": "task_B",
+      "job_type": "PAIRED",
+      "restaurant_location": [17.135, -61.875],
+      "delivery_location": [17.150, -61.890],
+      "pickup_before": "2025-05-30T16:45:00Z",
+      "delivery_before": "2025-05-30T17:15:00Z",
+      "assigned_driver": "driver_001",
+      "pickup_completed": false  // Normal paired task (default)
+    }
+  ]
+}
+```
+
+**How it works:**
+- When `pickup_completed: true`, the system **only routes the agent to the delivery location**
+- The pickup location and pickup_before time are ignored for routing (but can still be included for record-keeping)
+- The agent's route will start from their current location, skip the pickup, and go directly to the delivery
+- **Backward compatible**: Tasks without the `pickup_completed` flag default to `false` (normal PAIRED behavior)
+
+**Example Scenario:**
+```
+Agent has 3 tasks: A (pickup done), B (pickup done), C (new task)
+- Task A: pickup_completed=true → Only delivery routed
+- Task B: pickup_completed=true → Only delivery routed  
+- Task C: Normal PAIRED task → Both pickup and delivery routed
+
+Result: Agent routes to → Delivery A → Delivery B → Pickup C → Delivery C
 ```
 
 ### **Response Format**
@@ -419,6 +468,16 @@ python test_api_compatibility.py
 ```
 Runs comprehensive validation of API request/response formats to ensure 100% compatibility.
 
+### **Delivery-Only Tasks Testing**
+```bash
+cd OR_Tools_prototype
+python test_delivery_only.py
+```
+Tests the `pickup_completed` flag functionality with various scenarios:
+- Mixed tasks (some with completed pickups, some normal)
+- All delivery-only tasks
+- Backward compatibility (tasks without the flag)
+
 ### **Load Testing**
 The production service has been tested with:
 - ✅ **Small datasets (2-5 agents, 1-10 tasks)**: 0.75s response time (batch-optimized)
@@ -518,7 +577,8 @@ curl -X POST https://or-tools-recommender-95621826490.us-central1.run.app/recomm
 
 **🎯 Ready for Production**: This system is deployed and battle-tested on Google Cloud Run with **15x performance improvements** using revolutionary batch optimization + proximity filtering while maintaining 100% API compatibility.
 
-### 🚀 **Latest Deployment (June 2025)**
+### 🚀 **Latest Deployment (October 2025)**
+- ✅ **Delivery-only tasks support now live** - `pickup_completed` flag
 - ✅ **Proximity-based filtering now live in production**
 - ✅ **Up to 15x performance boost** with geographic agent filtering  
 - ✅ **Backward compatible** - existing integrations work unchanged

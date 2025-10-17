@@ -224,7 +224,10 @@ def build_data_model_incremental(new_task: Dict[str, Any], agents: List[Dict[str
     for task in all_tasks:
         pickup_loc = task.get("restaurant_location")
         delivery_loc = task.get("delivery_location")
-        if pickup_loc and len(pickup_loc) == 2:
+        pickup_completed = task.get("pickup_completed", False)
+        
+        # Only add pickup location if pickup hasn't been completed
+        if pickup_loc and len(pickup_loc) == 2 and not pickup_completed:
             task_locations.append(tuple(pickup_loc))
         if delivery_loc and len(delivery_loc) == 2:
             task_locations.append(tuple(delivery_loc))
@@ -310,66 +313,103 @@ def build_data_model_incremental(new_task: Dict[str, Any], agents: List[Dict[str
             task_id_to_indices[tid] = (None, delivery_index)
         
         else:  # PAIRED
-            if pickup_loc is None or len(pickup_loc) != 2:
-                raise ValueError(f"Task {tid} missing valid restaurant_location")
-            if delivery_loc is None or len(delivery_loc) != 2:
-                raise ValueError(f"Task {tid} missing valid delivery_location")
+            pickup_completed = task.get("pickup_completed", False)
             
-            pickup_index = location_indices[tuple(pickup_loc)]
-            delivery_index = location_indices[tuple(delivery_loc)]
-            
-            node_metadata[pickup_index] = {
-                "task_id": tid,
-                "type": "pickup",
-                "deadline_iso": pickup_before,
-                "is_new_task": is_new_task
-            }
-            node_metadata[delivery_index] = {
-                "task_id": tid,
-                "type": "delivery",
-                "deadline_iso": delivery_before,
-                "is_new_task": is_new_task
-            }
-            
-            # Process pickup time window
-            if pickup_before and pickup_before in parsed_times:
-                pickup_tw_end, grace_used = parsed_times[pickup_before]
-                grace_penalties[pickup_index] = grace_used
-                if isinstance(pickup_tw_end, tuple):
-                    pickup_tw = pickup_tw_end
-                    dt = datetime.fromisoformat(pickup_before.replace("Z", "+00:00")).astimezone(timezone.utc)
-                    now = datetime.now(timezone.utc)
-                    deadline_seconds = int((dt - now).total_seconds())
-                    late_flags[pickup_index] = max(deadline_seconds, 0)
+            # Handle PAIRED tasks with completed pickups (delivery-only mode)
+            if pickup_completed:
+                # Treat as delivery-only
+                if delivery_loc is None or len(delivery_loc) != 2:
+                    raise ValueError(f"Task {tid} missing valid delivery_location")
+                delivery_index = location_indices[tuple(delivery_loc)]
+                
+                node_metadata[delivery_index] = {
+                    "task_id": tid,
+                    "type": "delivery",
+                    "deadline_iso": delivery_before,
+                    "is_new_task": is_new_task
+                }
+                
+                if delivery_before and delivery_before in parsed_times:
+                    delivery_tw_end, grace_used = parsed_times[delivery_before]
+                    grace_penalties[delivery_index] = grace_used
+                    if isinstance(delivery_tw_end, tuple):
+                        delivery_tw = delivery_tw_end
+                        dt = datetime.fromisoformat(delivery_before.replace("Z", "+00:00")).astimezone(timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        deadline_seconds = int((dt - now).total_seconds())
+                        late_flags[delivery_index] = max(deadline_seconds, 0)
+                    else:
+                        delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
+                        late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
                 else:
-                    pickup_tw = (0, pickup_tw_end if pickup_tw_end is not None else MAX_TIME)
-                    late_flags[pickup_index] = pickup_tw_end if pickup_tw_end is not None else MAX_TIME
+                    delivery_tw = (0, MAX_TIME)
+                    late_flags[delivery_index] = MAX_TIME
+                    grace_penalties[delivery_index] = 0
+                
+                time_windows[delivery_index] = delivery_tw
+                task_id_to_indices[tid] = (None, delivery_index)
             else:
-                pickup_tw = (0, MAX_TIME)
-                late_flags[pickup_index] = MAX_TIME
-                grace_penalties[pickup_index] = 0
-            
-            # Process delivery time window
-            if delivery_before and delivery_before in parsed_times:
-                delivery_tw_end, grace_used = parsed_times[delivery_before]
-                grace_penalties[delivery_index] = grace_used
-                if isinstance(delivery_tw_end, tuple):
-                    delivery_tw = delivery_tw_end
-                    dt = datetime.fromisoformat(delivery_before.replace("Z", "+00:00")).astimezone(timezone.utc)
-                    now = datetime.now(timezone.utc)
-                    deadline_seconds = int((dt - now).total_seconds())
-                    late_flags[delivery_index] = max(deadline_seconds, 0)
+                # Normal PAIRED task with both pickup and delivery
+                if pickup_loc is None or len(pickup_loc) != 2:
+                    raise ValueError(f"Task {tid} missing valid restaurant_location")
+                if delivery_loc is None or len(delivery_loc) != 2:
+                    raise ValueError(f"Task {tid} missing valid delivery_location")
+                
+                pickup_index = location_indices[tuple(pickup_loc)]
+                delivery_index = location_indices[tuple(delivery_loc)]
+                
+                node_metadata[pickup_index] = {
+                    "task_id": tid,
+                    "type": "pickup",
+                    "deadline_iso": pickup_before,
+                    "is_new_task": is_new_task
+                }
+                node_metadata[delivery_index] = {
+                    "task_id": tid,
+                    "type": "delivery",
+                    "deadline_iso": delivery_before,
+                    "is_new_task": is_new_task
+                }
+                
+                # Process pickup time window
+                if pickup_before and pickup_before in parsed_times:
+                    pickup_tw_end, grace_used = parsed_times[pickup_before]
+                    grace_penalties[pickup_index] = grace_used
+                    if isinstance(pickup_tw_end, tuple):
+                        pickup_tw = pickup_tw_end
+                        dt = datetime.fromisoformat(pickup_before.replace("Z", "+00:00")).astimezone(timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        deadline_seconds = int((dt - now).total_seconds())
+                        late_flags[pickup_index] = max(deadline_seconds, 0)
+                    else:
+                        pickup_tw = (0, pickup_tw_end if pickup_tw_end is not None else MAX_TIME)
+                        late_flags[pickup_index] = pickup_tw_end if pickup_tw_end is not None else MAX_TIME
                 else:
-                    delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
-                    late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
-            else:
-                delivery_tw = (0, MAX_TIME)
-                late_flags[delivery_index] = MAX_TIME
-                grace_penalties[delivery_index] = 0
-            
-            time_windows[pickup_index] = pickup_tw
-            time_windows[delivery_index] = delivery_tw
-            task_id_to_indices[tid] = (pickup_index, delivery_index)
+                    pickup_tw = (0, MAX_TIME)
+                    late_flags[pickup_index] = MAX_TIME
+                    grace_penalties[pickup_index] = 0
+                
+                # Process delivery time window
+                if delivery_before and delivery_before in parsed_times:
+                    delivery_tw_end, grace_used = parsed_times[delivery_before]
+                    grace_penalties[delivery_index] = grace_used
+                    if isinstance(delivery_tw_end, tuple):
+                        delivery_tw = delivery_tw_end
+                        dt = datetime.fromisoformat(delivery_before.replace("Z", "+00:00")).astimezone(timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        deadline_seconds = int((dt - now).total_seconds())
+                        late_flags[delivery_index] = max(deadline_seconds, 0)
+                    else:
+                        delivery_tw = (0, delivery_tw_end if delivery_tw_end is not None else MAX_TIME)
+                        late_flags[delivery_index] = delivery_tw_end if delivery_tw_end is not None else MAX_TIME
+                else:
+                    delivery_tw = (0, MAX_TIME)
+                    late_flags[delivery_index] = MAX_TIME
+                    grace_penalties[delivery_index] = 0
+                
+                time_windows[pickup_index] = pickup_tw
+                time_windows[delivery_index] = delivery_tw
+                task_id_to_indices[tid] = (pickup_index, delivery_index)
     
     # Build pickups_deliveries list
     for tid, (pidx, didx) in task_id_to_indices.items():

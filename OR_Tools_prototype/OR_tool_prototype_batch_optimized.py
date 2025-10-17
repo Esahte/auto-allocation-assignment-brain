@@ -207,13 +207,57 @@ def parse_time(time_str: str) -> datetime:
         time_str = time_str[:-1] + '+00:00'
     return datetime.fromisoformat(time_str)
 
+def build_google_maps_url(route: List[Dict[str, Any]], index_to_location: Dict[int, Tuple[float, float]]) -> str:
+    """
+    Build a Google Maps Directions URL from the route.
+    Starts from agent's current location (start point), includes all pickup/delivery waypoints in order.
+    """
+    # Extract the agent's starting location
+    origin = None
+    waypoints = []
+    
+    for step in route:
+        step_type = step.get('type')
+        if step_type == 'start':
+            # Get agent's current location as origin
+            idx = step.get('index')
+            if idx is not None and idx in index_to_location:
+                lat, lng = index_to_location[idx]
+                origin = (lat, lng)
+        elif step_type in ['new_task_pickup', 'existing_task_pickup']:
+            idx = step.get('pickup_index')
+            if idx is not None and idx in index_to_location:
+                lat, lng = index_to_location[idx]
+                waypoints.append((lat, lng))
+        elif step_type in ['new_task_delivery', 'existing_task_delivery']:
+            idx = step.get('delivery_index')
+            if idx is not None and idx in index_to_location:
+                lat, lng = index_to_location[idx]
+                waypoints.append((lat, lng))
+    
+    # Need at least an origin and one waypoint
+    if not origin or len(waypoints) < 1:
+        return ""
+    
+    # Use the last waypoint as destination
+    destination = waypoints[-1]
+    middle = waypoints[:-1]
+    
+    url = f"https://www.google.com/maps/dir/?api=1&origin={origin[0]},{origin[1]}&destination={destination[0]},{destination[1]}"
+    if middle:
+        waypoint_str = "|".join([f"{lat},{lng}" for lat, lng in middle])
+        url += f"&waypoints={waypoint_str}"
+    
+    return url
+
 def evaluate_agent_for_new_task(
     agent: Dict[str, Any],
     new_task: Dict[str, Any], 
     current_tasks: List[Dict[str, Any]],
     time_matrix: List[List[int]],
     location_to_index: Dict[Tuple[float, float], int],
-    max_grace_period: int
+    max_grace_period: int,
+    optimization_mode: str = "current"
 ) -> Dict[str, Any]:
     """
     Evaluate how adding the new task affects a specific agent's route.
@@ -234,7 +278,7 @@ def evaluate_agent_for_new_task(
     
     # Find best insertion points for new task
     best_insertion = find_best_insertion_point(
-        agent, new_task, current_route, time_matrix, location_to_index, max_grace_period
+        agent, new_task, current_route, time_matrix, location_to_index, max_grace_period, optimization_mode
     )
     
     return best_insertion
@@ -244,7 +288,10 @@ def build_agent_route(
     agent_tasks: List[Dict[str, Any]], 
     location_to_index: Dict[Tuple[float, float], int]
 ) -> List[Dict[str, Any]]:
-    """Build the current route for an agent with their existing tasks."""
+    """
+    Build the current route for an agent with their existing tasks.
+    Supports delivery-only tasks via the 'pickup_completed' flag.
+    """
     if not agent_tasks:
         return []
     
@@ -261,22 +308,30 @@ def build_agent_route(
     })
     
     # Add existing tasks (in chronological order by pickup time)
-    sorted_tasks = sorted(agent_tasks, key=lambda t: parse_time(t['pickup_before']))
+    # For delivery-only tasks, sort by delivery_before instead
+    def get_sort_key(task):
+        if task.get('pickup_completed', False):
+            return parse_time(task['delivery_before'])
+        return parse_time(task['pickup_before'])
+    
+    sorted_tasks = sorted(agent_tasks, key=get_sort_key)
     
     for task in sorted_tasks:
-        restaurant_loc = tuple(task['restaurant_location'])
         delivery_loc = tuple(task['delivery_location'])
+        pickup_completed = task.get('pickup_completed', False)
         
-        # Add pickup
-        route_points.append({
-            'type': 'existing_task_pickup',
-            'task_id': task['id'],
-            'index': location_to_index[restaurant_loc],
-            'location': restaurant_loc,
-            'deadline': parse_time(task['pickup_before'])
-        })
+        # Only add pickup if it hasn't been completed yet
+        if not pickup_completed:
+            restaurant_loc = tuple(task['restaurant_location'])
+            route_points.append({
+                'type': 'existing_task_pickup',
+                'task_id': task['id'],
+                'index': location_to_index[restaurant_loc],
+                'location': restaurant_loc,
+                'deadline': parse_time(task['pickup_before'])
+            })
         
-        # Add delivery
+        # Always add delivery
         route_points.append({
             'type': 'existing_task_delivery', 
             'task_id': task['id'],
@@ -318,13 +373,20 @@ def evaluate_empty_agent(
     travel_to_restaurant = time_matrix[agent_index][restaurant_index]
     pickup_arrival = current_time + timedelta(seconds=travel_to_restaurant)
     
-    # Time from restaurant to delivery
-    restaurant_to_delivery = time_matrix[restaurant_index][delivery_index]
-    delivery_arrival = pickup_arrival + timedelta(seconds=restaurant_to_delivery)
-    
     # Parse deadlines
     pickup_deadline = parse_time(new_task['pickup_before'])
     delivery_deadline = parse_time(new_task['delivery_before'])
+
+    # If we arrive before the pickup ready time, we must wait
+    if pickup_arrival < pickup_deadline:
+        wait_delta = pickup_deadline - pickup_arrival
+        pickup_arrival = pickup_deadline
+    else:
+        wait_delta = timedelta(seconds=0)
+    
+    # Time from restaurant to delivery (depart after pickup time, including any wait)
+    restaurant_to_delivery = time_matrix[restaurant_index][delivery_index]
+    delivery_arrival = pickup_arrival + timedelta(seconds=restaurant_to_delivery)
     
     # Calculate lateness and penalties
     pickup_lateness = max(0, (pickup_arrival - pickup_deadline).total_seconds())
@@ -385,7 +447,8 @@ def find_best_insertion_point(
     current_route: List[Dict[str, Any]],
     time_matrix: List[List[int]],
     location_to_index: Dict[Tuple[float, float], int],
-    max_grace_period: int
+    max_grace_period: int,
+    optimization_mode: str = "current"
 ) -> Dict[str, Any]:
     """
     Find the best insertion points for new task pickup and delivery in agent's existing route.
@@ -401,6 +464,8 @@ def find_best_insertion_point(
     
     best_score = -1
     best_result = None
+    # For tardiness-first, we track lexicographic objective
+    best_lex_key = None
     
     # Try all possible insertion positions
     route_length = len(current_route)
@@ -431,10 +496,22 @@ def find_best_insertion_point(
             
             # Calculate timing for this route
             result = calculate_route_timing(new_route, time_matrix, max_grace_period)
-            
-            if result and (best_score < 0 or result['score'] > best_score):
-                best_score = result['score']
-                best_result = result
+            if not result:
+                continue
+
+            if optimization_mode == "tardiness_min":
+                late_stops = int(result.get('already_late_stops', 0))
+                total_lateness = int(result.get('grace_penalty_seconds', 0))
+                added_travel = int(result.get('additional_time_minutes', 0) * 60)
+                lex_key = (late_stops, total_lateness, added_travel, -int(result.get('score', 0)))
+                if best_lex_key is None or lex_key < best_lex_key:
+                    best_lex_key = lex_key
+                    best_result = result
+                    best_score = result['score']
+            else:
+                if best_score < 0 or result['score'] > best_score:
+                    best_score = result['score']
+                    best_result = result
     
     # Format for API response
     if best_result:
@@ -485,8 +562,15 @@ def calculate_route_timing(
             arrival_time += timedelta(seconds=travel_time)
             total_travel_time += travel_time
             
-            # Check lateness
+            # Check for early arrival and waiting at pickups (ready-at semantics)
             deadline = point['deadline']
+            if point['type'] in ['new_task_pickup', 'existing_task_pickup'] and arrival_time < deadline:
+                # Wait until the ready-at time
+                wait_seconds = int((deadline - arrival_time).total_seconds())
+                arrival_time = deadline
+                total_travel_time += wait_seconds  # waiting impacts total time budget
+            
+            # Lateness applies if we arrive after deadline
             lateness_seconds = max(0, (arrival_time - deadline).total_seconds())
             
             if lateness_seconds > 0:
@@ -538,7 +622,8 @@ def recommend_agents_batch_optimized(
     enable_debug: bool = False,
     use_proximity: bool = True,
     area_type: str = "urban",
-    max_distance_km: Optional[float] = None
+    max_distance_km: Optional[float] = None,
+    optimization_mode: str = "current"
 ) -> Dict[str, Any]:
     """
     Batch-optimized agent recommendation with proximity-based filtering.
@@ -581,13 +666,18 @@ def recommend_agents_batch_optimized(
         locations.add(tuple(new_task['delivery_location']))
         
         # Current task locations
+        # NOTE: We still need to include pickup locations in the location map even if pickup_completed=True
+        # for the time matrix to work correctly. The build_agent_route function handles skipping them.
         for task in current_tasks:
+            # Add restaurant location (needed for time matrix even if pickup is completed)
             locations.add(tuple(task['restaurant_location']))
+            # Always add delivery location
             locations.add(tuple(task['delivery_location']))
         
         # Convert to list and create mapping
         location_list = list(locations)
         location_to_index = {loc: i for i, loc in enumerate(location_list)}
+        index_to_location = {i: loc for i, loc in enumerate(location_list)}
         
         if enable_debug:
             print(f"Batch optimization: {len(candidate_agents)}/{len(agents)} agents, {len(current_tasks)} current tasks, {len(location_list)} unique locations")
@@ -602,7 +692,7 @@ def recommend_agents_batch_optimized(
         for agent_idx, agent, distance_km in candidate_agents_data:
             try:
                 result = evaluate_agent_for_new_task(
-                    agent, new_task, current_tasks, time_matrix, location_to_index, max_grace_period
+                    agent, new_task, current_tasks, time_matrix, location_to_index, max_grace_period, optimization_mode
                 )
                 if result:
                     # Add proximity bonus to score (up to 5 points)
@@ -610,6 +700,11 @@ def recommend_agents_batch_optimized(
                     result['score'] = int(result['score'] + proximity_bonus)
                     result['distance_km'] = round(distance_km, 1)
                     result['proximity_bonus'] = round(proximity_bonus, 1)
+                    # Precompute helper fields used for tardiness-first ordering
+                    result['_late_stops'] = int(result.get('already_late_stops', 0))
+                    result['_total_lateness_seconds'] = int(result.get('grace_penalty_seconds', 0))
+                    # Convert minutes to seconds for ordering tie-breakers
+                    result['_added_travel_seconds'] = int(result.get('additional_time_minutes', 0) * 60)
                     recommendations.append(result)
                     
             except Exception as e:
@@ -617,9 +712,20 @@ def recommend_agents_batch_optimized(
                     print(f"Error evaluating agent {agent.get('driver_id', 'unknown')}: {e}")
                 continue
         
-        # Sort by score (highest first) and return top 3
-        recommendations.sort(key=lambda x: x['score'], reverse=True)
+        # Sort recommendations according to optimization mode
+        if optimization_mode == "tardiness_min":
+            # Lexicographic ordering: fewer late stops, then lower total lateness, then lower added travel, then higher score
+            recommendations.sort(key=lambda x: (x.get('_late_stops', 0), x.get('_total_lateness_seconds', 0), x.get('_added_travel_seconds', 0), -int(x.get('score', 0))))
+        else:
+            # Default behavior: score first
+            recommendations.sort(key=lambda x: x['score'], reverse=True)
         top_recommendations = recommendations[:3]
+        
+        # Add Google Maps URL to each recommendation
+        for rec in top_recommendations:
+            route = rec.get('route', [])
+            maps_url = build_google_maps_url(route, index_to_location)
+            rec['maps_url'] = maps_url
         
         # Early termination if we have high-quality candidates
         if len(top_recommendations) >= 3 and top_recommendations[0]['score'] >= high_score_threshold:
@@ -635,6 +741,13 @@ def recommend_agents_batch_optimized(
             if early_termination:
                 print(f"Early termination: found high-quality candidates (score >= {high_score_threshold})")
         
+        # Build performance metadata (non-breaking)
+        candidates_total = len(agents)
+        candidates_after_proximity = len(candidate_agents)
+        candidates_pruned = max(0, candidates_total - candidates_after_proximity)
+        zero_late_count = sum(1 for r in top_recommendations if r.get('already_late_stops', 0) == 0)
+        min_total_lateness_seconds = min((r.get('grace_penalty_seconds', 0) for r in top_recommendations), default=0)
+
         return {
             "task_id": new_task.get('id', 'unknown'),
             "recommendations": top_recommendations,
@@ -643,7 +756,12 @@ def recommend_agents_batch_optimized(
                 "agents_evaluated": len(candidate_agents),
                 "total_agents": len(agents),
                 "proximity_filtering": use_proximity,
-                "early_termination": early_termination
+                "early_termination": early_termination,
+                "optimization_mode": optimization_mode,
+                "candidates_after_proximity": candidates_after_proximity,
+                "candidates_pruned": candidates_pruned,
+                "zero_late_in_top": zero_late_count,
+                "min_total_lateness_seconds": int(min_total_lateness_seconds)
             }
         }
         

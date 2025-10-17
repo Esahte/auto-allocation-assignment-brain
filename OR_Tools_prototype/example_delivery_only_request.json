@@ -1,0 +1,73 @@
+{
+  "new_task": {
+    "id": "task_C",
+    "job_type": "PAIRED",
+    "restaurant_location": [17.140, -61.890],
+    "delivery_location": [17.160, -61.910],
+    "pickup_before": "2025-10-16T18:00:00Z",
+    "delivery_before": "2025-10-16T18:30:00Z"
+  },
+  "agents": [
+    {
+      "driver_id": "driver_001",
+      "name": "John Doe",
+      "current_location": [17.130, -61.880]
+    },
+    {
+      "driver_id": "driver_002",
+      "name": "Jane Smith",
+      "current_location": [17.120, -61.870]
+    }
+  ],
+  "current_tasks": [
+    {
+      "id": "task_A",
+      "job_type": "PAIRED",
+      "restaurant_location": [17.110, -61.860],
+      "delivery_location": [17.145, -61.885],
+      "pickup_before": "2025-10-16T16:00:00Z",
+      "delivery_before": "2025-10-16T17:30:00Z",
+      "assigned_driver": "driver_001",
+      "pickup_completed": true,
+      "_comment": "Task A pickup is already completed - agent only needs to deliver"
+    },
+    {
+      "id": "task_B",
+      "job_type": "PAIRED",
+      "restaurant_location": [17.105, -61.855],
+      "delivery_location": [17.150, -61.895],
+      "pickup_before": "2025-10-16T16:15:00Z",
+      "delivery_before": "2025-10-16T17:45:00Z",
+      "assigned_driver": "driver_001",
+      "pickup_completed": true,
+      "_comment": "Task B pickup is already completed - agent only needs to deliver"
+    },
+    {
+      "id": "task_D",
+      "job_type": "PAIRED",
+      "restaurant_location": [17.115, -61.865],
+      "delivery_location": [17.155, -61.875],
+      "pickup_before": "2025-10-16T17:00:00Z",
+      "delivery_before": "2025-10-16T18:00:00Z",
+      "assigned_driver": "driver_002",
+      "pickup_completed": false,
+      "_comment": "Task D is a normal paired task - agent needs both pickup and delivery"
+    }
+  ],
+  "max_grace_period": 3600,
+  "algorithm": "batch_optimized",
+  "use_proximity": true,
+  "area_type": "urban",
+  "_instructions": {
+    "description": "Example request demonstrating delivery-only tasks using the pickup_completed flag",
+    "key_points": [
+      "Tasks A and B have pickup_completed=true, so only their deliveries will be routed",
+      "Task D has pickup_completed=false (or omitted), so both pickup and delivery will be routed",
+      "The new task C is a normal PAIRED task with both pickup and delivery",
+      "Driver 001 will route to: Delivery A -> Delivery B -> (new task insertion)",
+      "Driver 002 will route to: Pickup D -> Delivery D -> (new task insertion)"
+    ],
+    "usage": "curl -X POST http://localhost:8080/recommend -H 'Content-Type: application/json' -d @example_delivery_only_request.json"
+  }
+}
+
