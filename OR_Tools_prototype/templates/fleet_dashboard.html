@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fleet Optimizer Dashboard</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Space Grotesk', sans-serif;
+            background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 50%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 2rem;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #00d4ff, #7b2cbf, #ff6b6b);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+        
+        .subtitle {
+            color: #888;
+            font-size: 1rem;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+        
+        .dashboard-input {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            color: #fff;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            width: 300px;
+        }
+        
+        .dashboard-input:focus {
+            outline: none;
+            border-color: #00d4ff;
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+            color: #000;
+            border: none;
+            padding: 0.75rem 2rem;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-family: 'Space Grotesk', sans-serif;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.3);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn.loading {
+            position: relative;
+        }
+        
+        .btn.loading::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border: 2px solid transparent;
+            border-top-color: #000;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            right: 10px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .stat-card {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 1.5rem;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #00d4ff;
+        }
+        
+        .stat-value.success { color: #4ade80; }
+        .stat-value.warning { color: #fbbf24; }
+        .stat-value.danger { color: #f87171; }
+        
+        .stat-label {
+            font-size: 0.85rem;
+            color: #888;
+            margin-top: 0.25rem;
+        }
+        
+        .results {
+            display: grid;
+            gap: 1rem;
+        }
+        
+        .agent-card {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+        
+        .agent-card:hover {
+            border-color: rgba(0, 212, 255, 0.3);
+            box-shadow: 0 5px 30px rgba(0, 212, 255, 0.1);
+        }
+        
+        .agent-card.has-new-tasks {
+            border-color: rgba(74, 222, 128, 0.5);
+        }
+        
+        .agent-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            background: rgba(255,255,255,0.02);
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        
+        .agent-name {
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+        
+        .agent-id {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: #666;
+        }
+        
+        .badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .badge.new-tasks {
+            background: rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+        }
+        
+        .badge.idle {
+            background: rgba(156, 163, 175, 0.2);
+            color: #9ca3af;
+        }
+        
+        .badge.existing {
+            background: rgba(59, 130, 246, 0.2);
+            color: #60a5fa;
+        }
+        
+        .agent-body {
+            padding: 1rem 1.5rem;
+        }
+        
+        .route-stop {
+            display: flex;
+            align-items: flex-start;
+            gap: 1rem;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        
+        .route-stop:last-child {
+            border-bottom: none;
+        }
+        
+        .stop-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            flex-shrink: 0;
+        }
+        
+        .stop-icon.pickup { background: rgba(251, 191, 36, 0.2); color: #fbbf24; }
+        .stop-icon.delivery { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+        .stop-icon.new { background: rgba(168, 85, 247, 0.2); color: #a855f7; }
+        
+        .stop-details {
+            flex: 1;
+        }
+        
+        .stop-type {
+            font-weight: 500;
+            font-size: 0.9rem;
+        }
+        
+        .stop-type.new-task { color: #a855f7; }
+        
+        .stop-time {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: #666;
+        }
+        
+        .stop-lateness {
+            font-size: 0.75rem;
+            color: #4ade80;
+        }
+        
+        .stop-lateness.late {
+            color: #f87171;
+        }
+        
+        .maps-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(59, 130, 246, 0.1);
+            color: #60a5fa;
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            margin-top: 0.5rem;
+            transition: all 0.2s ease;
+        }
+        
+        .maps-link:hover {
+            background: rgba(59, 130, 246, 0.2);
+        }
+        
+        .unassigned-section {
+            margin-top: 2rem;
+        }
+        
+        .unassigned-section h2 {
+            color: #f87171;
+            margin-bottom: 1rem;
+        }
+        
+        .unassigned-card {
+            background: rgba(248, 113, 113, 0.05);
+            border: 1px solid rgba(248, 113, 113, 0.2);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        .unassigned-reason {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: #f87171;
+            background: rgba(248, 113, 113, 0.1);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            display: inline-block;
+            margin-top: 0.5rem;
+        }
+        
+        .error-message {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            border-radius: 12px;
+            padding: 1.5rem;
+            text-align: center;
+            color: #f87171;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: #666;
+        }
+        
+        .empty-state svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚚 Fleet Optimizer</h1>
+            <p class="subtitle">Many-to-Many Route Optimization</p>
+        </header>
+        
+        <div class="controls">
+            <input type="text" 
+                   id="dashboardUrl" 
+                   class="dashboard-input" 
+                   placeholder="Dashboard URL"
+                   value="http://localhost:8000">
+            <button id="optimizeBtn" class="btn" onclick="runOptimization()">
+                🔄 Optimize Fleet
+            </button>
+        </div>
+        
+        <div id="statsGrid" class="stats-grid" style="display: none;">
+            <div class="stat-card">
+                <div class="stat-value" id="agentCount">0</div>
+                <div class="stat-label">Agents</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="taskCount">0</div>
+                <div class="stat-label">Unassigned Tasks</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value success" id="assignedCount">0</div>
+                <div class="stat-label">Tasks Assigned</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value warning" id="unassignedCount">0</div>
+                <div class="stat-label">Not Assigned</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="lateness">0s</div>
+                <div class="stat-label">Total Lateness</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="solveTime">0s</div>
+                <div class="stat-label">Solve Time</div>
+            </div>
+        </div>
+        
+        <div id="results" class="results">
+            <div class="empty-state">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17a2 2 0 11-4 0 2 2 0 014 0zM19 17a2 2 0 11-4 0 2 2 0 014 0z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16V6a1 1 0 00-1-1H4a1 1 0 00-1 1v10a1 1 0 001 1h1m8-1a1 1 0 01-1 1H9m4-1V8a1 1 0 011-1h2.586a1 1 0 01.707.293l3.414 3.414a1 1 0 01.293.707V16a1 1 0 01-1 1h-1m-6-1a1 1 0 001 1h1M5 17a2 2 0 104 0m-4 0a2 2 0 114 0m6 0a2 2 0 104 0m-4 0a2 2 0 114 0" />
+                </svg>
+                <p>Click "Optimize Fleet" to run the optimization</p>
+            </div>
+        </div>
+        
+        <div id="unassignedSection" class="unassigned-section" style="display: none;">
+            <h2>⚠️ Unassigned Tasks</h2>
+            <div id="unassignedTasks"></div>
+        </div>
+    </div>
+    
+    <script>
+        async function runOptimization() {
+            const btn = document.getElementById('optimizeBtn');
+            const dashboardUrl = document.getElementById('dashboardUrl').value;
+            
+            btn.disabled = true;
+            btn.classList.add('loading');
+            btn.textContent = 'Optimizing...';
+            
+            try {
+                const response = await fetch('/optimize-fleet', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ dashboard_url: dashboardUrl })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showError(data.error);
+                } else {
+                    renderResults(data);
+                }
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('loading');
+                btn.textContent = '🔄 Optimize Fleet';
+            }
+        }
+        
+        function showError(message) {
+            document.getElementById('statsGrid').style.display = 'none';
+            document.getElementById('unassignedSection').style.display = 'none';
+            document.getElementById('results').innerHTML = `
+                <div class="error-message">
+                    <strong>Error:</strong> ${message}
+                </div>
+            `;
+        }
+        
+        function renderResults(data) {
+            // Show stats
+            const statsGrid = document.getElementById('statsGrid');
+            statsGrid.style.display = 'grid';
+            
+            document.getElementById('agentCount').textContent = data.metadata.total_agents;
+            document.getElementById('taskCount').textContent = data.metadata.total_unassigned_tasks;
+            document.getElementById('assignedCount').textContent = data.metadata.tasks_assigned;
+            document.getElementById('unassignedCount').textContent = data.metadata.tasks_unassigned;
+            
+            const lateness = data.metadata.total_lateness_seconds;
+            const latenessEl = document.getElementById('lateness');
+            latenessEl.textContent = formatDuration(lateness);
+            latenessEl.className = 'stat-value ' + (lateness > 0 ? 'danger' : 'success');
+            
+            document.getElementById('solveTime').textContent = 
+                data.metadata.optimization_time_seconds.toFixed(1) + 's';
+            
+            // Render agent routes
+            const resultsDiv = document.getElementById('results');
+            
+            // Sort: agents with new tasks first, then by total stops
+            const sortedRoutes = [...data.agent_routes].sort((a, b) => {
+                if (a.assigned_new_tasks.length > 0 && b.assigned_new_tasks.length === 0) return -1;
+                if (b.assigned_new_tasks.length > 0 && a.assigned_new_tasks.length === 0) return 1;
+                return b.total_stops - a.total_stops;
+            });
+            
+            resultsDiv.innerHTML = sortedRoutes.map(agent => renderAgentCard(agent)).join('');
+            
+            // Render unassigned tasks
+            const unassignedSection = document.getElementById('unassignedSection');
+            if (data.unassigned_tasks && data.unassigned_tasks.length > 0) {
+                unassignedSection.style.display = 'block';
+                document.getElementById('unassignedTasks').innerHTML = 
+                    data.unassigned_tasks.map(task => `
+                        <div class="unassigned-card">
+                            <div><strong>${task.restaurant_name || 'Unknown Restaurant'}</strong></div>
+                            <div style="color: #888; font-size: 0.9rem;">
+                                Customer: ${task.customer_name || 'Unknown'}
+                            </div>
+                            <div class="unassigned-reason">${task.reason}</div>
+                        </div>
+                    `).join('');
+            } else {
+                unassignedSection.style.display = 'none';
+            }
+        }
+        
+        function renderAgentCard(agent) {
+            const hasNewTasks = agent.assigned_new_tasks.length > 0;
+            const isIdle = agent.total_stops === 0;
+            
+            let badge = '';
+            if (hasNewTasks) {
+                badge = `<span class="badge new-tasks">+${agent.assigned_new_tasks.length} NEW</span>`;
+            } else if (isIdle) {
+                badge = `<span class="badge idle">IDLE</span>`;
+            } else {
+                badge = `<span class="badge existing">${agent.total_stops} stops</span>`;
+            }
+            
+            let routeHtml = '';
+            if (agent.route && agent.route.length > 0) {
+                routeHtml = agent.route.map((stop, i) => {
+                    const isPickup = stop.type.includes('pickup');
+                    const isNew = stop.type.includes('new');
+                    
+                    const iconClass = isNew ? 'new' : (isPickup ? 'pickup' : 'delivery');
+                    const icon = isPickup ? '📦' : '📍';
+                    
+                    const arrivalTime = new Date(stop.arrival_time).toLocaleTimeString();
+                    
+                    // Use display_name if available, otherwise show restaurant/customer
+                    const displayName = stop.display_name || (isPickup ? stop.restaurant_name : stop.customer_name) || 'Unknown';
+                    const stopLabel = isPickup ? 'Pickup from' : 'Deliver to';
+                    
+                    let timeInfo = '';
+                    let statusInfo = '';
+                    
+                    if (isPickup) {
+                        // Pickup: show food ready time and wait/late status
+                        const foodReadyTime = stop.food_ready_time ? new Date(stop.food_ready_time).toLocaleTimeString() : 'N/A';
+                        timeInfo = `Arrival: ${arrivalTime} | Food ready: ${foodReadyTime}`;
+                        
+                        if (stop.wait_seconds > 0) {
+                            statusInfo = `<span style="color: #fbbf24;">⏳ Wait ${formatDuration(stop.wait_seconds)} for food</span>`;
+                        } else if (stop.late_seconds > 0) {
+                            statusInfo = `<span style="color: #60a5fa;">✓ Food ready ${formatDuration(stop.late_seconds)} ago</span>`;
+                        } else {
+                            statusInfo = `<span style="color: #4ade80;">✓ Perfect timing</span>`;
+                        }
+                    } else {
+                        // Delivery: show deadline and lateness
+                        const deadline = stop.deadline ? new Date(stop.deadline).toLocaleTimeString() : 'N/A';
+                        timeInfo = `Arrival: ${arrivalTime} | Deadline: ${deadline}`;
+                        
+                        if (stop.lateness_seconds > 0) {
+                            statusInfo = `<span style="color: #f87171;">⚠️ Late by ${formatDuration(stop.lateness_seconds)}</span>`;
+                        } else if (stop.early_seconds > 0) {
+                            statusInfo = `<span style="color: #4ade80;">✓ ${formatDuration(stop.early_seconds)} early</span>`;
+                        } else {
+                            statusInfo = `<span style="color: #4ade80;">✓ On time</span>`;
+                        }
+                    }
+                    
+                    return `
+                        <div class="route-stop">
+                            <div class="stop-icon ${iconClass}">${icon}</div>
+                            <div class="stop-details">
+                                <div class="stop-type ${isNew ? 'new-task' : ''}">
+                                    ${isNew ? '✨ ' : ''}${stopLabel}: <strong>${displayName}</strong>
+                                </div>
+                                <div class="stop-time">${timeInfo}</div>
+                                <div class="stop-lateness">${statusInfo}</div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } else {
+                routeHtml = '<div style="color: #666; font-style: italic; padding: 1rem 0;">No stops - agent is available</div>';
+            }
+            
+            let mapsLink = '';
+            if (agent.maps_url) {
+                mapsLink = `
+                    <a href="${agent.maps_url}" target="_blank" class="maps-link">
+                        🗺️ View Route on Google Maps
+                    </a>
+                `;
+            }
+            
+            return `
+                <div class="agent-card ${hasNewTasks ? 'has-new-tasks' : ''}">
+                    <div class="agent-header">
+                        <div>
+                            <div class="agent-name">${agent.agent_name}</div>
+                            <div class="agent-id">ID: ${agent.agent_id}</div>
+                        </div>
+                        ${badge}
+                    </div>
+                    <div class="agent-body">
+                        ${routeHtml}
+                        ${mapsLink}
+                    </div>
+                </div>
+            `;
+        }
+        
+        function formatStopType(type) {
+            return type
+                .replace(/_/g, ' ')
+                .replace(/\b\w/g, l => l.toUpperCase());
+        }
+        
+        function formatDuration(seconds) {
+            if (seconds === 0) return '0s';
+            if (seconds < 60) return seconds + 's';
+            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            return h + 'h ' + m + 'm';
+        }
+    </script>
+</body>
+</html>
+

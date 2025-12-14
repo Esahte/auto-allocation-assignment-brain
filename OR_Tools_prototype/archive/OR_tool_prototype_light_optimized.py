@@ -50,7 +50,7 @@ def build_osrm_time_matrix_internal(coordinates: List[Tuple[float, float]]) -> L
     try:
         # Format coordinates for OSRM API
         coords_str = ";".join([f"{lng},{lat}" for lat, lng in coordinates])
-        url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=duration"
+        url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coords_str}?annotations=duration"
         
         response = requests.get(url, timeout=30)
         response.raise_for_status()
@@ -418,7 +418,9 @@ def build_data_model_incremental(new_task: Dict[str, Any], agents: List[Dict[str
     
     # Get current coordinates and build OSRM matrix with caching
     current_coordinates = _data_builder.get_current_coordinates()
+    print(f"[DEBUG light] Calling OSRM with {len(current_coordinates)} coordinates", flush=True)
     time_matrix_raw = build_osrm_time_matrix_cached(current_coordinates)
+    print(f"[DEBUG light] OSRM returned matrix of size {len(time_matrix_raw)}x{len(time_matrix_raw[0]) if time_matrix_raw else 0}", flush=True)
     time_matrix = [[int(round(cell)) for cell in row] for row in time_matrix_raw]
     
     # Build final data structure
@@ -662,13 +664,15 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
         enable_debug: Enable debug output
         max_distance_km: Maximum distance in kilometers for agent selection (default: None, allows up to 50km)
     """
+    print("[DEBUG light] recommend_agents called", flush=True)
     start_time = time.time()
     grace_period = INITIAL_GRACE_PERIOD
     best_recommendations = []
     agents_evaluated = 0
 
+    print(f"[DEBUG light] agents={len(agents)}, use_proximity={use_proximity}", flush=True)
     # Proximity-based agent filtering BEFORE data model building
-    if use_proximity and len(agents) > 1:  # Changed from > 5 to > 1 to allow proximity filtering with smaller fleets
+    if use_proximity and len(agents) >= 1:  # Allow proximity filtering for any number of agents
         proximity_config = get_proximity_config(len(agents), area_type)
         candidate_agents_data = get_proximate_agents(
             new_task, agents, 
@@ -680,9 +684,14 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
         agents_to_evaluate = [agent for _, agent, _ in candidate_agents_data]
         agent_distance_map = {agent['driver_id']: distance for _, agent, distance in candidate_agents_data}
     else:
+        # When proximity filtering is disabled, still calculate distances for reporting
+        task_location = tuple(new_task['restaurant_location'])
         agents_to_evaluate = agents
-        candidate_agents_data = [(i, agent, 0) for i, agent in enumerate(agents)]
-        agent_distance_map = {agent['driver_id']: 0 for agent in agents}
+        candidate_agents_data = [
+            (i, agent, haversine_distance_km(task_location, tuple(agent['current_location']))) 
+            for i, agent in enumerate(agents)
+        ]
+        agent_distance_map = {agent['driver_id']: dist for _, agent, dist in candidate_agents_data}
 
     while grace_period <= max_grace_period:
         if enable_debug:
@@ -691,8 +700,10 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
             print(f"New Task: {new_task.get('id')} {new_task.get('job_type')}")
         
         # Use incremental data model building with filtered agents
+        print(f"[DEBUG light] Building data model with grace_period={grace_period}", flush=True)
         data, assigned_tasks_per_agent, new_task_indices = build_data_model_incremental(
             new_task, agents_to_evaluate, current_tasks, grace_period)
+        print(f"[DEBUG light] Data model built, new_task_indices={new_task_indices}", flush=True)
 
         if new_task_indices is None:
             if enable_debug:
@@ -710,11 +721,14 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
                 print(row)
 
         # Calculate base route times for all agents (without new task)
+        print(f"[DEBUG light] Calculating base route times for {data['num_agents']} agents", flush=True)
         base_route_times = {}
         for agent in range(data['num_agents']):
             assigned = assigned_tasks_per_agent.get(agent, [])
+            print(f"[DEBUG light] Solving base route for agent {agent}...", flush=True)
             base_result = solve_single_agent_routing(data, agent, assigned, None)
             base_route_times[agent] = base_result['route_time'] if base_result['feasible'] else float('inf')
+            print(f"[DEBUG light] Agent {agent} base route done: feasible={base_result['feasible']}", flush=True)
 
         # Evaluate each agent for the new task
         recommendations = []
@@ -799,13 +813,19 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
             best_recommendations = recommendations
             
             # Early termination if we have high-quality candidates
-            if len(best_recommendations) >= 3 and best_recommendations[0]['score'] >= high_score_threshold:
+            if len(best_recommendations) >= 1 and best_recommendations[0]['score'] >= high_score_threshold:
                 if enable_debug:
                     print(f"Early termination: found high-quality candidates (score >= {high_score_threshold})")
                 break
 
         # Increase grace period for next iteration
+        old_grace = grace_period
         grace_period = min(grace_period * 2, max_grace_period)
+        
+        # Exit if we've reached max and done at least one iteration at max
+        if grace_period == old_grace == max_grace_period:
+            print(f"[DEBUG light] Reached max grace period, exiting loop", flush=True)
+            break
 
     execution_time = time.time() - start_time
     task_id = new_task.get("id", "unknown")
@@ -813,7 +833,7 @@ def recommend_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]],
     if best_recommendations:
         result = {
             "task_id": task_id,
-            "recommendations": best_recommendations[:3],  # Top 3
+            "recommendations": best_recommendations,  # Return all eligible agents
             "performance": {
                 "execution_time_seconds": round(execution_time, 3),
                 "agents_evaluated": len(agents_to_evaluate),
@@ -951,21 +971,63 @@ def haversine_distance_km(lat1_lng1: Tuple[float, float], lat2_lng2: Tuple[float
     r = 6371
     return c * r
 
+def get_osrm_road_distances(origin: Tuple[float, float], destinations: List[Tuple[float, float]]) -> List[float]:
+    """
+    Get road distances from origin to multiple destinations using OSRM.
+    Returns distances in kilometers. Falls back to Haversine if OSRM fails.
+    """
+    if not destinations:
+        return []
+    
+    try:
+        # Build coordinates string: origin first, then all destinations
+        all_coords = [origin] + destinations
+        coords_str = ";".join([f"{lng},{lat}" for lat, lng in all_coords])
+        
+        # Use OSRM table endpoint with distance annotation
+        # sources=0 means only calculate from the first point (origin) to all others
+        url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coords_str}?sources=0&annotations=distance"
+        
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get('code') != 'Ok':
+            raise Exception(f"OSRM API error: {data.get('message', 'Unknown error')}")
+        
+        # distances[0] contains distances from origin to all points (including itself)
+        # Skip the first value (distance to self = 0), convert meters to km
+        distances_meters = data['distances'][0][1:]  # Skip first element (origin to origin)
+        distances_km = [d / 1000.0 if d is not None else float('inf') for d in distances_meters]
+        
+        return distances_km
+        
+    except Exception as e:
+        print(f"OSRM road distance call failed: {e}, falling back to Haversine", flush=True)
+        # Fallback to Haversine distances
+        return [haversine_distance_km(origin, dest) for dest in destinations]
+
 def get_proximate_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], 
                         max_candidates: int = 8, initial_radius_km: float = 5.0,
                         enable_debug: bool = False, max_distance_km: Optional[float] = None) -> List[Tuple[int, Dict[str, Any], float]]:
     """
     Get agents sorted by proximity to new task, expanding radius as needed.
     Returns: List of (original_agent_index, agent_data, distance_km)
+    Uses OSRM road distance instead of straight-line Haversine distance.
     """
     # Use restaurant location as primary proximity point
     task_location = tuple(new_task['restaurant_location'])
     
-    # Calculate distances to all agents
+    # Get all agent locations
+    agent_locations = [tuple(agent['current_location']) for agent in agents]
+    
+    # Get road distances from OSRM (single API call for efficiency)
+    road_distances = get_osrm_road_distances(task_location, agent_locations)
+    
+    # Build agent distances list
     agent_distances = []
-    for i, agent in enumerate(agents):
-        agent_loc = tuple(agent['current_location'])
-        distance_km = haversine_distance_km(task_location, agent_loc)
+    for i, (agent, distance_km) in enumerate(zip(agents, road_distances)):
         agent_distances.append((i, agent, distance_km))
     
     # Sort by distance

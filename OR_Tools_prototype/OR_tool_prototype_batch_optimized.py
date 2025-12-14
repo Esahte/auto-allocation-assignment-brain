@@ -50,21 +50,63 @@ def haversine_distance_km(lat1_lng1: Tuple[float, float], lat2_lng2: Tuple[float
     r = 6371
     return c * r
 
+def get_osrm_road_distances(origin: Tuple[float, float], destinations: List[Tuple[float, float]]) -> List[float]:
+    """
+    Get road distances from origin to multiple destinations using OSRM.
+    Returns distances in kilometers. Falls back to Haversine if OSRM fails.
+    """
+    if not destinations:
+        return []
+    
+    try:
+        # Build coordinates string: origin first, then all destinations
+        all_coords = [origin] + destinations
+        coords_str = ";".join([f"{lng},{lat}" for lat, lng in all_coords])
+        
+        # Use OSRM table endpoint with distance annotation
+        # sources=0 means only calculate from the first point (origin) to all others
+        url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coords_str}?sources=0&annotations=distance"
+        
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get('code') != 'Ok':
+            raise Exception(f"OSRM API error: {data.get('message', 'Unknown error')}")
+        
+        # distances[0] contains distances from origin to all points (including itself)
+        # Skip the first value (distance to self = 0), convert meters to km
+        distances_meters = data['distances'][0][1:]  # Skip first element (origin to origin)
+        distances_km = [d / 1000.0 if d is not None else float('inf') for d in distances_meters]
+        
+        return distances_km
+        
+    except Exception as e:
+        print(f"OSRM road distance call failed: {e}, falling back to Haversine", flush=True)
+        # Fallback to Haversine distances
+        return [haversine_distance_km(origin, dest) for dest in destinations]
+
 def get_proximate_agents(new_task: Dict[str, Any], agents: List[Dict[str, Any]], 
                         max_candidates: int = 10, initial_radius_km: float = 5.0,
                         enable_debug: bool = False, max_distance_km: Optional[float] = None) -> List[Tuple[int, Dict[str, Any], float]]:
     """
     Get agents sorted by proximity to new task, expanding radius as needed.
     Returns: List of (original_agent_index, agent_data, distance_km)
+    Uses OSRM road distance instead of straight-line Haversine distance.
     """
     # Use restaurant location as primary proximity point
     task_location = tuple(new_task['restaurant_location'])
     
-    # Calculate distances to all agents
+    # Get all agent locations
+    agent_locations = [tuple(agent['current_location']) for agent in agents]
+    
+    # Get road distances from OSRM (single API call for efficiency)
+    road_distances = get_osrm_road_distances(task_location, agent_locations)
+    
+    # Build agent distances list
     agent_distances = []
-    for i, agent in enumerate(agents):
-        agent_loc = tuple(agent['current_location'])
-        distance_km = haversine_distance_km(task_location, agent_loc)
+    for i, (agent, distance_km) in enumerate(zip(agents, road_distances)):
         agent_distances.append((i, agent, distance_km))
     
     # Sort by distance
@@ -150,7 +192,7 @@ def build_osrm_time_matrix_cached(locations: List[Tuple[float, float]], use_cach
     try:
         # Format coordinates for OSRM API
         coordinates = ";".join([f"{lng},{lat}" for lat, lng in locations])
-        url = f"http://router.project-osrm.org/table/v1/driving/{coordinates}?annotations=duration"
+        url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coordinates}?annotations=duration"
         
         response = requests.get(url, timeout=30)
         response.raise_for_status()
@@ -389,19 +431,22 @@ def evaluate_empty_agent(
     delivery_arrival = pickup_arrival + timedelta(seconds=restaurant_to_delivery)
     
     # Calculate lateness and penalties
-    pickup_lateness = max(0, (pickup_arrival - pickup_deadline).total_seconds())
-    delivery_lateness = max(0, (delivery_arrival - delivery_deadline).total_seconds())
+    # Note: pickup_lateness here means arriving AFTER food is ready (food waits)
+    pickup_late_seconds = max(0, (pickup_arrival - pickup_deadline).total_seconds())
+    delivery_late_seconds = max(0, (delivery_arrival - delivery_deadline).total_seconds())
     
-    total_lateness = pickup_lateness + delivery_lateness
+    total_lateness = pickup_late_seconds + delivery_late_seconds
     grace_penalty = min(total_lateness, max_grace_period)
-    already_late_stops = (1 if pickup_lateness > 0 else 0) + (1 if delivery_lateness > 0 else 0)
+    already_late_stops = (1 if pickup_late_seconds > 0 else 0) + (1 if delivery_late_seconds > 0 else 0)
+    late_delivery_stops = 1 if delivery_late_seconds > 0 else 0
     
-    # Calculate score (0-100)
+    # Calculate score (0-100) - DELIVERY lateness is 3x more important
     total_time = travel_to_restaurant + restaurant_to_delivery
-    time_penalty = min(total_time / 3600, 1.0) * 30  # Max 30 point penalty for long routes
-    lateness_penalty = min(grace_penalty / max_grace_period, 1.0) * 70  # Max 70 point penalty for lateness
+    time_penalty = min(total_time / 3600, 1.0) * 20  # Max 20 point penalty for long routes
+    pickup_lateness_penalty = min(pickup_late_seconds / max_grace_period, 1.0) * 15  # Max 15 points
+    delivery_lateness_penalty = min(delivery_late_seconds / max_grace_period, 1.0) * 45  # Max 45 points (3x pickup)
     
-    score = max(0, 100 - time_penalty - lateness_penalty)
+    score = max(0, 100 - time_penalty - pickup_lateness_penalty - delivery_lateness_penalty)
     
     # Build route
     route = [
@@ -438,6 +483,9 @@ def evaluate_empty_agent(
         "additional_time_minutes": total_time / 60.0,
         "grace_penalty_seconds": int(grace_penalty),
         "already_late_stops": already_late_stops,
+        "late_delivery_stops": late_delivery_stops,
+        "pickup_lateness_seconds": int(pickup_late_seconds),
+        "delivery_lateness_seconds": int(delivery_late_seconds),
         "route": route
     }
 
@@ -534,7 +582,13 @@ def calculate_route_timing(
     arrival_time = current_time
     
     total_lateness = 0
+    pickup_lateness = 0       # Lateness at pickups (food waiting)
+    delivery_lateness = 0     # Lateness at deliveries (customer waiting) - MORE IMPORTANT
+    unavoidable_lateness = 0  # Lateness for deadlines already passed (not agent's fault)
+    additional_lateness = 0   # Extra lateness beyond unavoidable
     late_stops = 0
+    late_delivery_stops = 0   # Track delivery lateness separately
+    unavoidable_late_stops = 0
     total_travel_time = 0
     route_details = []
     
@@ -573,9 +627,29 @@ def calculate_route_timing(
             # Lateness applies if we arrive after deadline
             lateness_seconds = max(0, (arrival_time - deadline).total_seconds())
             
+            # Calculate unavoidable lateness (deadline already passed at request time)
+            deadline_already_passed_seconds = max(0, (current_time - deadline).total_seconds())
+            
             if lateness_seconds > 0:
                 total_lateness += lateness_seconds
                 late_stops += 1
+                
+                # Track pickup vs delivery lateness separately
+                is_delivery = point['type'] in ['new_task_delivery', 'existing_task_delivery']
+                if is_delivery:
+                    delivery_lateness += lateness_seconds
+                    late_delivery_stops += 1
+                else:
+                    pickup_lateness += lateness_seconds
+                
+                # Split lateness into unavoidable and additional
+                if deadline_already_passed_seconds > 0:
+                    unavoidable_late_stops += 1
+                    unavoidable_for_this_stop = min(lateness_seconds, deadline_already_passed_seconds)
+                    unavoidable_lateness += unavoidable_for_this_stop
+                    additional_lateness += lateness_seconds - unavoidable_for_this_stop
+                else:
+                    additional_lateness += lateness_seconds
             
             # Add to route details
             if point['type'] in ['new_task_pickup', 'existing_task_pickup']:
@@ -585,7 +659,8 @@ def calculate_route_timing(
                     "pickup_index": point['index'],
                     "arrival_time": arrival_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "deadline": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "lateness": int(lateness_seconds)
+                    "lateness": int(lateness_seconds),
+                    "unavoidable_lateness": int(min(lateness_seconds, deadline_already_passed_seconds))
                 })
             else:  # delivery
                 route_details.append({
@@ -594,23 +669,39 @@ def calculate_route_timing(
                     "delivery_index": point['index'], 
                     "arrival_time": arrival_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "deadline": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "lateness": int(lateness_seconds)
+                    "lateness": int(lateness_seconds),
+                    "unavoidable_lateness": int(min(lateness_seconds, deadline_already_passed_seconds))
                 })
     
-    # Calculate score
+    # Calculate score - prioritize delivery lateness over pickup lateness
     grace_penalty = min(total_lateness, max_grace_period)
+    additional_grace_penalty = min(additional_lateness, max_grace_period)
     
-    # Score components
-    time_penalty = min(total_travel_time / 3600, 1.0) * 30  # Max 30 points for travel time
-    lateness_penalty = min(grace_penalty / max_grace_period, 1.0) * 70  # Max 70 points for lateness
+    # Score components - DELIVERY lateness is weighted more heavily
+    time_penalty = min(total_travel_time / 3600, 1.0) * 20  # Max 20 points for travel time
     
-    score = max(0, 100 - time_penalty - lateness_penalty)
+    # Delivery lateness is 3x more important than pickup lateness
+    # Pickup late = food waits (not great, but manageable)
+    # Delivery late = customer waits (very bad for experience)
+    pickup_lateness_penalty = min(pickup_lateness / max_grace_period, 1.0) * 15  # Max 15 points
+    delivery_lateness_penalty = min(delivery_lateness / max_grace_period, 1.0) * 45  # Max 45 points (3x pickup)
+    unavoidable_penalty = min(unavoidable_lateness / max_grace_period, 1.0) * 10  # Light penalty for unavoidable
+    
+    total_lateness_penalty = pickup_lateness_penalty + delivery_lateness_penalty + unavoidable_penalty
+    
+    score = max(0, 100 - time_penalty - total_lateness_penalty)
     
     return {
         "score": int(score),
         "additional_time_minutes": total_travel_time / 60.0,
         "grace_penalty_seconds": int(grace_penalty),
         "already_late_stops": late_stops,
+        "late_delivery_stops": late_delivery_stops,
+        "pickup_lateness_seconds": int(pickup_lateness),
+        "delivery_lateness_seconds": int(delivery_lateness),
+        "unavoidable_lateness_seconds": int(unavoidable_lateness),
+        "additional_lateness_seconds": int(additional_lateness),
+        "unavoidable_late_stops": unavoidable_late_stops,
         "route": route_details
     }
 
@@ -640,7 +731,7 @@ def recommend_agents_batch_optimized(
     
     try:
         # Proximity-based agent filtering
-        if use_proximity and len(agents) > 1:  # Changed from > 5 to > 1 to allow proximity filtering with smaller fleets
+        if use_proximity and len(agents) >= 1:  # Allow proximity filtering for any number of agents
             proximity_config = get_proximity_config(len(agents), area_type)
             candidate_agents_data = get_proximate_agents(
                 new_task, agents, 
@@ -651,8 +742,13 @@ def recommend_agents_batch_optimized(
             )
             candidate_agents = [agent for _, agent, _ in candidate_agents_data]
         else:
+            # When proximity filtering is disabled, still calculate distances for reporting
+            task_location = tuple(new_task['restaurant_location'])
             candidate_agents = agents
-            candidate_agents_data = [(i, agent, 0) for i, agent in enumerate(agents)]
+            candidate_agents_data = [
+                (i, agent, haversine_distance_km(task_location, tuple(agent['current_location']))) 
+                for i, agent in enumerate(agents)
+            ]
         
         # Collect all unique locations (now with filtered agents)
         locations = set()
@@ -719,16 +815,36 @@ def recommend_agents_batch_optimized(
         else:
             # Default behavior: score first
             recommendations.sort(key=lambda x: x['score'], reverse=True)
-        top_recommendations = recommendations[:3]
+        top_recommendations = recommendations  # Return all eligible agents
         
-        # Add Google Maps URL to each recommendation
-        for rec in top_recommendations:
-            route = rec.get('route', [])
-            maps_url = build_google_maps_url(route, index_to_location)
-            rec['maps_url'] = maps_url
+        # Calculate relative scores and add context-aware fields
+        if top_recommendations:
+            best_score = top_recommendations[0]['score']
+            
+            for i, rec in enumerate(top_recommendations):
+                # Add Google Maps URL
+                route = rec.get('route', [])
+                maps_url = build_google_maps_url(route, index_to_location)
+                rec['maps_url'] = maps_url
+                
+                # is_best_available: True for the top recommendation
+                rec['is_best_available'] = (i == 0)
+                
+                # relative_score: Score relative to best available (0-100 where 100 = best)
+                if best_score > 0:
+                    rec['relative_score'] = int(min(100, (rec['score'] / best_score) * 100))
+                else:
+                    # All scores are 0, so relative to each other they're equal
+                    rec['relative_score'] = 100 if i == 0 else 100
+                
+                # Ensure unavoidable_lateness_seconds and additional_lateness_seconds are present
+                if 'unavoidable_lateness_seconds' not in rec:
+                    rec['unavoidable_lateness_seconds'] = 0
+                if 'additional_lateness_seconds' not in rec:
+                    rec['additional_lateness_seconds'] = rec.get('grace_penalty_seconds', 0)
         
         # Early termination if we have high-quality candidates
-        if len(top_recommendations) >= 3 and top_recommendations[0]['score'] >= high_score_threshold:
+        if len(top_recommendations) >= 1 and top_recommendations[0]['score'] >= high_score_threshold:
             early_termination = True
         else:
             early_termination = False
@@ -748,9 +864,30 @@ def recommend_agents_batch_optimized(
         zero_late_count = sum(1 for r in top_recommendations if r.get('already_late_stops', 0) == 0)
         min_total_lateness_seconds = min((r.get('grace_penalty_seconds', 0) for r in top_recommendations), default=0)
 
+        # Check if the new task's deadlines are already passed
+        current_time = datetime.now(timezone.utc)
+        pickup_deadline = parse_time(new_task.get('pickup_before', ''))
+        delivery_deadline = parse_time(new_task.get('delivery_before', ''))
+        
+        task_pickup_already_late = pickup_deadline < current_time if pickup_deadline else False
+        task_delivery_already_late = delivery_deadline < current_time if delivery_deadline else False
+        task_already_late = task_pickup_already_late or task_delivery_already_late
+        
+        # Calculate minimum unavoidable lateness from best agent
+        min_unavoidable_lateness = min((r.get('unavoidable_lateness_seconds', 0) for r in top_recommendations), default=0)
+        min_additional_lateness = min((r.get('additional_lateness_seconds', 0) for r in top_recommendations), default=0)
+        
         return {
             "task_id": new_task.get('id', 'unknown'),
             "recommendations": top_recommendations,
+            "task_context": {
+                "task_already_late": task_already_late,
+                "pickup_already_late": task_pickup_already_late,
+                "delivery_already_late": task_delivery_already_late,
+                "min_unavoidable_lateness_seconds": int(min_unavoidable_lateness),
+                "min_additional_lateness_seconds": int(min_additional_lateness),
+                "best_possible_score": top_recommendations[0]['score'] if top_recommendations else 0
+            },
             "performance": {
                 "execution_time_seconds": round(execution_time, 3),
                 "agents_evaluated": len(candidate_agents),

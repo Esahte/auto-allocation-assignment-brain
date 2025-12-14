@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 import json
 import os
 import time
@@ -6,18 +6,24 @@ from datetime import datetime
 
 app = Flask(__name__)
 
+
+@app.route('/fleet-dashboard')
+def fleet_dashboard():
+    """Serve the fleet optimizer dashboard UI."""
+    return render_template('fleet_dashboard.html')
+
 # Performance monitoring
 performance_stats = {
     "total_requests": 0,
-    "fixed_optimized_requests": 0,
-    "light_optimized_requests": 0,
+    "batch_optimized_requests": 0,
+    "fleet_optimizer_requests": 0,
     "average_response_time": 0.0,
     "cache_hits": 0,
     "algorithm_usage": {},
     "response_times": []
 }
 
-# Add import for new batch optimization
+# Add import for batch optimization
 try:
     from OR_tool_prototype_batch_optimized import recommend_agents_batch_optimized, clear_cache
     BATCH_AVAILABLE = True
@@ -25,16 +31,36 @@ except ImportError:
     BATCH_AVAILABLE = False
     print("Warning: Batch optimization not available")
 
+# Add import for fleet optimization
+try:
+    from fleet_optimizer import optimize_fleet
+    FLEET_AVAILABLE = True
+except ImportError:
+    FLEET_AVAILABLE = False
+    print("Warning: Fleet optimization not available")
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "healthy",
         "performance_stats": performance_stats,
-        "available_algorithms": ["fixed_optimized", "light_optimized", "auto"]
+        "available_algorithms": ["batch_optimized", "fleet_optimizer"],
+        "batch_optimizer_available": BATCH_AVAILABLE,
+        "fleet_optimizer_available": FLEET_AVAILABLE
     }), 200
 
 @app.route('/recommend', methods=['POST'])
 def recommend():
+    """
+    Single-task recommendation endpoint.
+    Uses batch_optimized algorithm to recommend agents for a new task.
+    """
+    if not BATCH_AVAILABLE:
+        return jsonify({
+            "error": "Batch optimization not available",
+            "message": "OR_tool_prototype_batch_optimized module not found"
+        }), 503
+    
     start_time = time.time()
     
     try:
@@ -55,11 +81,11 @@ def recommend():
         
         # Get optional parameters
         max_grace_period = data.get('max_grace_period', 3600)
-        algorithm = data.get('algorithm', 'auto')  # auto, fixed_optimized, light_optimized
         enable_debug = data.get('enable_debug', False)
         use_proximity = data.get('use_proximity', True)
-        area_type = data.get('area_type', 'urban')  # 'urban' or 'rural'
-        max_distance_km = data.get('max_distance_km', None)  # Maximum distance for agent selection
+        area_type = data.get('area_type', 'urban')
+        max_distance_km = data.get('max_distance_km', None)
+        optimization_mode = data.get('optimization_mode', 'tardiness_min')
         
         # Validate max_distance_km parameter
         if max_distance_km is not None:
@@ -67,80 +93,24 @@ def recommend():
                 return jsonify({"error": "max_distance_km must be a number"}), 400
             if max_distance_km <= 0:
                 return jsonify({"error": "max_distance_km must be positive"}), 400
-            if max_distance_km > 200:  # Reasonable upper limit
+            if max_distance_km > 200:
                 return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
         
-        # Optimization mode flag (backward compatible)
-        optimization_mode = data.get('optimization_mode', 'current')
+        # Run batch optimization
+        recommendations = recommend_agents_batch_optimized(
+            new_task=new_task,
+            agents=agents,
+            current_tasks=current_tasks,
+            max_grace_period=max_grace_period,
+            enable_debug=enable_debug,
+            use_proximity=use_proximity,
+            area_type=area_type,
+            max_distance_km=max_distance_km,
+            optimization_mode=optimization_mode
+        )
         
-        # Auto-select algorithm based on dataset size and requirements
-        if algorithm == 'auto':
-            num_agents = len(agents)
-            num_tasks = len(current_tasks)
-            
-            # Enhanced auto-selection with batch optimization preference
-            if BATCH_AVAILABLE and num_agents >= 5 and num_tasks >= 2:
-                algorithm = 'batch_optimized'   # Use batch optimization for multiple agents/tasks
-            elif num_agents <= 20 and num_tasks <= 50:
-                algorithm = 'light_optimized'    # Good for smaller datasets with caching benefits
-            else:
-                algorithm = 'fixed_optimized'    # Best for larger datasets with adaptive optimizations
-        
-        # Call the appropriate recommendation service
-        if algorithm == 'batch_optimized' and BATCH_AVAILABLE:
-            recommendations = recommend_agents_batch_optimized(
-                new_task=new_task,
-                agents=agents,
-                current_tasks=current_tasks,
-                max_grace_period=max_grace_period,
-                enable_debug=enable_debug,
-                use_proximity=use_proximity,
-                area_type=area_type,
-                max_distance_km=max_distance_km,
-                optimization_mode=optimization_mode
-            )
-            if "algorithm_usage" not in performance_stats:
-                performance_stats["algorithm_usage"] = {}
-            performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
-            
-        elif algorithm == 'fixed_optimized':
-            from OR_tool_prototype_optimized_fixed import recommend_agents
-            recommendations = recommend_agents(
-                new_task, agents, current_tasks, max_grace_period
-            )
-            performance_stats["fixed_optimized_requests"] += 1
-            
-        elif algorithm == 'light_optimized':
-            from OR_tool_prototype_light_optimized import recommend_agents
-            recommendations = recommend_agents(
-                new_task, agents, current_tasks, max_grace_period, 
-                use_proximity, area_type, enable_debug, max_distance_km
-            )
-            performance_stats["light_optimized_requests"] += 1
-            
-        else:
-            return jsonify({
-                "error": f"Unknown algorithm: {algorithm}",
-                "available_algorithms": ["batch_optimized", "fixed_optimized", "light_optimized", "auto"]
-            }), 400
-        
-        # Handle detailed JSON response from optimized models
-        if isinstance(recommendations, str):
-            try:
-                # Parse the JSON response from the models
-                recommendations_dict = json.loads(recommendations)
-            except json.JSONDecodeError:
-                # Fallback for simple driver ID responses
-                recommendations_dict = {
-                    "task_id": new_task.get("id", "unknown"),
-                    "recommendations": []
-                }
-        else:
-            # Handle case where it's already a dict
-            recommendations_dict = recommendations if isinstance(recommendations, dict) else {
-                "task_id": new_task.get("id", "unknown"),
-                "recommendations": []
-            }
+        performance_stats["batch_optimized_requests"] += 1
+        performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
         
         # Update performance stats
         execution_time = time.time() - start_time
@@ -150,10 +120,10 @@ def recommend():
         )
         
         # Ensure task_id is present
-        if "task_id" not in recommendations_dict:
-            recommendations_dict["task_id"] = new_task.get("id", "unknown")
+        if isinstance(recommendations, dict) and "task_id" not in recommendations:
+            recommendations["task_id"] = new_task.get("id", "unknown")
         
-        return jsonify(recommendations_dict), 200
+        return jsonify(recommendations), 200
         
     except Exception as e:
         execution_time = time.time() - start_time
@@ -161,20 +131,6 @@ def recommend():
         return jsonify({
             "error": str(e)
         }), 500
-
-@app.route('/recommend/fixed-optimized', methods=['POST'])
-def recommend_fixed_optimized():
-    """Endpoint specifically for fixed optimized recommendations."""
-    data = request.get_json()
-    data['algorithm'] = 'fixed_optimized'
-    return recommend()
-
-@app.route('/recommend/light-optimized', methods=['POST'])
-def recommend_light_optimized():
-    """Endpoint specifically for light optimized recommendations."""
-    data = request.get_json()
-    data['algorithm'] = 'light_optimized'
-    return recommend()
 
 @app.route('/recommend/batch-optimized', methods=['POST'])
 def recommend_batch_optimized():
@@ -201,7 +157,7 @@ def recommend_batch_optimized():
         use_proximity = data.get('use_proximity', True)
         area_type = data.get('area_type', 'urban')
         max_distance_km = data.get('max_distance_km', None)
-        optimization_mode = data.get('optimization_mode', 'current')
+        optimization_mode = data.get('optimization_mode', 'tardiness_min')
         
         if not new_task or not agents:
             return jsonify({"error": "Missing required fields: new_task, agents"}), 400
@@ -212,7 +168,7 @@ def recommend_batch_optimized():
                 return jsonify({"error": "max_distance_km must be a number"}), 400
             if max_distance_km <= 0:
                 return jsonify({"error": "max_distance_km must be positive"}), 400
-            if max_distance_km > 200:  # Reasonable upper limit
+            if max_distance_km > 200:
                 return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
         
         enable_debug = data.get('debug', False)
@@ -236,6 +192,7 @@ def recommend_batch_optimized():
         
         # Update statistics
         performance_stats["total_requests"] += 1
+        performance_stats["batch_optimized_requests"] += 1
         performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
         performance_stats["response_times"].append(execution_time)
         if len(performance_stats["response_times"]) > 100:
@@ -253,25 +210,122 @@ def recommend_batch_optimized():
         return jsonify(result)
         
     except Exception as e:
-        execution_time = time.time() - start_time
-        app.logger.error(f"Error processing request in {execution_time:.3f}s: {str(e)}")
+        app.logger.error(f"Error processing request: {str(e)}")
         return jsonify({
             "error": str(e),
             "algorithm": "batch_optimized"
+        }), 500
+
+@app.route('/optimize-fleet', methods=['POST'])
+def optimize_fleet_endpoint():
+    """
+    Fleet-wide optimization endpoint (Many-to-Many).
+    
+    Fetches data from dashboard endpoints and returns optimized routes for all agents.
+    
+    Request body (optional):
+    {
+        "dashboard_url": "http://localhost:8000",  // Optional, defaults to localhost:8000
+        "agents_data": {...},  // Optional, provide data directly instead of fetching
+        "tasks_data": {...}    // Optional, provide data directly instead of fetching
+    }
+    """
+    if not FLEET_AVAILABLE:
+        return jsonify({
+            "error": "Fleet optimization not available",
+            "message": "fleet_optimizer module not found"
+        }), 503
+    
+    import requests as req
+    from concurrent.futures import ThreadPoolExecutor
+    
+    try:
+        start_time = time.time()
+        data = request.get_json() or {}
+        
+        # Get dashboard URL
+        dashboard_url = data.get('dashboard_url', 'http://localhost:8000')
+        
+        # Check if data is provided directly or needs to be fetched
+        if 'agents_data' in data and 'tasks_data' in data:
+            # Use provided data
+            agents_data = data['agents_data']
+            tasks_data = data['tasks_data']
+            print(f"[optimize-fleet] Using provided data")
+        else:
+            # Fetch from dashboard using PARALLEL requests
+            print(f"[optimize-fleet] Fetching data from {dashboard_url} (parallel)")
+            
+            def fetch_agents():
+                resp = req.get(f"{dashboard_url}/api/test/or-tools/agents", timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+            
+            def fetch_tasks():
+                resp = req.get(f"{dashboard_url}/api/test/or-tools/unassigned-tasks", timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+            
+            agents_data = None
+            tasks_data = None
+            errors = []
+            
+            # Execute both fetches in parallel
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_agents = executor.submit(fetch_agents)
+                future_tasks = executor.submit(fetch_tasks)
+                
+                try:
+                    agents_data = future_agents.result(timeout=30)
+                    print(f"[optimize-fleet] Got {agents_data.get('summary', {}).get('eligible_agents', 0)} agents")
+                except Exception as e:
+                    errors.append(f"agents: {str(e)}")
+                
+                try:
+                    tasks_data = future_tasks.result(timeout=30)
+                    print(f"[optimize-fleet] Got {tasks_data.get('summary', {}).get('total', 0)} tasks")
+                except Exception as e:
+                    errors.append(f"tasks: {str(e)}")
+            
+            if errors:
+                return jsonify({
+                    "error": f"Failed to fetch data from dashboard: {', '.join(errors)}",
+                    "hint": "Ensure dashboard is running at the specified URL"
+                }), 503
+        
+        # Run fleet optimization
+        result = optimize_fleet(agents_data, tasks_data)
+        
+        execution_time = time.time() - start_time
+        
+        # Update stats
+        performance_stats["total_requests"] += 1
+        performance_stats["fleet_optimizer_requests"] += 1
+        performance_stats["algorithm_usage"]["fleet_optimizer"] = performance_stats["algorithm_usage"].get("fleet_optimizer", 0) + 1
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        import traceback
+        app.logger.error(f"Error in fleet optimization: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            "error": str(e),
+            "algorithm": "fleet_optimizer"
         }), 500
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
     """Get detailed performance statistics."""
     try:
-        from OR_tool_prototype_light_optimized import _osrm_cache as light_cache
+        from OR_tool_prototype_batch_optimized import _osrm_cache as batch_cache
         cache_info = {
-            "light_optimized_cache_size": len(light_cache),
-            "total_cache_entries": len(light_cache)
+            "batch_optimized_cache_size": len(batch_cache),
+            "total_cache_entries": len(batch_cache)
         }
     except (ImportError, AttributeError):
         cache_info = {
-            "light_optimized_cache_size": 0,
+            "batch_optimized_cache_size": 0,
             "total_cache_entries": 0
         }
     
@@ -279,9 +333,8 @@ def get_stats():
         **performance_stats,
         **cache_info,
         "algorithm_usage": {
-            "fixed_optimized_percentage": round(performance_stats["fixed_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
-            "light_optimized_percentage": round(performance_stats["light_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
-            "batch_optimized_percentage": round(performance_stats["algorithm_usage"].get("batch_optimized", 0) / max(performance_stats["total_requests"], 1) * 100, 1)
+            "batch_optimized_percentage": round(performance_stats["batch_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
+            "fleet_optimizer_percentage": round(performance_stats["fleet_optimizer_requests"] / max(performance_stats["total_requests"], 1) * 100, 1)
         }
     }), 200
 
@@ -296,8 +349,6 @@ def clear_caches():
             clear_cache()
             cleared_caches.append("batch_optimization_cache")
         
-        # Clear any other caches here in the future
-        
         return jsonify({
             "message": "Caches cleared successfully",
             "cleared_caches": cleared_caches,
@@ -309,76 +360,8 @@ def clear_caches():
             "error": f"Failed to clear caches: {str(e)}"
         }), 500
 
-@app.route('/benchmark', methods=['POST'])
-def benchmark():
-    """Run a quick benchmark comparing both available algorithms."""
-    try:
-        data = request.get_json()
-        required_fields = ['new_task', 'agents', 'current_tasks']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({"error": f"Missing required field: {field}"}), 400
-        
-        new_task = data['new_task']
-        agents = data['agents']
-        current_tasks = data['current_tasks']
-        
-        results = {}
-        
-        # Test fixed optimized
-        try:
-            start_time = time.time()
-            from OR_tool_prototype_optimized_fixed import recommend_agents
-            fixed_result = recommend_agents(new_task, agents, current_tasks)
-            fixed_time = time.time() - start_time
-            results["fixed_optimized"] = {
-                "execution_time": round(fixed_time, 3),
-                "success": True,
-                "recommended_driver": fixed_result
-            }
-        except Exception as e:
-            results["fixed_optimized"] = {"execution_time": 0, "success": False, "error": str(e)}
-        
-        # Test light optimized
-        try:
-            start_time = time.time()
-            from OR_tool_prototype_light_optimized import recommend_agents
-            light_result = recommend_agents(new_task, agents, current_tasks)
-            light_time = time.time() - start_time
-            results["light_optimized"] = {
-                "execution_time": round(light_time, 3),
-                "success": True,
-                "recommended_driver": light_result
-            }
-        except Exception as e:
-            results["light_optimized"] = {"execution_time": 0, "success": False, "error": str(e)}
-        
-        # Add comparison
-        if results["fixed_optimized"]["success"] and results["light_optimized"]["success"]:
-            fixed_time = results["fixed_optimized"]["execution_time"]
-            light_time = results["light_optimized"]["execution_time"]
-            
-            if fixed_time < light_time:
-                speedup = light_time / max(fixed_time, 0.001)
-                faster_algorithm = "fixed_optimized"
-            else:
-                speedup = fixed_time / max(light_time, 0.001)
-                faster_algorithm = "light_optimized"
-                
-            results["comparison"] = {
-                "faster_algorithm": faster_algorithm,
-                "speedup": f"{speedup:.1f}x faster",
-                "time_difference_ms": round(abs(fixed_time - light_time) * 1000),
-                "both_recommend_same_driver": results["fixed_optimized"]["recommended_driver"] == results["light_optimized"]["recommended_driver"]
-            }
-        
-        return jsonify(results), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 if __name__ == '__main__':
     # Get port from environment variable or default to 8080
     port = int(os.environ.get('PORT', 8080))
     # Use 0.0.0.0 to listen on all available network interfaces
-    app.run(host='0.0.0.0', port=port, debug=False) 
+    app.run(host='0.0.0.0', port=port, debug=False)
