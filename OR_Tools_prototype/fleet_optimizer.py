@@ -214,6 +214,47 @@ def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, floa
 # COMPATIBILITY MATRIX
 # =============================================================================
 
+def get_osrm_distances_matrix(origins: List[Location], destinations: List[Location]) -> List[List[float]]:
+    """
+    Get road distances from multiple origins to multiple destinations using OSRM.
+    Returns distances in kilometers.
+    """
+    if not origins or not destinations:
+        return []
+    
+    try:
+        # Build coordinates: origins first, then destinations
+        all_locations = origins + destinations
+        coords_str = ";".join([loc.to_osrm_str() for loc in all_locations])
+        
+        # sources = indices of origins, destinations = indices of destinations
+        sources = ",".join([str(i) for i in range(len(origins))])
+        destinations_idx = ",".join([str(i) for i in range(len(origins), len(all_locations))])
+        
+        url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?sources={sources}&destinations={destinations_idx}&annotations=distance"
+        
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('code') == 'Ok':
+            # Convert meters to km
+            distances = data.get('distances', [])
+            return [[d / 1000.0 if d is not None else float('inf') for d in row] for row in distances]
+    except Exception as e:
+        print(f"[OSRM] Distance matrix error: {e}, falling back to Haversine")
+    
+    # Fallback to Haversine
+    result = []
+    for origin in origins:
+        row = []
+        for dest in destinations:
+            dist = _haversine_km(origin.lat, origin.lng, dest.lat, dest.lng)
+            row.append(dist)
+        result.append(row)
+    return result
+
+
 class CompatibilityChecker:
     """
     Builds and checks agent-task compatibility based on business rules.
@@ -221,11 +262,36 @@ class CompatibilityChecker:
     
     def __init__(self, 
                  wallet_threshold: float = DEFAULT_WALLET_THRESHOLD,
-                 geofence_regions: List[GeofenceRegion] = None):
+                 geofence_regions: List[GeofenceRegion] = None,
+                 max_distance_km: float = None):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
+        self.max_distance_km = max_distance_km  # Max distance for assignment
+        self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
+    
+    def precompute_distances(self, agents: List[Agent], tasks: List[Task]):
+        """
+        Precompute OSRM road distances from all agents to all task pickup locations.
+        This is done once upfront for efficiency.
+        """
+        if not agents or not tasks:
+            return
+        
+        agent_locations = [agent.current_location for agent in agents]
+        task_locations = [task.restaurant_location for task in tasks]
+        
+        print(f"[CompatibilityChecker] Getting OSRM distances for {len(agents)} agents x {len(tasks)} tasks...")
+        
+        distances = get_osrm_distances_matrix(agent_locations, task_locations)
+        
+        # Store in cache
+        for i, agent in enumerate(agents):
+            for j, task in enumerate(tasks):
+                self.distance_cache[(agent.id, task.id)] = distances[i][j] if distances else float('inf')
+        
+        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} distances")
     
     def is_compatible(self, agent: Agent, task: Task) -> Tuple[bool, str]:
         """
@@ -267,6 +333,23 @@ class CompatibilityChecker:
                     if not (pickup_in and delivery_in):
                         return False, "outside_scooter_geofence"
         
+        # Rule 6: Max Distance - Agent must be within maxDistanceKm of pickup location
+        # Uses OSRM road distance (precomputed) for accuracy
+        if self.max_distance_km is not None:
+            # Check cache first (OSRM road distance)
+            cache_key = (agent.id, task.id)
+            if cache_key in self.distance_cache:
+                distance = self.distance_cache[cache_key]
+            else:
+                # Fallback to Haversine if not in cache
+                distance = _haversine_km(
+                    agent.current_location.lat, agent.current_location.lng,
+                    task.restaurant_location.lat, task.restaurant_location.lng
+                )
+            
+            if distance > self.max_distance_km:
+                return False, f"distance_exceeded_{distance:.1f}km"
+        
         return True, "compatible"
     
     def build_compatibility_matrix(self, 
@@ -278,11 +361,40 @@ class CompatibilityChecker:
         Returns:
             {agent_id: {task_id: (is_compatible, reason)}}
         """
+        # Precompute OSRM distances for maxDistanceKm check
+        if self.max_distance_km is not None and tasks:
+            self.precompute_distances(agents, tasks)
+        
         matrix = {}
+        stats = {
+            'total_pairs': 0,
+            'compatible': 0,
+            'filtered_by_distance': 0,
+            'filtered_by_cash': 0,
+            'filtered_by_declined': 0,
+            'filtered_by_other': 0
+        }
+        
         for agent in agents:
             matrix[agent.id] = {}
             for task in tasks:
-                matrix[agent.id][task.id] = self.is_compatible(agent, task)
+                stats['total_pairs'] += 1
+                is_compatible, reason = self.is_compatible(agent, task)
+                matrix[agent.id][task.id] = (is_compatible, reason)
+                
+                if is_compatible:
+                    stats['compatible'] += 1
+                elif 'distance_exceeded' in reason:
+                    stats['filtered_by_distance'] += 1
+                elif reason in ['no_cash_tag', 'wallet_threshold_exceeded']:
+                    stats['filtered_by_cash'] += 1
+                elif reason == 'agent_declined_task':
+                    stats['filtered_by_declined'] += 1
+                else:
+                    stats['filtered_by_other'] += 1
+        
+        print(f"[CompatibilityMatrix] {stats}")
+        self.compatibility_stats = stats  # Store for reporting
         return matrix
 
 
@@ -830,6 +942,9 @@ class FleetOptimizer:
                     'customer_name': task.meta.get('customer_name', '')
                 })
         
+        # Get compatibility stats
+        compat_stats = getattr(self.compatibility_checker, 'compatibility_stats', {})
+        
         return {
             'success': True,
             'metadata': {
@@ -840,6 +955,14 @@ class FleetOptimizer:
                 'total_lateness_seconds': int(total_lateness),
                 'optimization_time_seconds': round(solve_time, 3),
                 'solver': 'or_tools_vrp'
+            },
+            'compatibility': {
+                'total_agent_task_pairs': compat_stats.get('total_pairs', 0),
+                'compatible_pairs': compat_stats.get('compatible', 0),
+                'filtered_by_distance': compat_stats.get('filtered_by_distance', 0),
+                'filtered_by_cash_rules': compat_stats.get('filtered_by_cash', 0),
+                'filtered_by_declined': compat_stats.get('filtered_by_declined', 0),
+                'filtered_by_other': compat_stats.get('filtered_by_other', 0)
             },
             'agent_routes': agent_routes,
             'unassigned_tasks': unassigned_tasks
@@ -894,11 +1017,15 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict) -> Dict:
     # Get settings
     settings = agents_data.get('settings_used', {})
     wallet_threshold = settings.get('walletNoCashThreshold', DEFAULT_WALLET_THRESHOLD)
+    max_distance_km = settings.get('maxDistanceKm', None)  # Max distance for assignment
+    
+    print(f"[optimize_fleet] Settings: wallet_threshold={wallet_threshold}, max_distance_km={max_distance_km}")
     
     # Build compatibility checker
     compatibility_checker = CompatibilityChecker(
         wallet_threshold=wallet_threshold,
-        geofence_regions=geofences
+        geofence_regions=geofences,
+        max_distance_km=max_distance_km
     )
     
     # Run optimizer
