@@ -301,7 +301,7 @@ class CompatibilityChecker:
             (is_compatible, reason) tuple
         """
         # Rule 1: Decline History - Agent previously declined this task
-        if agent.id in task.declined_by:
+        if task.declined_by and agent.id in task.declined_by:
             return False, "agent_declined_task"
         
         # Rule 2: NoCash Tag - Agent can't handle cash
@@ -313,7 +313,8 @@ class CompatibilityChecker:
             return False, "wallet_threshold_exceeded"
         
         # Rule 4: Tag Matching - Task tags must match agent tags
-        if task.tags:
+        # task.tags must be a non-empty list for tag filtering to apply
+        if task.tags and len(task.tags) > 0:
             if not any(tag in agent.tags for tag in task.tags):
                 return False, "tag_mismatch"
         
@@ -494,6 +495,9 @@ class FleetOptimizer:
         self.compatibility_checker = compatibility_checker
         self.current_time = current_time or datetime.now(timezone.utc)
         
+        # Store max distance for chain-aware filtering
+        self.max_distance_km = getattr(compatibility_checker, 'max_distance_km', None)
+        
         # Build compatibility matrix
         self.compatibility_matrix = compatibility_checker.build_compatibility_matrix(
             agents, unassigned_tasks
@@ -505,14 +509,22 @@ class FleetOptimizer:
         self.unassigned = []
         self.metadata = {}
     
-    def _build_location_index(self) -> Tuple[List[Location], Dict]:
+    def _build_location_index(self, routable_tasks: List[Task] = None) -> Tuple[List[Location], Dict]:
         """
         Build unified location index for all stops.
+        
+        Args:
+            routable_tasks: List of unassigned tasks that have compatible agents.
+                           If None, uses self.unassigned_tasks (legacy behavior).
         
         Returns:
             locations: List of all locations
             index_map: Mapping information for nodes
         """
+        # Default to all unassigned tasks if not specified (legacy behavior)
+        if routable_tasks is None:
+            routable_tasks = self.unassigned_tasks
+        
         locations = []
         index_map = {
             'agent_starts': {},      # agent_id -> location_index
@@ -560,8 +572,8 @@ class FleetOptimizer:
                 locations.append(task.delivery_location)
                 idx += 1
         
-        # Add unassigned task locations
-        for task in self.unassigned_tasks:
+        # Add routable unassigned task locations (pre-filtered tasks excluded)
+        for task in routable_tasks:
             # Pickup
             index_map['pickups'][task.id] = idx
             index_map['task_at_index'][idx] = (task.id, 'pickup', None)
@@ -581,6 +593,46 @@ class FleetOptimizer:
         delta = (dt - self.current_time).total_seconds()
         return max(0, int(delta))
     
+    def _build_distance_matrix(self, locations: List[Location]) -> List[List[float]]:
+        """
+        Build a distance matrix (in km) for all location pairs.
+        Used for chain-aware distance enforcement.
+        
+        Returns:
+            2D list where matrix[i][j] = distance in km from location i to j
+        """
+        n = len(locations)
+        
+        # Try OSRM first
+        try:
+            # Build coordinate string for OSRM
+            coords_str = ";".join([loc.to_osrm_str() for loc in locations])
+            url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coords_str}?annotations=distance"
+            
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 'Ok' and 'distances' in data:
+                    # OSRM returns distances in meters, convert to km
+                    osrm_distances = data['distances']
+                    return [[d / 1000.0 for d in row] for row in osrm_distances]
+        except Exception as e:
+            print(f"[FleetOptimizer] OSRM distance matrix error: {e}, using Haversine fallback")
+        
+        # Fallback to Haversine distances
+        matrix = []
+        for i, loc_i in enumerate(locations):
+            row = []
+            for j, loc_j in enumerate(locations):
+                if i == j:
+                    row.append(0.0)
+                else:
+                    dist = _haversine_km(loc_i.lat, loc_i.lng, loc_j.lat, loc_j.lng)
+                    row.append(dist)
+            matrix.append(row)
+        
+        return matrix
+    
     def optimize(self) -> Dict:
         """
         Run the fleet optimization.
@@ -597,17 +649,55 @@ class FleetOptimizer:
         if not self.unassigned_tasks and not any(a.current_tasks for a in self.agents):
             return self._empty_result("no_tasks")
         
-        # Build location index
-        locations, index_map = self._build_location_index()
+        # PRE-FILTER: Check compatibility BEFORE building location index
+        # This prevents pre-filtered tasks from getting indices in the routing model
+        self.pre_filtered_tasks = []
+        self.routable_tasks = []  # Tasks that have at least one compatible agent
+        
+        for task in self.unassigned_tasks:
+            # Check if ANY agent is compatible with this task
+            compatible_agents = []
+            incompatibility_reasons = []
+            
+            for agent in self.agents:
+                is_compatible, reason = self.compatibility_matrix[agent.id][task.id]
+                if is_compatible:
+                    compatible_agents.append(agent.name)
+                else:
+                    incompatibility_reasons.append(reason)
+            
+            if compatible_agents:
+                self.routable_tasks.append(task)
+            else:
+                # No compatible agents - pre-filter this task
+                reason = max(set(incompatibility_reasons), key=incompatibility_reasons.count) if incompatibility_reasons else "no_compatible_agents"
+                print(f"[FleetOptimizer] PRE-FILTER: Task {task.id[:20]}... no compatible agents (reason: {reason})")
+                self.pre_filtered_tasks.append({
+                    'task': task,
+                    'reason': reason
+                })
+        
+        print(f"[FleetOptimizer] Pre-filtered {len(self.pre_filtered_tasks)} tasks, {len(self.routable_tasks)} tasks routable")
+        
+        # Build location index with ONLY routable tasks
+        locations, index_map = self._build_location_index(self.routable_tasks)
         num_locations = len(locations)
         num_vehicles = len(self.agents)
         
         print(f"[FleetOptimizer] Building model: {num_locations} locations, {num_vehicles} vehicles")
-        print(f"[FleetOptimizer] Unassigned tasks: {len(self.unassigned_tasks)}")
+        print(f"[FleetOptimizer] Routable tasks: {len(self.routable_tasks)}")
         
         # Get travel time matrix
         print("[FleetOptimizer] Fetching travel times from OSRM...")
         time_matrix = get_travel_time_matrix(locations)
+        
+        # Build distance matrix for chain-aware enforcement
+        # This ensures every hop in the route is within maxDistanceKm
+        max_distance_km = self.max_distance_km
+        distance_matrix = None
+        if max_distance_km is not None:
+            print(f"[FleetOptimizer] Building distance matrix for chain-aware filtering (max {max_distance_km}km per hop)...")
+            distance_matrix = self._build_distance_matrix(locations)
         
         # Create routing model
         manager = pywrapcp.RoutingIndexManager(
@@ -618,11 +708,30 @@ class FleetOptimizer:
         )
         routing = pywrapcp.RoutingModel(manager)
         
-        # Travel time callback
+        # Travel time callback with chain-aware distance enforcement
+        # Progressive penalty: the further over maxDistanceKm, the heavier the penalty
+        # Uses quadratic scaling so small overages are tolerable but large ones are punishing
+        BASE_PENALTY_PER_KM = 600  # 10 min base penalty per km over
+        
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
-            return time_matrix[from_node][to_node] + DEFAULT_SERVICE_TIME_SECONDS
+            base_time = time_matrix[from_node][to_node] + DEFAULT_SERVICE_TIME_SECONDS
+            
+            # Chain-aware enforcement: progressive penalty for exceeding maxDistanceKm
+            if distance_matrix is not None and max_distance_km is not None:
+                hop_distance_km = distance_matrix[from_node][to_node]
+                if hop_distance_km > max_distance_km:
+                    # Progressive (quadratic) penalty:
+                    # - 1km over: 1^2 * 600 = 10 min penalty
+                    # - 2km over: 2^2 * 600 = 40 min penalty  
+                    # - 3km over: 3^2 * 600 = 1.5 hour penalty
+                    # - 5km over: 5^2 * 600 = 4+ hour penalty (strongly discouraged)
+                    excess_km = hop_distance_km - max_distance_km
+                    penalty = int((excess_km ** 2) * BASE_PENALTY_PER_KM)
+                    return base_time + penalty
+            
+            return base_time
         
         transit_callback_index = routing.RegisterTransitCallback(time_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
@@ -638,9 +747,9 @@ class FleetOptimizer:
         time_dimension = routing.GetDimensionOrDie('Time')
         
         # Add capacity dimension to enforce max_tasks per agent
-        # Track NEW tasks only - count pickups of unassigned tasks
-        # Build set of unassigned task IDs for quick lookup
-        unassigned_task_ids = {t.id for t in self.unassigned_tasks}
+        # Track NEW tasks only - count pickups of routable unassigned tasks
+        # Build set of routable task IDs for quick lookup
+        routable_task_ids = {t.id for t in self.routable_tasks}
         
         def demand_callback(from_index):
             """Returns demand: +1 for new task pickup, 0 otherwise"""
@@ -649,7 +758,7 @@ class FleetOptimizer:
             if task_info:
                 task_id, stop_type, original_agent = task_info
                 # Only count NEW task pickups (not existing tasks, not deliveries)
-                if stop_type == 'pickup' and task_id in unassigned_task_ids:
+                if stop_type == 'pickup' and task_id in routable_task_ids:
                     return 1  # New task being assigned
             return 0  # Existing tasks, deliveries, start/end nodes
         
@@ -703,38 +812,36 @@ class FleetOptimizer:
                     deadline_seconds = self._time_to_seconds(task.delivery_before)
                     time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # 30min grace
         
-        # Unassigned tasks
-        for task in self.unassigned_tasks:
+        # Routable tasks (pre-filtering already done before building location index)
+        for task in self.routable_tasks:
             pickup_idx = index_map['pickups'].get(task.id)
             delivery_idx = index_map['deliveries'].get(task.id)
             
             if pickup_idx is None or delivery_idx is None:
                 continue
             
-            pickup_delivery_pairs.append((pickup_idx, delivery_idx))
-            
-            pickup_index = manager.NodeToIndex(pickup_idx)
-            delivery_index = manager.NodeToIndex(delivery_idx)
-            
-            # Set allowed vehicles based on compatibility
+            # Get compatible vehicles (we know at least one exists because of pre-filtering)
             allowed_vehicles = []
             for agent_idx, agent in enumerate(self.agents):
                 is_compatible, _ = self.compatibility_matrix[agent.id][task.id]
                 if is_compatible:
                     allowed_vehicles.append(agent_idx)
             
-            # Log compatibility
-            if allowed_vehicles:
-                print(f"[FleetOptimizer] Task {task.id[:20]}... compatible with {len(allowed_vehicles)} agents: {[self.agents[i].name for i in allowed_vehicles[:3]]}")
-                routing.SetAllowedVehiclesForIndex(allowed_vehicles, pickup_index)
-                routing.SetAllowedVehiclesForIndex(allowed_vehicles, delivery_index)
-            else:
-                print(f"[FleetOptimizer] Task {task.id[:20]}... NO compatible agents!")
+            print(f"[FleetOptimizer] Task {task.id[:20]}... compatible with {len(allowed_vehicles)} agents: {[self.agents[i].name for i in allowed_vehicles[:3]]} (vehicle_indices: {allowed_vehicles})")
+            
+            pickup_delivery_pairs.append((pickup_idx, delivery_idx))
+            
+            pickup_index = manager.NodeToIndex(pickup_idx)
+            delivery_index = manager.NodeToIndex(delivery_idx)
+            
+            # Set allowed vehicles - only agents who haven't declined and pass other checks
+            print(f"[FleetOptimizer] Setting allowed vehicles for pickup_index={pickup_index}, delivery_index={delivery_index} -> vehicles={allowed_vehicles}")
+            routing.SetAllowedVehiclesForIndex(allowed_vehicles, pickup_index)
+            routing.SetAllowedVehiclesForIndex(allowed_vehicles, delivery_index)
             
             # Allow dropping this task as a pair (pickup + delivery together)
-            # Penalty is high but allows partial solutions when capacity is exceeded
-            penalty = 50000 if allowed_vehicles else 1000
-            routing.AddDisjunction([pickup_index, delivery_index], penalty, 2)
+            # High penalty ensures we try to assign before dropping
+            routing.AddDisjunction([pickup_index, delivery_index], 50000, 2)
             
             # Add time windows
             # pickup_before = when food is READY (earliest pickup time)
@@ -841,8 +948,8 @@ class FleetOptimizer:
                                     task = t
                                     break
                     else:
-                        # Unassigned task
-                        for t in self.unassigned_tasks:
+                        # Routable unassigned task
+                        for t in self.routable_tasks:
                             if t.id == task_id:
                                 task = t
                                 if stop_type == 'pickup':
@@ -924,14 +1031,27 @@ class FleetOptimizer:
         
         # Find unassigned tasks
         unassigned_tasks = []
-        for task in self.unassigned_tasks:
+        
+        # First, add pre-filtered tasks (those with NO compatible agents)
+        for pre_filtered in getattr(self, 'pre_filtered_tasks', []):
+            task = pre_filtered['task']
+            unassigned_tasks.append({
+                'task_id': task.id,
+                'reason': pre_filtered['reason'],
+                'restaurant_name': task.meta.get('restaurant_name', ''),
+                'customer_name': task.meta.get('customer_name', '')
+            })
+        
+        # Then add routable tasks that were in the routing model but not assigned
+        for task in getattr(self, 'routable_tasks', []):
             if task.id not in assigned_task_ids:
-                # Find reason
+                # Find reason from compatibility matrix
                 reasons = []
                 for agent in self.agents:
-                    compatible, reason = self.compatibility_matrix[agent.id][task.id]
-                    if not compatible:
-                        reasons.append(reason)
+                    if task.id in self.compatibility_matrix.get(agent.id, {}):
+                        compatible, reason = self.compatibility_matrix[agent.id][task.id]
+                        if not compatible:
+                            reasons.append(reason)
                 
                 primary_reason = max(set(reasons), key=reasons.count) if reasons else "no_feasible_route"
                 
