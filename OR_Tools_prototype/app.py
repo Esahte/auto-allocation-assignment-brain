@@ -318,7 +318,7 @@ def handle_task_created(data):
     # Trigger fleet optimization
     trigger_fleet_optimization('task:created', {
         'task_id': task_id,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 @socketio.on('task:declined')
@@ -344,7 +344,7 @@ def handle_task_declined(data):
         'task_id': task_id,
         'agent_id': agent_id,
         'agent_name': agent_name,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 @socketio.on('task:completed')
@@ -370,7 +370,7 @@ def handle_task_completed(data):
         'task_id': task_id,
         'agent_id': agent_id,
         'agent_name': agent_name,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 @socketio.on('task:cancelled')
@@ -394,7 +394,7 @@ def handle_task_cancelled(data):
     trigger_fleet_optimization('task:cancelled', {
         'task_id': task_id,
         'reason': reason,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 @socketio.on('task:updated')
@@ -419,7 +419,7 @@ def handle_task_updated(data):
     trigger_fleet_optimization('task:updated', {
         'task_id': task_id,
         'updated_fields': updated_fields,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 @socketio.on('agent:online')
@@ -443,7 +443,7 @@ def handle_agent_online(data):
     trigger_fleet_optimization('agent:online', {
         'agent_id': agent_id,
         'agent_name': name,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 @socketio.on('agent:offline')
@@ -467,7 +467,7 @@ def handle_agent_offline(data):
     trigger_fleet_optimization('agent:offline', {
         'agent_id': agent_id,
         'agent_name': name,
-        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     })
 
 # -----------------------------------------------------------------------------
