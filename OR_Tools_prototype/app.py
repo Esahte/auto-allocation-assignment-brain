@@ -111,7 +111,9 @@ def process_fleet_optimization(data: dict) -> dict:
         tasks_data = data['tasks_data']
     else:
         # Fetch from dashboard
-        dashboard_url = data.get('dashboard_url', 'http://localhost:8000')
+        # Priority: request data > environment variable > localhost default
+        default_dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
+        dashboard_url = data.get('dashboard_url', default_dashboard_url)
         
         def fetch_agents():
             resp = req.get(f"{dashboard_url}/api/test/or-tools/agents", timeout=30)
@@ -150,9 +152,10 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
     try:
         start_time = time.time()
         
-        # Use dashboard_url from trigger_data or default
+        # Use dashboard_url from trigger_data, env var, or default
+        default_dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
         result = process_fleet_optimization({
-            'dashboard_url': trigger_data.get('dashboard_url', 'http://localhost:8000')
+            'dashboard_url': trigger_data.get('dashboard_url', default_dashboard_url)
         })
         
         execution_time = time.time() - start_time
