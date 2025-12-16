@@ -19,7 +19,7 @@ IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE_NAME}
 # Dashboard URL for fleet optimization callbacks
 # Set this to your dashboard's public URL (the OR-Tools service calls this to fetch agent/task data)
 # Leave empty to require dashboard_url in each request
-DASHBOARD_URL=""  # Example: "https://your-dashboard.vercel.app" or "https://your-dashboard.com"
+DASHBOARD_URL="https://allmart-dashboard-95621826490.us-central1.run.app"  # Example: "https://your-dashboard.vercel.app" or "https://your-dashboard.com"
 
 echo "=================================="
 echo "OR-Tools Recommender Deployment"

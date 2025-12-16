@@ -10,7 +10,9 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'fleet-optimizer-secret-key')
 
 # Initialize Socket.IO with CORS support
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Use gevent async_mode to match gunicorn's gevent worker in production
+# Falls back gracefully in development
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 # Track connected clients
 connected_clients = {}
