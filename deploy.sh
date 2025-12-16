@@ -16,6 +16,11 @@ REGION="us-central1"
 REPOSITORY="cloud-run-source-deploy"
 IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE_NAME}"
 
+# Dashboard URL for fleet optimization callbacks
+# Set this to your dashboard's public URL (the OR-Tools service calls this to fetch agent/task data)
+# Leave empty to require dashboard_url in each request
+DASHBOARD_URL=""  # Example: "https://your-dashboard.vercel.app" or "https://your-dashboard.com"
+
 echo "=================================="
 echo "OR-Tools Recommender Deployment"
 echo "=================================="
@@ -23,6 +28,11 @@ echo ""
 echo "Project: ${PROJECT_ID}"
 echo "Service: ${SERVICE_NAME}"
 echo "Region: ${REGION}"
+if [ -n "$DASHBOARD_URL" ]; then
+    echo "Dashboard URL: ${DASHBOARD_URL}"
+else
+    echo "Dashboard URL: (will use request data or localhost default)"
+fi
 echo ""
 
 # Check if gcloud is installed
@@ -62,6 +72,12 @@ echo ""
 echo "⬆️  Pushing image to Artifact Registry..."
 docker push ${IMAGE_NAME}:latest
 
+# Build environment variables string
+ENV_VARS=""
+if [ -n "$DASHBOARD_URL" ]; then
+    ENV_VARS="--set-env-vars DASHBOARD_URL=${DASHBOARD_URL}"
+fi
+
 # Deploy to Cloud Run
 echo ""
 echo "🚀 Deploying to Cloud Run..."
@@ -73,7 +89,8 @@ gcloud run deploy ${SERVICE_NAME} \
   --memory 2Gi \
   --cpu 2 \
   --max-instances 10 \
-  --timeout 300
+  --timeout 300 \
+  ${ENV_VARS}
 
 echo ""
 echo "✅ Deployment complete!"
@@ -84,4 +101,6 @@ echo ""
 echo "Test the deployment:"
 echo "  curl \$(gcloud run services describe ${SERVICE_NAME} --region ${REGION} --format='value(status.url)')/health"
 echo ""
-
+echo "WebSocket endpoint:"
+echo "  wss://\$(gcloud run services describe ${SERVICE_NAME} --region ${REGION} --format='value(status.url)' | sed 's/https:\/\///')/socket.io/"
+echo ""
