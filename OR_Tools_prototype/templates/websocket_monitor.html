@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Monitor</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+        h1 { color: #00ff88; margin-bottom: 20px; }
+        .container { display: flex; gap: 20px; height: calc(100vh - 100px); }
+        .panel { flex: 1; background: #16213e; border-radius: 8px; padding: 15px; overflow: hidden; display: flex; flex-direction: column; }
+        .panel h2 { color: #00ff88; margin-bottom: 10px; font-size: 14px; }
+        .log { flex: 1; overflow-y: auto; background: #0f0f23; padding: 10px; border-radius: 4px; font-size: 11px; }
+        .log-entry { margin-bottom: 15px; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        .log-entry.sent { border-left: 3px solid #ff6b6b; padding-left: 10px; }
+        .log-entry.received { border-left: 3px solid #4ecdc4; padding-left: 10px; }
+        .timestamp { color: #666; font-size: 10px; }
+        .event-name { color: #ffd93d; font-weight: bold; }
+        pre { white-space: pre-wrap; word-wrap: break-word; color: #ccc; margin-top: 5px; }
+        .status { padding: 10px; margin-bottom: 20px; border-radius: 4px; }
+        .status.connected { background: #1b4332; color: #95d5b2; }
+        .status.disconnected { background: #4a1515; color: #f8a5a5; }
+        .controls { margin-bottom: 20px; }
+        button { background: #00ff88; color: #000; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-right: 10px; font-family: monospace; }
+        button:hover { background: #00cc6a; }
+        button:disabled { background: #444; color: #888; cursor: not-allowed; }
+        textarea { width: 100%; height: 150px; background: #0f0f23; color: #eee; border: 1px solid #333; padding: 10px; font-family: monospace; font-size: 11px; border-radius: 4px; }
+        .send-panel { margin-top: 10px; }
+        select { background: #0f0f23; color: #eee; border: 1px solid #333; padding: 8px; border-radius: 4px; margin-right: 10px; }
+    </style>
+</head>
+<body>
+    <h1>🔌 WebSocket Monitor</h1>
+    
+    <div id="status" class="status disconnected">Disconnected</div>
+    
+    <div class="controls">
+        <button id="connectBtn" onclick="connect()">Connect</button>
+        <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        <button onclick="clearLogs()">Clear Logs</button>
+    </div>
+    
+    <div class="container">
+        <div class="panel">
+            <h2>📤 SENT</h2>
+            <div id="sentLog" class="log"></div>
+            <div class="send-panel">
+                <select id="eventSelect">
+                    <option value="task:get_recommendations">task:get_recommendations</option>
+                    <option value="fleet:optimize_request">fleet:optimize_request</option>
+                    <option value="task:created">task:created</option>
+                    <option value="task:declined">task:declined</option>
+                </select>
+                <button onclick="sendMessage()">Send</button>
+                <textarea id="messageInput" placeholder="Enter JSON payload...">{
+  "request_id": "test-001",
+  "new_task": {
+    "id": "test-task-001",
+    "restaurant_location": [17.12543, -61.8172],
+    "delivery_location": [17.162913, -61.8213],
+    "pickup_before": "2025-12-16T05:08:00.000Z",
+    "delivery_before": "2025-12-16T05:38:00.000Z"
+  },
+  "agents": [
+    {
+      "driver_id": "2023444",
+      "name": "Test Agent",
+      "current_location": [17.1284917, -61.8227533]
+    }
+  ],
+  "current_tasks": [],
+  "optimization_mode": "tardiness_min"
+}</textarea>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <h2>📥 RECEIVED</h2>
+            <div id="receivedLog" class="log"></div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        
+        function connect() {
+            socket = io('http://localhost:5050');
+            
+            socket.on('connect', () => {
+                document.getElementById('status').className = 'status connected';
+                document.getElementById('status').textContent = 'Connected: ' + socket.id;
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = false;
+                logReceived('connect', { socket_id: socket.id });
+            });
+            
+            socket.on('disconnect', () => {
+                document.getElementById('status').className = 'status disconnected';
+                document.getElementById('status').textContent = 'Disconnected';
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('disconnectBtn').disabled = true;
+                logReceived('disconnect', {});
+            });
+            
+            // Listen to all events
+            socket.onAny((event, data) => {
+                logReceived(event, data);
+            });
+        }
+        
+        function disconnect() {
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+        }
+        
+        function sendMessage() {
+            if (!socket || !socket.connected) {
+                alert('Not connected!');
+                return;
+            }
+            
+            const event = document.getElementById('eventSelect').value;
+            const input = document.getElementById('messageInput').value;
+            
+            try {
+                const data = JSON.parse(input);
+                socket.emit(event, data);
+                logSent(event, data);
+            } catch (e) {
+                alert('Invalid JSON: ' + e.message);
+            }
+        }
+        
+        function logSent(event, data) {
+            const log = document.getElementById('sentLog');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry sent';
+            entry.innerHTML = `
+                <div class="timestamp">${new Date().toISOString()}</div>
+                <div class="event-name">${event}</div>
+                <pre>${JSON.stringify(data, null, 2)}</pre>
+            `;
+            log.insertBefore(entry, log.firstChild);
+        }
+        
+        function logReceived(event, data) {
+            const log = document.getElementById('receivedLog');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry received';
+            entry.innerHTML = `
+                <div class="timestamp">${new Date().toISOString()}</div>
+                <div class="event-name">${event}</div>
+                <pre>${JSON.stringify(data, null, 2)}</pre>
+            `;
+            log.insertBefore(entry, log.firstChild);
+        }
+        
+        function clearLogs() {
+            document.getElementById('sentLog').innerHTML = '';
+            document.getElementById('receivedLog').innerHTML = '';
+        }
+    </script>
+</body>
+</html>
+

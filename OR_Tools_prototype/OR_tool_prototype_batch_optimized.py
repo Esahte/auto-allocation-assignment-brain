@@ -15,6 +15,8 @@ import numpy as np
 import json
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import math
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -28,6 +30,25 @@ DEFAULT_MAX_GRACE_PERIOD = 3600  # 60 minutes
 # OSRM cache for API calls
 _osrm_cache = {}
 _cache_timeout = 300  # 5 minutes
+
+# =============================================================================
+# RETRY SESSION FOR OSRM CALLS
+# =============================================================================
+def _create_retry_session() -> requests.Session:
+    """Create a session with retry logic for OSRM calls"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=0.5,  # Wait 0.5s, 1s, 2s between retries
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+_osrm_session = _create_retry_session()
 
 def haversine_distance_km(lat1_lng1: Tuple[float, float], lat2_lng2: Tuple[float, float]) -> float:
     """
@@ -54,6 +75,7 @@ def get_osrm_road_distances(origin: Tuple[float, float], destinations: List[Tupl
     """
     Get road distances from origin to multiple destinations using OSRM.
     Returns distances in kilometers. Falls back to Haversine if OSRM fails.
+    Uses retry session to handle connection resets from Cloud Run cold starts.
     """
     if not destinations:
         return []
@@ -67,7 +89,7 @@ def get_osrm_road_distances(origin: Tuple[float, float], destinations: List[Tupl
         # sources=0 means only calculate from the first point (origin) to all others
         url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coords_str}?sources=0&annotations=distance"
         
-        response = requests.get(url, timeout=10)
+        response = _osrm_session.get(url, timeout=15)
         response.raise_for_status()
         
         data = response.json()
@@ -194,7 +216,7 @@ def build_osrm_time_matrix_cached(locations: List[Tuple[float, float]], use_cach
         coordinates = ";".join([f"{lng},{lat}" for lat, lng in locations])
         url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coordinates}?annotations=duration"
         
-        response = requests.get(url, timeout=30)
+        response = _osrm_session.get(url, timeout=30)
         response.raise_for_status()
         
         data = response.json()

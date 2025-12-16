@@ -11,6 +11,8 @@ Conservative mode: Only assigns unassigned/declined tasks, doesn't reassign exis
 
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -23,6 +25,36 @@ import math
 # =============================================================================
 
 OSRM_SERVER = "https://osrm-caribbean-785077267034.us-central1.run.app"
+
+# =============================================================================
+# HTTP SESSION WITH RETRY LOGIC
+# =============================================================================
+
+def create_retry_session(retries=3, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504)):
+    """Create a requests session with retry logic for OSRM calls."""
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+# Global session for OSRM calls
+_osrm_session = None
+
+def get_osrm_session():
+    """Get or create the OSRM HTTP session with retry logic."""
+    global _osrm_session
+    if _osrm_session is None:
+        _osrm_session = create_retry_session(retries=3, backoff_factor=1.0)
+    return _osrm_session
 DEFAULT_WALLET_THRESHOLD = 2500
 DEFAULT_SERVICE_TIME_SECONDS = 180  # 3 minutes per stop
 MAX_SOLVER_TIME_SECONDS = 10  # Reduced from 30 - sufficient for typical fleet sizes
@@ -41,8 +73,8 @@ class Location:
         return (self.lat, self.lng)
     
     def to_osrm_str(self) -> str:
-        """OSRM expects lng,lat format"""
-        return f"{self.lng},{self.lat}"
+        """OSRM expects lng,lat format. Truncate to 6 decimal places (0.1m precision)"""
+        return f"{self.lng:.6f},{self.lat:.6f}"
 
 
 @dataclass
@@ -226,21 +258,51 @@ def get_osrm_distances_matrix(origins: List[Location], destinations: List[Locati
         # Build coordinates: origins first, then destinations
         all_locations = origins + destinations
         coords_str = ";".join([loc.to_osrm_str() for loc in all_locations])
+        num_origins = len(origins)
         
-        # sources = indices of origins, destinations = indices of destinations
-        sources = ",".join([str(i) for i in range(len(origins))])
-        destinations_idx = ",".join([str(i) for i in range(len(origins), len(all_locations))])
+        # Request FULL matrix without sources/destinations filter
+        # (the sources/destinations filter causes "InvalidQuery" on some OSRM servers)
+        url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance"
         
-        url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?sources={sources}&destinations={destinations_idx}&annotations=distance"
+        session = get_osrm_session()
+        response = session.get(url, timeout=30)
         
-        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            # Get more details about the error
+            try:
+                error_data = response.json()
+                error_msg = error_data.get('message', 'Unknown error')
+                error_code = error_data.get('code', 'Unknown')
+                print(f"[OSRM] Distance matrix failed: {error_code} - {error_msg}")
+                
+                # Log problematic coordinates
+                print(f"[OSRM] Origins ({len(origins)}):")
+                for i, loc in enumerate(origins):
+                    print(f"[OSRM]   {i}: ({loc.lat:.6f}, {loc.lng:.6f})")
+                print(f"[OSRM] Destinations ({len(destinations)}):")
+                for i, loc in enumerate(destinations):
+                    print(f"[OSRM]   {i}: ({loc.lat:.6f}, {loc.lng:.6f})")
+            except:
+                print(f"[OSRM] Distance matrix failed with status {response.status_code}")
+        
         response.raise_for_status()
         data = response.json()
         
         if data.get('code') == 'Ok':
-            # Convert meters to km
-            distances = data.get('distances', [])
-            return [[d / 1000.0 if d is not None else float('inf') for d in row] for row in distances]
+            # Extract only the origin→destination subset from the full matrix
+            # Full matrix is NxN where N = num_origins + num_destinations
+            # We want rows 0..num_origins-1, columns num_origins..N-1
+            full_distances = data.get('distances', [])
+            result = []
+            for i in range(num_origins):
+                row = []
+                for j in range(num_origins, len(all_locations)):
+                    d = full_distances[i][j]
+                    row.append(d / 1000.0 if d is not None else float('inf'))
+                result.append(row)
+            return result
+        else:
+            print(f"[OSRM] Unexpected response code: {data.get('code')} - {data.get('message', '')}")
     except Exception as e:
         print(f"[OSRM] Distance matrix error: {e}, falling back to Haversine")
     
@@ -271,27 +333,56 @@ class CompatibilityChecker:
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
     
+    def _get_agent_projected_location(self, agent: Agent) -> Location:
+        """
+        Get the agent's projected location for distance checks.
+        
+        If agent has existing tasks, returns their LAST DELIVERY location
+        (where they'll be after completing current tasks).
+        Otherwise, returns their current location.
+        
+        This enables smarter chaining - an agent far from a restaurant NOW
+        might be close AFTER their current deliveries.
+        """
+        if agent.current_tasks:
+            # Find the last delivery location in their current task chain
+            last_task = agent.current_tasks[-1]
+            return last_task.delivery_location
+        else:
+            return agent.current_location
+    
     def precompute_distances(self, agents: List[Agent], tasks: List[Task]):
         """
         Precompute OSRM road distances from all agents to all task pickup locations.
-        This is done once upfront for efficiency.
+        
+        IMPORTANT: For agents with existing tasks, we use their PROJECTED location
+        (last delivery) instead of current location. This enables smart chaining
+        where an agent finishing nearby can pick up new tasks in the area.
         """
         if not agents or not tasks:
             return
         
-        agent_locations = [agent.current_location for agent in agents]
+        # Use projected locations (last delivery) for agents with existing tasks
+        agent_projected_locations = [self._get_agent_projected_location(agent) for agent in agents]
         task_locations = [task.restaurant_location for task in tasks]
+        
+        # Log which agents are using projected locations
+        for agent in agents:
+            if agent.current_tasks:
+                proj_loc = self._get_agent_projected_location(agent)
+                print(f"[CompatibilityChecker] {agent.name}: Using projected location "
+                      f"(last delivery at {proj_loc.lat:.4f}, {proj_loc.lng:.4f}) instead of current location")
         
         print(f"[CompatibilityChecker] Getting OSRM distances for {len(agents)} agents x {len(tasks)} tasks...")
         
-        distances = get_osrm_distances_matrix(agent_locations, task_locations)
+        distances = get_osrm_distances_matrix(agent_projected_locations, task_locations)
         
-        # Store in cache
+        # Store in cache with projected flag
         for i, agent in enumerate(agents):
             for j, task in enumerate(tasks):
                 self.distance_cache[(agent.id, task.id)] = distances[i][j] if distances else float('inf')
         
-        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} distances")
+        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} distances (using projected locations)")
     
     def is_compatible(self, agent: Agent, task: Task) -> Tuple[bool, str]:
         """
@@ -336,20 +427,24 @@ class CompatibilityChecker:
         
         # Rule 6: Max Distance - Agent must be within maxDistanceKm of pickup location
         # Uses OSRM road distance (precomputed) for accuracy
+        # IMPORTANT: Uses PROJECTED location (last delivery) for agents with existing tasks
         if self.max_distance_km is not None:
-            # Check cache first (OSRM road distance)
+            # Check cache first (OSRM road distance from projected location)
             cache_key = (agent.id, task.id)
             if cache_key in self.distance_cache:
                 distance = self.distance_cache[cache_key]
             else:
-                # Fallback to Haversine if not in cache
+                # Fallback to Haversine if not in cache - use projected location
+                projected_loc = self._get_agent_projected_location(agent)
                 distance = _haversine_km(
-                    agent.current_location.lat, agent.current_location.lng,
+                    projected_loc.lat, projected_loc.lng,
                     task.restaurant_location.lat, task.restaurant_location.lng
                 )
             
             if distance > self.max_distance_km:
-                return False, f"distance_exceeded_{distance:.1f}km"
+                # Include whether this is from projected location in the reason
+                loc_type = "projected" if agent.current_tasks else "current"
+                return False, f"distance_exceeded_{distance:.1f}km_from_{loc_type}"
         
         return True, "compatible"
     
@@ -421,7 +516,8 @@ def get_travel_time_matrix(locations: List[Location]) -> List[List[int]]:
     url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=duration"
     
     try:
-        response = requests.get(url, timeout=30)
+        session = get_osrm_session()
+        response = session.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
         
@@ -558,18 +654,24 @@ class FleetOptimizer:
         
         # Add existing task locations (pickups and deliveries for current tasks)
         for agent in self.agents:
+            print(f"[FleetOptimizer] Agent {agent.name} has {len(agent.current_tasks)} current tasks")
             for task in agent.current_tasks:
+                print(f"[FleetOptimizer]   - Task {task.id[:20]}... pickup_completed={task.pickup_completed}")
                 if not task.pickup_completed:
                     # Add pickup location
                     index_map['pickups'][task.id] = idx
                     index_map['task_at_index'][idx] = (task.id, 'pickup', agent.id)
                     locations.append(task.restaurant_location)
+                    print(f"[FleetOptimizer]     Added PICKUP at index {idx}")
                     idx += 1
+                else:
+                    print(f"[FleetOptimizer]     SKIPPED pickup (already completed)")
                 
                 # Add delivery location
                 index_map['deliveries'][task.id] = idx
                 index_map['task_at_index'][idx] = (task.id, 'delivery', agent.id)
                 locations.append(task.delivery_location)
+                print(f"[FleetOptimizer]     Added DELIVERY at index {idx}")
                 idx += 1
         
         # Add routable unassigned task locations (pre-filtered tasks excluded)
@@ -607,9 +709,10 @@ class FleetOptimizer:
         try:
             # Build coordinate string for OSRM
             coords_str = ";".join([loc.to_osrm_str() for loc in locations])
-            url = f"https://osrm-caribbean-785077267034.us-central1.run.app/table/v1/driving/{coords_str}?annotations=distance"
+            url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance"
             
-            response = requests.get(url, timeout=30)
+            session = get_osrm_session()
+            response = session.get(url, timeout=30)
             if response.status_code == 200:
                 data = response.json()
                 if data.get('code') == 'Ok' and 'distances' in data:
@@ -786,31 +889,38 @@ class FleetOptimizer:
         # Add pickup and delivery constraints
         pickup_delivery_pairs = []
         
-        # Existing tasks (already assigned to specific agents)
+        # Existing tasks (already assigned to specific agents) - MANDATORY, no disjunction
+        print(f"[FleetOptimizer] Setting up existing task constraints...")
         for agent_idx, agent in enumerate(self.agents):
             for task in agent.current_tasks:
                 pickup_idx = index_map['pickups'].get(task.id)
                 delivery_idx = index_map['deliveries'].get(task.id)
                 
+                print(f"[FleetOptimizer] Existing task {task.id[:20]}... for {agent.name}: pickup_idx={pickup_idx}, delivery_idx={delivery_idx}")
+                
                 if pickup_idx is not None and delivery_idx is not None:
                     # Both pickup and delivery needed
                     pickup_delivery_pairs.append((pickup_idx, delivery_idx))
                     
-                    # Force this task to this agent
+                    # Force this task to this agent (MANDATORY - no disjunction)
                     pickup_index = manager.NodeToIndex(pickup_idx)
                     delivery_index = manager.NodeToIndex(delivery_idx)
                     
                     routing.SetAllowedVehiclesForIndex([agent_idx], pickup_index)
                     routing.SetAllowedVehiclesForIndex([agent_idx], delivery_index)
+                    print(f"[FleetOptimizer]   Locked to agent {agent_idx} ({agent.name}): pickup->delivery")
                     
                 elif delivery_idx is not None:
                     # Delivery only (pickup completed)
                     delivery_index = manager.NodeToIndex(delivery_idx)
                     routing.SetAllowedVehiclesForIndex([agent_idx], delivery_index)
+                    print(f"[FleetOptimizer]   Locked to agent {agent_idx} ({agent.name}): delivery only (pickup done)")
                     
                     # Add time window for delivery - this is the real deadline
                     deadline_seconds = self._time_to_seconds(task.delivery_before)
                     time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # 30min grace
+                else:
+                    print(f"[FleetOptimizer]   WARNING: No indices found for existing task!")
         
         # Routable tasks (pre-filtering already done before building location index)
         for task in self.routable_tasks:
@@ -1035,31 +1145,63 @@ class FleetOptimizer:
         # First, add pre-filtered tasks (those with NO compatible agents)
         for pre_filtered in getattr(self, 'pre_filtered_tasks', []):
             task = pre_filtered['task']
+            
+            # Build detailed agent-level breakdown
+            agent_details = []
+            for agent in self.agents:
+                if task.id in self.compatibility_matrix.get(agent.id, {}):
+                    compatible, reason = self.compatibility_matrix[agent.id][task.id]
+                    agent_details.append({
+                        'agent_id': agent.id,
+                        'agent_name': agent.name,
+                        'compatible': compatible,
+                        'reason': reason
+                    })
+            
             unassigned_tasks.append({
                 'task_id': task.id,
                 'reason': pre_filtered['reason'],
                 'restaurant_name': task.meta.get('restaurant_name', ''),
-                'customer_name': task.meta.get('customer_name', '')
+                'customer_name': task.meta.get('customer_name', ''),
+                'agents_considered': agent_details
             })
         
         # Then add routable tasks that were in the routing model but not assigned
         for task in getattr(self, 'routable_tasks', []):
             if task.id not in assigned_task_ids:
-                # Find reason from compatibility matrix
-                reasons = []
+                # Build detailed agent-level breakdown
+                agent_details = []
+                compatible_agents = []
+                
                 for agent in self.agents:
                     if task.id in self.compatibility_matrix.get(agent.id, {}):
                         compatible, reason = self.compatibility_matrix[agent.id][task.id]
-                        if not compatible:
-                            reasons.append(reason)
+                        agent_details.append({
+                            'agent_id': agent.id,
+                            'agent_name': agent.name,
+                            'compatible': compatible,
+                            'reason': reason
+                        })
+                        if compatible:
+                            compatible_agents.append(agent.name)
                 
-                primary_reason = max(set(reasons), key=reasons.count) if reasons else "no_feasible_route"
+                # Determine primary reason
+                if compatible_agents:
+                    # Had compatible agents but solver couldn't fit it
+                    primary_reason = "no_feasible_route"
+                    reason_detail = f"Compatible with {', '.join(compatible_agents)} but no feasible time slot"
+                else:
+                    incompatible_reasons = [a['reason'] for a in agent_details if not a['compatible']]
+                    primary_reason = max(set(incompatible_reasons), key=incompatible_reasons.count) if incompatible_reasons else "unknown"
+                    reason_detail = primary_reason
                 
                 unassigned_tasks.append({
                     'task_id': task.id,
                     'reason': primary_reason,
+                    'reason_detail': reason_detail,
                     'restaurant_name': task.meta.get('restaurant_name', ''),
-                    'customer_name': task.meta.get('customer_name', '')
+                    'customer_name': task.meta.get('customer_name', ''),
+                    'agents_considered': agent_details
                 })
         
         # Get compatibility stats
@@ -1090,6 +1232,35 @@ class FleetOptimizer:
     
     def _empty_result(self, reason: str, solve_time: float = 0) -> Dict:
         """Return empty result with reason"""
+        # Build agent details for each unassigned task
+        unassigned_with_details = []
+        for t in self.unassigned_tasks:
+            agent_details = []
+            for agent in self.agents:
+                if hasattr(self, 'compatibility_matrix') and t.id in self.compatibility_matrix.get(agent.id, {}):
+                    compatible, agent_reason = self.compatibility_matrix[agent.id][t.id]
+                    agent_details.append({
+                        'agent_id': agent.id,
+                        'agent_name': agent.name,
+                        'compatible': compatible,
+                        'reason': agent_reason
+                    })
+                else:
+                    agent_details.append({
+                        'agent_id': agent.id,
+                        'agent_name': agent.name,
+                        'compatible': False,
+                        'reason': reason
+                    })
+            
+            unassigned_with_details.append({
+                'task_id': t.id, 
+                'reason': reason,
+                'restaurant_name': t.meta.get('restaurant_name', ''),
+                'customer_name': t.meta.get('customer_name', ''),
+                'agents_considered': agent_details
+            })
+        
         return {
             'success': False,
             'reason': reason,
@@ -1101,7 +1272,7 @@ class FleetOptimizer:
                 'optimization_time_seconds': round(solve_time, 3)
             },
             'agent_routes': [],
-            'unassigned_tasks': [{'task_id': t.id, 'reason': reason} for t in self.unassigned_tasks]
+            'unassigned_tasks': unassigned_with_details
         }
 
 

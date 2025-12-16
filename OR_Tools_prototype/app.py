@@ -20,12 +20,18 @@ def fleet_dashboard():
     """Serve the fleet optimizer dashboard UI."""
     return render_template('fleet_dashboard.html')
 
+@app.route('/ws-monitor')
+def websocket_monitor():
+    """Serve the WebSocket monitor/debug UI."""
+    return render_template('websocket_monitor.html')
+
 # Performance monitoring
 performance_stats = {
     "total_requests": 0,
     "batch_optimized_requests": 0,
     "fleet_optimizer_requests": 0,
     "websocket_events": 0,
+    "auto_optimizations": 0,
     "average_response_time": 0.0,
     "cache_hits": 0,
     "algorithm_usage": {},
@@ -57,16 +63,6 @@ def process_batch_recommendation(data: dict) -> dict:
     """
     Core function for batch-optimized recommendations.
     Used by both HTTP API and WebSocket handlers.
-    
-    Expected data format:
-    {
-        "new_task": {...},
-        "agents": [...],           # Must have driver_id, current_location
-        "current_tasks": [...],    # Must have assigned_driver
-        "max_grace_period": 3600,
-        "optimization_mode": "tardiness_min",
-        ...
-    }
     """
     if not BATCH_AVAILABLE:
         return {"error": "Batch optimization not available", "recommendations": []}
@@ -78,7 +74,6 @@ def process_batch_recommendation(data: dict) -> dict:
     if not new_task or not agents:
         return {"error": "Missing required fields: new_task, agents", "recommendations": []}
     
-    # Run batch optimization
     result = recommend_agents_batch_optimized(
         new_task=new_task,
         agents=agents,
@@ -91,7 +86,6 @@ def process_batch_recommendation(data: dict) -> dict:
         optimization_mode=data.get('optimization_mode', 'tardiness_min')
     )
     
-    # Update stats
     performance_stats["batch_optimized_requests"] += 1
     performance_stats["total_requests"] += 1
     performance_stats["algorithm_usage"]["batch_optimized"] = \
@@ -129,23 +123,57 @@ def process_fleet_optimization(data: dict) -> dict:
             resp.raise_for_status()
             return resp.json()
         
-        # Parallel fetch
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_agents = executor.submit(fetch_agents)
             future_tasks = executor.submit(fetch_tasks)
             agents_data = future_agents.result(timeout=30)
             tasks_data = future_tasks.result(timeout=30)
     
-    # Run optimization
     result = optimize_fleet(agents_data, tasks_data)
     
-    # Update stats
     performance_stats["fleet_optimizer_requests"] += 1
     performance_stats["total_requests"] += 1
     performance_stats["algorithm_usage"]["fleet_optimizer"] = \
         performance_stats["algorithm_usage"].get("fleet_optimizer", 0) + 1
     
     return result
+
+
+def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
+    """
+    Trigger fleet optimization and emit updated routes.
+    Called automatically when relevant events occur.
+    """
+    print(f"[WebSocket] Auto-triggering fleet optimization due to: {trigger_event}")
+    performance_stats["auto_optimizations"] += 1
+    
+    try:
+        start_time = time.time()
+        
+        # Use dashboard_url from trigger_data or default
+        result = process_fleet_optimization({
+            'dashboard_url': trigger_data.get('dashboard_url', 'http://localhost:8000')
+        })
+        
+        execution_time = time.time() - start_time
+        
+        result['trigger_event'] = trigger_event
+        result['trigger_data'] = trigger_data
+        result['total_execution_time_seconds'] = round(execution_time, 3)
+        
+        # Emit updated routes to all connected clients
+        emit('fleet:routes_updated', result, broadcast=True)
+        
+        assigned = result.get('metadata', {}).get('tasks_assigned', 0)
+        print(f"[WebSocket] Auto-optimization complete: {assigned} tasks assigned in {execution_time:.3f}s")
+        
+    except Exception as e:
+        print(f"[WebSocket] Auto-optimization failed: {e}")
+        emit('fleet:routes_updated', {
+            'trigger_event': trigger_event,
+            'error': str(e),
+            'success': False
+        }, broadcast=True)
 
 
 # =============================================================================
@@ -166,9 +194,13 @@ def handle_connect():
         'server_time': datetime.now().isoformat(),
         'available_events': [
             'task:get_recommendations',
-            'fleet:optimize_request',
             'task:created',
-            'task:declined'
+            'task:declined',
+            'task:completed',
+            'fleet:optimize_request',
+            'agent:online',
+            'agent:offline',
+            'agent:location_update'
         ]
     })
 
@@ -183,16 +215,8 @@ def handle_disconnect():
 @socketio.on('task:get_recommendations')
 def handle_get_recommendations(data):
     """
-    Handle single-task recommendation request via WebSocket.
-    Uses SAME format as HTTP API.
-    
-    Expected payload (same as POST /recommend/batch-optimized):
-    {
-        "new_task": {...},
-        "agents": [{driver_id, name, current_location}, ...],
-        "current_tasks": [{id, assigned_driver, ...}, ...],
-        "optimization_mode": "tardiness_min"
-    }
+    Handle single-task recommendation request.
+    Returns agent recommendations for ONE specific task.
     """
     client_id = request.sid
     performance_stats["websocket_events"] += 1
@@ -205,13 +229,9 @@ def handle_get_recommendations(data):
     
     try:
         start_time = time.time()
-        
-        # Use the same core function as HTTP API
         result = process_batch_recommendation(data)
-        
         execution_time = time.time() - start_time
         
-        # Emit response
         emit('task:recommendations', {
             'request_id': request_id,
             'task_id': result.get('task_id'),
@@ -237,8 +257,8 @@ def handle_get_recommendations(data):
 @socketio.on('fleet:optimize_request')
 def handle_fleet_optimize(data):
     """
-    Handle fleet-wide optimization request via WebSocket.
-    Uses SAME format as HTTP API.
+    Handle explicit fleet-wide optimization request.
+    Returns optimized routes for ALL agents.
     """
     client_id = request.sid
     performance_stats["websocket_events"] += 1
@@ -251,10 +271,7 @@ def handle_fleet_optimize(data):
     
     try:
         start_time = time.time()
-        
-        # Use the same core function as HTTP API
         result = process_fleet_optimization(data)
-        
         execution_time = time.time() - start_time
         
         result['request_id'] = request_id
@@ -274,57 +291,201 @@ def handle_fleet_optimize(data):
             'unassigned_tasks': []
         })
 
+# -----------------------------------------------------------------------------
+# EVENTS THAT TRIGGER AUTOMATIC FLEET RE-OPTIMIZATION
+# -----------------------------------------------------------------------------
+
 @socketio.on('task:created')
 def handle_task_created(data):
-    """Handle notification that a new task was created."""
-    client_id = request.sid
+    """
+    New task created → Re-optimize fleet to assign it.
+    """
     performance_stats["websocket_events"] += 1
-    
-    print(f"[WebSocket] task:created from {client_id}, task_id={data.get('task_id')}")
+    task_id = data.get('task_id')
+    print(f"[WebSocket] task:created: {task_id}")
     
     emit('task:created_ack', {
-        'task_id': data.get('task_id'),
-        'received_at': datetime.now().isoformat()
+        'task_id': task_id,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
     })
     
-    # If auto_recommend, call the same handler with proper format
-    if data.get('auto_recommend') and data.get('new_task') and data.get('agents'):
-        handle_get_recommendations({
-            'request_id': f"auto-{data.get('task_id')}",
-            'new_task': data['new_task'],
-            'agents': data['agents'],
-            'current_tasks': data.get('current_tasks', []),
-            'optimization_mode': data.get('optimization_mode', 'tardiness_min')
-        })
+    # Trigger fleet optimization
+    trigger_fleet_optimization('task:created', {
+        'task_id': task_id,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
 
 @socketio.on('task:declined')
 def handle_task_declined(data):
-    """Handle notification that an agent declined a task."""
-    client_id = request.sid
+    """
+    Agent declined task → Re-optimize to assign to someone else.
+    """
     performance_stats["websocket_events"] += 1
-    
-    print(f"[WebSocket] task:declined from {client_id}, task_id={data.get('task_id')}, agent={data.get('agent_id')}")
+    task_id = data.get('task_id')
+    agent_id = data.get('agent_id')
+    agent_name = data.get('agent_name', 'Unknown')
+    print(f"[WebSocket] task:declined: {task_id} by {agent_name} ({agent_id})")
     
     emit('task:declined_ack', {
-        'task_id': data.get('task_id'),
-        'agent_id': data.get('agent_id'),
-        'received_at': datetime.now().isoformat()
+        'task_id': task_id,
+        'agent_id': agent_id,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
     })
     
-    # If auto_recommend, get new recommendations excluding declining agent
-    if data.get('auto_recommend') and data.get('new_task') and data.get('agents'):
-        filtered_agents = [
-            a for a in data['agents'] 
-            if a.get('driver_id') != data.get('agent_id')
-        ]
-        
-        handle_get_recommendations({
-            'request_id': f"decline-{data.get('task_id')}-{data.get('agent_id')}",
-            'new_task': data['new_task'],
-            'agents': filtered_agents,
-            'current_tasks': data.get('current_tasks', []),
-            'optimization_mode': data.get('optimization_mode', 'tardiness_min')
-        })
+    # Trigger fleet optimization
+    trigger_fleet_optimization('task:declined', {
+        'task_id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
+
+@socketio.on('task:completed')
+def handle_task_completed(data):
+    """
+    Task completed → Agent has capacity, re-optimize to give them more work.
+    """
+    performance_stats["websocket_events"] += 1
+    task_id = data.get('task_id')
+    agent_id = data.get('agent_id')
+    agent_name = data.get('agent_name', 'Unknown')
+    print(f"[WebSocket] task:completed: {task_id} by {agent_name} ({agent_id})")
+    
+    emit('task:completed_ack', {
+        'task_id': task_id,
+        'agent_id': agent_id,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
+    })
+    
+    # Trigger fleet optimization
+    trigger_fleet_optimization('task:completed', {
+        'task_id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
+
+@socketio.on('task:cancelled')
+def handle_task_cancelled(data):
+    """
+    Task cancelled → Remove from routes, re-optimize to redistribute work.
+    """
+    performance_stats["websocket_events"] += 1
+    task_id = data.get('task_id')
+    reason = data.get('reason', 'unknown')
+    print(f"[WebSocket] task:cancelled: {task_id} (reason: {reason})")
+    
+    emit('task:cancelled_ack', {
+        'task_id': task_id,
+        'reason': reason,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
+    })
+    
+    # Trigger fleet optimization - cancelled task is removed, redistribute remaining
+    trigger_fleet_optimization('task:cancelled', {
+        'task_id': task_id,
+        'reason': reason,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
+
+@socketio.on('task:updated')
+def handle_task_updated(data):
+    """
+    Task updated → Details changed (times, locations, tags, etc.), re-optimize.
+    Changes might affect agent compatibility or optimal routes.
+    """
+    performance_stats["websocket_events"] += 1
+    task_id = data.get('task_id')
+    updated_fields = data.get('updated_fields', [])
+    print(f"[WebSocket] task:updated: {task_id} (fields: {', '.join(updated_fields) if updated_fields else 'unknown'})")
+    
+    emit('task:updated_ack', {
+        'task_id': task_id,
+        'updated_fields': updated_fields,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
+    })
+    
+    # Trigger fleet optimization - task details changed, recalculate routes
+    trigger_fleet_optimization('task:updated', {
+        'task_id': task_id,
+        'updated_fields': updated_fields,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
+
+@socketio.on('agent:online')
+def handle_agent_online(data):
+    """
+    Agent came online → Re-optimize to assign them tasks.
+    """
+    performance_stats["websocket_events"] += 1
+    agent_id = data.get('agent_id')
+    name = data.get('name', 'Unknown')
+    print(f"[WebSocket] agent:online: {name} ({agent_id})")
+    
+    emit('agent:online_ack', {
+        'agent_id': agent_id,
+        'name': name,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
+    })
+    
+    # Trigger fleet optimization
+    trigger_fleet_optimization('agent:online', {
+        'agent_id': agent_id,
+        'agent_name': name,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
+
+@socketio.on('agent:offline')
+def handle_agent_offline(data):
+    """
+    Agent went offline → Re-optimize to reassign their tasks.
+    """
+    performance_stats["websocket_events"] += 1
+    agent_id = data.get('agent_id')
+    name = data.get('name', 'Unknown')
+    print(f"[WebSocket] agent:offline: {name} ({agent_id})")
+    
+    emit('agent:offline_ack', {
+        'agent_id': agent_id,
+        'name': name,
+        'received_at': datetime.now().isoformat(),
+        'will_optimize': True
+    })
+    
+    # Trigger fleet optimization
+    trigger_fleet_optimization('agent:offline', {
+        'agent_id': agent_id,
+        'agent_name': name,
+        'dashboard_url': data.get('dashboard_url', 'http://localhost:8000')
+    })
+
+# -----------------------------------------------------------------------------
+# EVENTS THAT JUST TRACK (no auto-optimization - too frequent)
+# -----------------------------------------------------------------------------
+
+@socketio.on('agent:location_update')
+def handle_agent_location_update(data):
+    """
+    Agent location updated → Just acknowledge (too frequent to trigger optimization).
+    Location will be used in the next optimization request.
+    """
+    performance_stats["websocket_events"] += 1
+    agent_id = data.get('agent_id')
+    name = data.get('name', 'Unknown')
+    location = data.get('location', [])
+    print(f"[WebSocket] agent:location_update: {name} ({agent_id}) -> {location}")
+    
+    emit('agent:location_update_ack', {
+        'agent_id': agent_id,
+        'location': location,
+        'received_at': datetime.now().isoformat()
+    })
 
 
 # =============================================================================
@@ -351,11 +512,9 @@ def recommend():
     try:
         data = request.get_json()
         
-        # Validate required fields
         if 'new_task' not in data or 'agents' not in data:
             return jsonify({"error": "Missing required fields: new_task, agents"}), 400
         
-        # Use shared core function
         result = process_batch_recommendation(data)
         
         if 'error' in result and not result.get('recommendations'):
@@ -383,7 +542,6 @@ def recommend_batch_optimized():
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
         
-        # Use shared core function
         result = process_batch_recommendation(data)
         
         if 'error' in result and not result.get('recommendations'):
@@ -395,7 +553,6 @@ def recommend_batch_optimized():
         if len(performance_stats["response_times"]) > 100:
             performance_stats["response_times"] = performance_stats["response_times"][-100:]
         
-        # Add metadata
         result['metadata'] = {
             'algorithm': 'batch_optimized',
             'execution_time': execution_time,
@@ -418,7 +575,6 @@ def optimize_fleet_endpoint():
     try:
         data = request.get_json() or {}
         
-        # Use shared core function
         result = process_fleet_optimization(data)
         
         if 'error' in result and not result.get('success', True):
@@ -467,5 +623,20 @@ def clear_caches():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     print(f"Starting server with WebSocket support on port {port}")
-    print("WebSocket events: task:get_recommendations, fleet:optimize_request, task:created, task:declined")
+    print("")
+    print("Events that TRIGGER fleet optimization:")
+    print("  - task:created")
+    print("  - task:declined")
+    print("  - task:completed")
+    print("  - task:cancelled")
+    print("  - task:updated")
+    print("  - agent:online")
+    print("  - agent:offline")
+    print("")
+    print("Events that just track (no auto-optimization):")
+    print("  - agent:location_update")
+    print("")
+    print("Request events:")
+    print("  - task:get_recommendations (single task)")
+    print("  - fleet:optimize_request (full fleet)")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)

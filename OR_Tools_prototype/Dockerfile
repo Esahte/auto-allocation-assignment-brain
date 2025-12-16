@@ -17,5 +17,7 @@ COPY . .
 # Expose the port the app runs on
 EXPOSE 8080
 
-# Command to run the application
-CMD ["python", "app.py"] 
+# Use gunicorn with gevent worker for WebSocket support
+# --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker enables WebSocket
+# -k gevent uses gevent async workers for better concurrency
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--worker-class", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "--workers", "1", "--timeout", "300", "app:app"]
