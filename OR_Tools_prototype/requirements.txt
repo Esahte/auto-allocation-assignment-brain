@@ -2,4 +2,8 @@ ortools==9.12.4544
 numpy==1.26.4
 requests==2.31.0
 flask==2.3.3
+flask-socketio==5.3.6
+python-socketio==5.10.0
 gunicorn==21.2.0
+gevent==23.9.1
+gevent-websocket==0.10.1

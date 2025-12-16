@@ -1,11 +1,19 @@
 from flask import Flask, request, jsonify, render_template
+from flask_socketio import SocketIO, emit
 import json
 import os
 import time
 from datetime import datetime
+import uuid
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'fleet-optimizer-secret-key')
 
+# Initialize Socket.IO with CORS support
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Track connected clients
+connected_clients = {}
 
 @app.route('/fleet-dashboard')
 def fleet_dashboard():
@@ -17,6 +25,7 @@ performance_stats = {
     "total_requests": 0,
     "batch_optimized_requests": 0,
     "fleet_optimizer_requests": 0,
+    "websocket_events": 0,
     "average_response_time": 0.0,
     "cache_hits": 0,
     "algorithm_usage": {},
@@ -39,10 +48,295 @@ except ImportError:
     FLEET_AVAILABLE = False
     print("Warning: Fleet optimization not available")
 
+
+# =============================================================================
+# CORE FUNCTIONS (shared by HTTP and WebSocket)
+# =============================================================================
+
+def process_batch_recommendation(data: dict) -> dict:
+    """
+    Core function for batch-optimized recommendations.
+    Used by both HTTP API and WebSocket handlers.
+    
+    Expected data format:
+    {
+        "new_task": {...},
+        "agents": [...],           # Must have driver_id, current_location
+        "current_tasks": [...],    # Must have assigned_driver
+        "max_grace_period": 3600,
+        "optimization_mode": "tardiness_min",
+        ...
+    }
+    """
+    if not BATCH_AVAILABLE:
+        return {"error": "Batch optimization not available", "recommendations": []}
+    
+    new_task = data.get('new_task')
+    agents = data.get('agents', [])
+    current_tasks = data.get('current_tasks', [])
+    
+    if not new_task or not agents:
+        return {"error": "Missing required fields: new_task, agents", "recommendations": []}
+    
+    # Run batch optimization
+    result = recommend_agents_batch_optimized(
+        new_task=new_task,
+        agents=agents,
+        current_tasks=current_tasks,
+        max_grace_period=data.get('max_grace_period', 3600),
+        enable_debug=data.get('enable_debug', False),
+        use_proximity=data.get('use_proximity', True),
+        area_type=data.get('area_type', 'urban'),
+        max_distance_km=data.get('max_distance_km'),
+        optimization_mode=data.get('optimization_mode', 'tardiness_min')
+    )
+    
+    # Update stats
+    performance_stats["batch_optimized_requests"] += 1
+    performance_stats["total_requests"] += 1
+    performance_stats["algorithm_usage"]["batch_optimized"] = \
+        performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
+    
+    return result
+
+
+def process_fleet_optimization(data: dict) -> dict:
+    """
+    Core function for fleet-wide optimization.
+    Used by both HTTP API and WebSocket handlers.
+    """
+    import requests as req
+    from concurrent.futures import ThreadPoolExecutor
+    
+    if not FLEET_AVAILABLE:
+        return {"error": "Fleet optimization not available", "success": False}
+    
+    # Check if data is provided directly
+    if 'agents_data' in data and 'tasks_data' in data:
+        agents_data = data['agents_data']
+        tasks_data = data['tasks_data']
+    else:
+        # Fetch from dashboard
+        dashboard_url = data.get('dashboard_url', 'http://localhost:8000')
+        
+        def fetch_agents():
+            resp = req.get(f"{dashboard_url}/api/test/or-tools/agents", timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        
+        def fetch_tasks():
+            resp = req.get(f"{dashboard_url}/api/test/or-tools/unassigned-tasks", timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        
+        # Parallel fetch
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_agents = executor.submit(fetch_agents)
+            future_tasks = executor.submit(fetch_tasks)
+            agents_data = future_agents.result(timeout=30)
+            tasks_data = future_tasks.result(timeout=30)
+    
+    # Run optimization
+    result = optimize_fleet(agents_data, tasks_data)
+    
+    # Update stats
+    performance_stats["fleet_optimizer_requests"] += 1
+    performance_stats["total_requests"] += 1
+    performance_stats["algorithm_usage"]["fleet_optimizer"] = \
+        performance_stats["algorithm_usage"].get("fleet_optimizer", 0) + 1
+    
+    return result
+
+
+# =============================================================================
+# SOCKET.IO EVENT HANDLERS
+# =============================================================================
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle new client connection."""
+    client_id = request.sid
+    connected_clients[client_id] = {
+        'connected_at': datetime.now().isoformat(),
+        'events_received': 0
+    }
+    print(f"[WebSocket] Client connected: {client_id}")
+    emit('connection_established', {
+        'client_id': client_id,
+        'server_time': datetime.now().isoformat(),
+        'available_events': [
+            'task:get_recommendations',
+            'fleet:optimize_request',
+            'task:created',
+            'task:declined'
+        ]
+    })
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection."""
+    client_id = request.sid
+    if client_id in connected_clients:
+        del connected_clients[client_id]
+    print(f"[WebSocket] Client disconnected: {client_id}")
+
+@socketio.on('task:get_recommendations')
+def handle_get_recommendations(data):
+    """
+    Handle single-task recommendation request via WebSocket.
+    Uses SAME format as HTTP API.
+    
+    Expected payload (same as POST /recommend/batch-optimized):
+    {
+        "new_task": {...},
+        "agents": [{driver_id, name, current_location}, ...],
+        "current_tasks": [{id, assigned_driver, ...}, ...],
+        "optimization_mode": "tardiness_min"
+    }
+    """
+    client_id = request.sid
+    performance_stats["websocket_events"] += 1
+    
+    if client_id in connected_clients:
+        connected_clients[client_id]['events_received'] += 1
+    
+    request_id = data.get('request_id', str(uuid.uuid4()))
+    print(f"[WebSocket] task:get_recommendations from {client_id}, request_id={request_id}")
+    
+    try:
+        start_time = time.time()
+        
+        # Use the same core function as HTTP API
+        result = process_batch_recommendation(data)
+        
+        execution_time = time.time() - start_time
+        
+        # Emit response
+        emit('task:recommendations', {
+            'request_id': request_id,
+            'task_id': result.get('task_id'),
+            'recommendations': result.get('recommendations', []),
+            'task_context': result.get('task_context', {}),
+            'performance': {
+                **result.get('performance', {}),
+                'total_execution_time': round(execution_time, 3)
+            },
+            'error': result.get('error')
+        })
+        
+        print(f"[WebSocket] Sent {len(result.get('recommendations', []))} recommendations in {execution_time:.3f}s")
+        
+    except Exception as e:
+        print(f"[WebSocket] Error in task:get_recommendations: {e}")
+        emit('task:recommendations', {
+            'request_id': request_id,
+            'error': str(e),
+            'recommendations': []
+        })
+
+@socketio.on('fleet:optimize_request')
+def handle_fleet_optimize(data):
+    """
+    Handle fleet-wide optimization request via WebSocket.
+    Uses SAME format as HTTP API.
+    """
+    client_id = request.sid
+    performance_stats["websocket_events"] += 1
+    
+    if client_id in connected_clients:
+        connected_clients[client_id]['events_received'] += 1
+    
+    request_id = data.get('request_id', str(uuid.uuid4()))
+    print(f"[WebSocket] fleet:optimize_request from {client_id}, request_id={request_id}")
+    
+    try:
+        start_time = time.time()
+        
+        # Use the same core function as HTTP API
+        result = process_fleet_optimization(data)
+        
+        execution_time = time.time() - start_time
+        
+        result['request_id'] = request_id
+        result['total_execution_time_seconds'] = round(execution_time, 3)
+        
+        emit('fleet:routes_updated', result)
+        
+        print(f"[WebSocket] Sent fleet routes ({result.get('metadata', {}).get('tasks_assigned', 0)} assigned) in {execution_time:.3f}s")
+        
+    except Exception as e:
+        print(f"[WebSocket] Error in fleet:optimize_request: {e}")
+        emit('fleet:routes_updated', {
+            'request_id': request_id,
+            'error': str(e),
+            'success': False,
+            'agent_routes': [],
+            'unassigned_tasks': []
+        })
+
+@socketio.on('task:created')
+def handle_task_created(data):
+    """Handle notification that a new task was created."""
+    client_id = request.sid
+    performance_stats["websocket_events"] += 1
+    
+    print(f"[WebSocket] task:created from {client_id}, task_id={data.get('task_id')}")
+    
+    emit('task:created_ack', {
+        'task_id': data.get('task_id'),
+        'received_at': datetime.now().isoformat()
+    })
+    
+    # If auto_recommend, call the same handler with proper format
+    if data.get('auto_recommend') and data.get('new_task') and data.get('agents'):
+        handle_get_recommendations({
+            'request_id': f"auto-{data.get('task_id')}",
+            'new_task': data['new_task'],
+            'agents': data['agents'],
+            'current_tasks': data.get('current_tasks', []),
+            'optimization_mode': data.get('optimization_mode', 'tardiness_min')
+        })
+
+@socketio.on('task:declined')
+def handle_task_declined(data):
+    """Handle notification that an agent declined a task."""
+    client_id = request.sid
+    performance_stats["websocket_events"] += 1
+    
+    print(f"[WebSocket] task:declined from {client_id}, task_id={data.get('task_id')}, agent={data.get('agent_id')}")
+    
+    emit('task:declined_ack', {
+        'task_id': data.get('task_id'),
+        'agent_id': data.get('agent_id'),
+        'received_at': datetime.now().isoformat()
+    })
+    
+    # If auto_recommend, get new recommendations excluding declining agent
+    if data.get('auto_recommend') and data.get('new_task') and data.get('agents'):
+        filtered_agents = [
+            a for a in data['agents'] 
+            if a.get('driver_id') != data.get('agent_id')
+        ]
+        
+        handle_get_recommendations({
+            'request_id': f"decline-{data.get('task_id')}-{data.get('agent_id')}",
+            'new_task': data['new_task'],
+            'agents': filtered_agents,
+            'current_tasks': data.get('current_tasks', []),
+            'optimization_mode': data.get('optimization_mode', 'tardiness_min')
+        })
+
+
+# =============================================================================
+# HTTP REST ENDPOINTS
+# =============================================================================
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "healthy",
+        "websocket_enabled": True,
+        "connected_clients": len(connected_clients),
         "performance_stats": performance_stats,
         "available_algorithms": ["batch_optimized", "fleet_optimizer"],
         "batch_optimizer_available": BATCH_AVAILABLE,
@@ -51,149 +345,52 @@ def health_check():
 
 @app.route('/recommend', methods=['POST'])
 def recommend():
-    """
-    Single-task recommendation endpoint.
-    Uses batch_optimized algorithm to recommend agents for a new task.
-    """
-    if not BATCH_AVAILABLE:
-        return jsonify({
-            "error": "Batch optimization not available",
-            "message": "OR_tool_prototype_batch_optimized module not found"
-        }), 503
-    
+    """Single-task recommendation endpoint."""
     start_time = time.time()
     
     try:
-        performance_stats["total_requests"] += 1
-        
         data = request.get_json()
         
         # Validate required fields
-        required_fields = ['new_task', 'agents', 'current_tasks']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({"error": f"Missing required field: {field}"}), 400
+        if 'new_task' not in data or 'agents' not in data:
+            return jsonify({"error": "Missing required fields: new_task, agents"}), 400
         
-        # Get the data
-        new_task = data['new_task']
-        agents = data['agents']
-        current_tasks = data['current_tasks']
+        # Use shared core function
+        result = process_batch_recommendation(data)
         
-        # Get optional parameters
-        max_grace_period = data.get('max_grace_period', 3600)
-        enable_debug = data.get('enable_debug', False)
-        use_proximity = data.get('use_proximity', True)
-        area_type = data.get('area_type', 'urban')
-        max_distance_km = data.get('max_distance_km', None)
-        optimization_mode = data.get('optimization_mode', 'tardiness_min')
+        if 'error' in result and not result.get('recommendations'):
+            return jsonify(result), 400
         
-        # Validate max_distance_km parameter
-        if max_distance_km is not None:
-            if not isinstance(max_distance_km, (int, float)):
-                return jsonify({"error": "max_distance_km must be a number"}), 400
-            if max_distance_km <= 0:
-                return jsonify({"error": "max_distance_km must be positive"}), 400
-            if max_distance_km > 200:
-                return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
-        
-        # Run batch optimization
-        recommendations = recommend_agents_batch_optimized(
-            new_task=new_task,
-            agents=agents,
-            current_tasks=current_tasks,
-            max_grace_period=max_grace_period,
-            enable_debug=enable_debug,
-            use_proximity=use_proximity,
-            area_type=area_type,
-            max_distance_km=max_distance_km,
-            optimization_mode=optimization_mode
-        )
-        
-        performance_stats["batch_optimized_requests"] += 1
-        performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
-        
-        # Update performance stats
         execution_time = time.time() - start_time
         performance_stats["average_response_time"] = (
             (performance_stats["average_response_time"] * (performance_stats["total_requests"] - 1) + execution_time) 
-            / performance_stats["total_requests"]
+            / max(performance_stats["total_requests"], 1)
         )
         
-        # Ensure task_id is present
-        if isinstance(recommendations, dict) and "task_id" not in recommendations:
-            recommendations["task_id"] = new_task.get("id", "unknown")
-        
-        return jsonify(recommendations), 200
+        return jsonify(result), 200
         
     except Exception as e:
-        execution_time = time.time() - start_time
-        app.logger.error(f"Error processing request in {execution_time:.3f}s: {str(e)}")
-        return jsonify({
-            "error": str(e)
-        }), 500
+        app.logger.error(f"Error processing request: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/recommend/batch-optimized', methods=['POST'])
 def recommend_batch_optimized():
-    """
-    Batch-optimized recommendation using native multi-vehicle VRP capabilities.
-    Processes ALL agents simultaneously instead of sequential optimization.
-    """
-    if not BATCH_AVAILABLE:
-        return jsonify({
-            "error": "Batch optimization not available",
-            "message": "OR_tool_prototype_batch_optimized module not found"
-        }), 503
+    """Batch-optimized recommendation endpoint."""
+    start_time = time.time()
     
     try:
-        # Parse request
         data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
         
-        new_task = data.get('new_task')
-        agents = data.get('agents', [])
-        current_tasks = data.get('current_tasks', [])
-        max_grace_period = data.get('max_grace_period', 3600)
-        use_proximity = data.get('use_proximity', True)
-        area_type = data.get('area_type', 'urban')
-        max_distance_km = data.get('max_distance_km', None)
-        optimization_mode = data.get('optimization_mode', 'tardiness_min')
+        # Use shared core function
+        result = process_batch_recommendation(data)
         
-        if not new_task or not agents:
-            return jsonify({"error": "Missing required fields: new_task, agents"}), 400
-        
-        # Validate max_distance_km parameter
-        if max_distance_km is not None:
-            if not isinstance(max_distance_km, (int, float)):
-                return jsonify({"error": "max_distance_km must be a number"}), 400
-            if max_distance_km <= 0:
-                return jsonify({"error": "max_distance_km must be positive"}), 400
-            if max_distance_km > 200:
-                return jsonify({"error": "max_distance_km cannot exceed 200km"}), 400
-        
-        enable_debug = data.get('debug', False)
-        
-        start_time = time.time()
-        
-        # Run batch optimization
-        result = recommend_agents_batch_optimized(
-            new_task=new_task,
-            agents=agents,
-            current_tasks=current_tasks,
-            max_grace_period=max_grace_period,
-            enable_debug=enable_debug,
-            use_proximity=use_proximity,
-            area_type=area_type,
-            max_distance_km=max_distance_km,
-            optimization_mode=optimization_mode
-        )
+        if 'error' in result and not result.get('recommendations'):
+            return jsonify(result), 400
         
         execution_time = time.time() - start_time
         
-        # Update statistics
-        performance_stats["total_requests"] += 1
-        performance_stats["batch_optimized_requests"] += 1
-        performance_stats["algorithm_usage"]["batch_optimized"] = performance_stats["algorithm_usage"].get("batch_optimized", 0) + 1
         performance_stats["response_times"].append(execution_time)
         if len(performance_stats["response_times"]) > 100:
             performance_stats["response_times"] = performance_stats["response_times"][-100:]
@@ -202,8 +399,8 @@ def recommend_batch_optimized():
         result['metadata'] = {
             'algorithm': 'batch_optimized',
             'execution_time': execution_time,
-            'agents_count': len(agents),
-            'current_tasks_count': len(current_tasks),
+            'agents_count': len(data.get('agents', [])),
+            'current_tasks_count': len(data.get('current_tasks', [])),
             'optimization_method': 'native_multi_vehicle_vrp'
         }
         
@@ -211,97 +408,24 @@ def recommend_batch_optimized():
         
     except Exception as e:
         app.logger.error(f"Error processing request: {str(e)}")
-        return jsonify({
-            "error": str(e),
-            "algorithm": "batch_optimized"
-        }), 500
+        return jsonify({"error": str(e), "algorithm": "batch_optimized"}), 500
 
 @app.route('/optimize-fleet', methods=['POST'])
 def optimize_fleet_endpoint():
-    """
-    Fleet-wide optimization endpoint (Many-to-Many).
-    
-    Fetches data from dashboard endpoints and returns optimized routes for all agents.
-    
-    Request body (optional):
-    {
-        "dashboard_url": "http://localhost:8000",  // Optional, defaults to localhost:8000
-        "agents_data": {...},  // Optional, provide data directly instead of fetching
-        "tasks_data": {...}    // Optional, provide data directly instead of fetching
-    }
-    """
-    if not FLEET_AVAILABLE:
-        return jsonify({
-            "error": "Fleet optimization not available",
-            "message": "fleet_optimizer module not found"
-        }), 503
-    
-    import requests as req
-    from concurrent.futures import ThreadPoolExecutor
+    """Fleet-wide optimization endpoint."""
+    start_time = time.time()
     
     try:
-        start_time = time.time()
         data = request.get_json() or {}
         
-        # Get dashboard URL
-        dashboard_url = data.get('dashboard_url', 'http://localhost:8000')
+        # Use shared core function
+        result = process_fleet_optimization(data)
         
-        # Check if data is provided directly or needs to be fetched
-        if 'agents_data' in data and 'tasks_data' in data:
-            # Use provided data
-            agents_data = data['agents_data']
-            tasks_data = data['tasks_data']
-            print(f"[optimize-fleet] Using provided data")
-        else:
-            # Fetch from dashboard using PARALLEL requests
-            print(f"[optimize-fleet] Fetching data from {dashboard_url} (parallel)")
-            
-            def fetch_agents():
-                resp = req.get(f"{dashboard_url}/api/test/or-tools/agents", timeout=30)
-                resp.raise_for_status()
-                return resp.json()
-            
-            def fetch_tasks():
-                resp = req.get(f"{dashboard_url}/api/test/or-tools/unassigned-tasks", timeout=30)
-                resp.raise_for_status()
-                return resp.json()
-            
-            agents_data = None
-            tasks_data = None
-            errors = []
-            
-            # Execute both fetches in parallel
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                future_agents = executor.submit(fetch_agents)
-                future_tasks = executor.submit(fetch_tasks)
-                
-                try:
-                    agents_data = future_agents.result(timeout=30)
-                    print(f"[optimize-fleet] Got {agents_data.get('summary', {}).get('eligible_agents', 0)} agents")
-                except Exception as e:
-                    errors.append(f"agents: {str(e)}")
-                
-                try:
-                    tasks_data = future_tasks.result(timeout=30)
-                    print(f"[optimize-fleet] Got {tasks_data.get('summary', {}).get('total', 0)} tasks")
-                except Exception as e:
-                    errors.append(f"tasks: {str(e)}")
-            
-            if errors:
-                return jsonify({
-                    "error": f"Failed to fetch data from dashboard: {', '.join(errors)}",
-                    "hint": "Ensure dashboard is running at the specified URL"
-                }), 503
-        
-        # Run fleet optimization
-        result = optimize_fleet(agents_data, tasks_data)
+        if 'error' in result and not result.get('success', True):
+            return jsonify(result), 503
         
         execution_time = time.time() - start_time
-        
-        # Update stats
-        performance_stats["total_requests"] += 1
-        performance_stats["fleet_optimizer_requests"] += 1
-        performance_stats["algorithm_usage"]["fleet_optimizer"] = performance_stats["algorithm_usage"].get("fleet_optimizer", 0) + 1
+        result['total_execution_time_seconds'] = round(execution_time, 3)
         
         return jsonify(result)
         
@@ -309,59 +433,39 @@ def optimize_fleet_endpoint():
         import traceback
         app.logger.error(f"Error in fleet optimization: {str(e)}")
         traceback.print_exc()
-        return jsonify({
-            "error": str(e),
-            "algorithm": "fleet_optimizer"
-        }), 500
+        return jsonify({"error": str(e), "algorithm": "fleet_optimizer"}), 500
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
     """Get detailed performance statistics."""
     try:
         from OR_tool_prototype_batch_optimized import _osrm_cache as batch_cache
-        cache_info = {
-            "batch_optimized_cache_size": len(batch_cache),
-            "total_cache_entries": len(batch_cache)
-        }
+        cache_info = {"batch_optimized_cache_size": len(batch_cache)}
     except (ImportError, AttributeError):
-        cache_info = {
-            "batch_optimized_cache_size": 0,
-            "total_cache_entries": 0
-        }
+        cache_info = {"batch_optimized_cache_size": 0}
     
     return jsonify({
         **performance_stats,
         **cache_info,
-        "algorithm_usage": {
-            "batch_optimized_percentage": round(performance_stats["batch_optimized_requests"] / max(performance_stats["total_requests"], 1) * 100, 1),
-            "fleet_optimizer_percentage": round(performance_stats["fleet_optimizer_requests"] / max(performance_stats["total_requests"], 1) * 100, 1)
-        }
+        "connected_websocket_clients": len(connected_clients),
     }), 200
 
 @app.route('/cache/clear', methods=['POST'])
 def clear_caches():
     """Clear all optimization caches."""
     try:
-        cleared_caches = []
-        
-        # Clear batch optimization cache if available
         if BATCH_AVAILABLE:
             clear_cache()
-            cleared_caches.append("batch_optimization_cache")
-        
         return jsonify({
             "message": "Caches cleared successfully",
-            "cleared_caches": cleared_caches,
             "timestamp": datetime.now().isoformat()
         })
-        
     except Exception as e:
-        return jsonify({
-            "error": f"Failed to clear caches: {str(e)}"
-        }), 500
+        return jsonify({"error": f"Failed to clear caches: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
-    # Get port from environment variable or default to 8080
     port = int(os.environ.get('PORT', 8080))
-    # Use 0.0.0.0 to listen on all available network interfaces
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"Starting server with WebSocket support on port {port}")
+    print("WebSocket events: task:get_recommendations, fleet:optimize_request, task:created, task:declined")
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
