@@ -373,17 +373,113 @@ def handle_connect():
     emit('connection_established', {
         'client_id': client_id,
         'server_time': datetime.now().isoformat(),
+        'fleet_state_enabled': FLEET_STATE_AVAILABLE,
         'available_events': [
+            # Request events
             'task:get_recommendations',
+            'fleet:optimize_request',
+            'fleet:sync',  # Initial state sync
+            # Task events
             'task:created',
+            'task:assigned',
+            'task:accepted',
             'task:declined',
             'task:completed',
-            'fleet:optimize_request',
+            'task:cancelled',
+            'task:updated',
+            # Agent events
             'agent:online',
             'agent:offline',
             'agent:location_update'
         ]
     })
+
+@socketio.on('fleet:sync')
+def handle_fleet_sync(data):
+    """
+    Initial fleet state sync from dashboard.
+    Payload: {
+        agents: [...],
+        unassigned_tasks: [...],
+        in_progress_tasks: [...],
+        geofences: [...],
+        config: {...},
+        dashboard_url
+    }
+    """
+    performance_stats["websocket_events"] += 1
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] fleet:sync received from dashboard")
+    
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        emit('fleet:sync_ack', {
+            'success': False,
+            'error': 'Fleet state not available',
+            'received_at': datetime.now().isoformat()
+        })
+        return
+    
+    try:
+        # Sync agents
+        agents_data = data.get('agents', [])
+        if agents_data:
+            fleet_state.sync_agents(agents_data)
+            print(f"[FleetState] Synced {len(agents_data)} agents")
+        
+        # Sync unassigned tasks
+        unassigned_tasks = data.get('unassigned_tasks', [])
+        if unassigned_tasks:
+            fleet_state.sync_tasks(unassigned_tasks)
+            print(f"[FleetState] Synced {len(unassigned_tasks)} unassigned tasks")
+        
+        # Sync in-progress tasks
+        in_progress_tasks = data.get('in_progress_tasks', [])
+        if in_progress_tasks:
+            fleet_state.sync_tasks(in_progress_tasks)
+            print(f"[FleetState] Synced {len(in_progress_tasks)} in-progress tasks")
+        
+        # Store geofences (if provided)
+        geofences = data.get('geofences', [])
+        if geofences:
+            # TODO: Implement geofence storage and checking
+            print(f"[FleetState] Received {len(geofences)} geofences (not yet implemented)")
+        
+        # Apply config (if provided)
+        config = data.get('config', {})
+        if config:
+            if 'default_max_distance_km' in config:
+                fleet_state.max_distance_km = float(config['default_max_distance_km'])
+            if 'max_tasks_per_agent' in config:
+                # Update agent capacities
+                pass
+            print(f"[FleetState] Applied config: {config}")
+        
+        stats = fleet_state.get_stats()
+        
+        emit('fleet:sync_ack', {
+            'success': True,
+            'received_at': datetime.now().isoformat(),
+            'synced': {
+                'agents': len(agents_data),
+                'unassigned_tasks': len(unassigned_tasks),
+                'in_progress_tasks': len(in_progress_tasks),
+                'geofences': len(geofences)
+            },
+            'fleet_stats': stats
+        })
+        
+        print(f"[FleetState] ✅ Initial sync complete: {stats['online_agents']} agents, {stats['unassigned_tasks']} tasks")
+        
+    except Exception as e:
+        print(f"[FleetState] ❌ Sync failed: {e}")
+        import traceback
+        traceback.print_exc()
+        emit('fleet:sync_ack', {
+            'success': False,
+            'error': str(e),
+            'received_at': datetime.now().isoformat()
+        })
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -480,82 +576,92 @@ def handle_fleet_optimize(data):
 def handle_task_created(data):
     """
     New task created → Add to fleet state and check for nearby agents.
+    Payload: { task: { id, ... }, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
-    task_id = data.get('task_id')
     task_data = data.get('task', {})
-    print(f"[WebSocket] task:created: {task_id}")
+    task_id = task_data.get('id', data.get('id', ''))
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] task:created: {task_id[:20]}...")
     
     # Update fleet state
-    if FLEET_STATE_AVAILABLE and fleet_state:
-        if task_data:
-            task_data['id'] = task_id
-            task = fleet_state.add_task(task_data)
-            print(f"[FleetState] Added task: {task.restaurant_name} → {task.customer_name}")
-            
-            # Check if any agents are already near this task
-            eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
-            nearby_eligible = [
-                (a, d, r) for a, d, r in eligible_agents 
-                if r is None and d <= fleet_state.assignment_radius_km
-            ]
-            
-            if nearby_eligible:
-                best_agent, best_dist, _ = nearby_eligible[0]
-                print(f"[FleetState] 🎯 Agent {best_agent.name} is already {best_dist:.2f}km from new task!")
+    if FLEET_STATE_AVAILABLE and fleet_state and task_data:
+        task = fleet_state.add_task(task_data)
+        print(f"[FleetState] Added task: {task.restaurant_name} → {task.customer_name}")
+        
+        # Check if any agents are already near this task
+        eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
+        nearby_eligible = [
+            (a, d, r) for a, d, r in eligible_agents 
+            if r is None and d <= fleet_state.assignment_radius_km
+        ]
+        
+        if nearby_eligible:
+            best_agent, best_dist, _ = nearby_eligible[0]
+            print(f"[FleetState] 🎯 Agent {best_agent.name} is already {best_dist:.2f}km from new task!")
     
     emit('task:created_ack', {
-        'task_id': task_id,
+        'id': task_id,
         'received_at': datetime.now().isoformat(),
         'will_optimize': True
     })
     
     # Trigger fleet optimization
     trigger_fleet_optimization('task:created', {
-        'task_id': task_id,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'id': task_id,
+        'dashboard_url': dashboard_url
     })
 
 @socketio.on('task:declined')
 def handle_task_declined(data):
     """
     Agent declined task → Record decline and re-optimize.
+    Payload: { id, declined_by: [...], latest_decline: { agent_id, agent_name, declined_at }, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
-    task_id = data.get('task_id')
-    agent_id = data.get('agent_id')
-    agent_name = data.get('agent_name', 'Unknown')
-    print(f"[WebSocket] task:declined: {task_id} by {agent_name} ({agent_id})")
+    task_id = data.get('id', '')
+    declined_by = data.get('declined_by', [])
+    latest_decline = data.get('latest_decline', {})
+    latest_agent_id = latest_decline.get('agent_id')
+    latest_agent_name = latest_decline.get('agent_name', 'Unknown')
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    # Update fleet state - record the decline
-    if FLEET_STATE_AVAILABLE and fleet_state and agent_id and task_id:
-        fleet_state.add_declined_task(str(agent_id), task_id)
+    print(f"[WebSocket] task:declined: {task_id[:20]}... by {latest_agent_name} (total: {len(declined_by)} declines)")
+    
+    # Update fleet state - record the declines
+    if FLEET_STATE_AVAILABLE and fleet_state and task_id:
+        fleet_state.record_task_decline(task_id, declined_by, latest_agent_id)
     
     emit('task:declined_ack', {
-        'task_id': task_id,
-        'agent_id': agent_id,
+        'id': task_id,
+        'declined_by': declined_by,
         'received_at': datetime.now().isoformat(),
         'will_optimize': True
     })
     
     # Trigger fleet optimization
     trigger_fleet_optimization('task:declined', {
-        'task_id': task_id,
-        'agent_id': agent_id,
-        'agent_name': agent_name,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'id': task_id,
+        'declined_by': declined_by,
+        'latest_agent_id': latest_agent_id,
+        'latest_agent_name': latest_agent_name,
+        'dashboard_url': dashboard_url
     })
 
 @socketio.on('task:completed')
 def handle_task_completed(data):
     """
     Task completed → Update state, agent has capacity for more work.
+    Payload: { id, agent_id, agent_name, completed_at, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
-    task_id = data.get('task_id')
+    task_id = data.get('id', '')
     agent_id = data.get('agent_id')
     agent_name = data.get('agent_name', 'Unknown')
-    print(f"[WebSocket] task:completed: {task_id} by {agent_name} ({agent_id})")
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] task:completed: {task_id[:20]}... by {agent_name} ({agent_id})")
     
     # Update fleet state
     if FLEET_STATE_AVAILABLE and fleet_state and task_id:
@@ -573,7 +679,7 @@ def handle_task_completed(data):
                     print(f"[FleetState] 🎯 {agent_name} now idle, nearest task: {nearest.restaurant_name} ({dist:.2f}km)")
     
     emit('task:completed_ack', {
-        'task_id': task_id,
+        'id': task_id,
         'agent_id': agent_id,
         'received_at': datetime.now().isoformat(),
         'will_optimize': True
@@ -581,21 +687,24 @@ def handle_task_completed(data):
     
     # Trigger fleet optimization
     trigger_fleet_optimization('task:completed', {
-        'task_id': task_id,
+        'id': task_id,
         'agent_id': agent_id,
         'agent_name': agent_name,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'dashboard_url': dashboard_url
     })
 
 @socketio.on('task:cancelled')
 def handle_task_cancelled(data):
     """
     Task cancelled → Update state, remove from routes.
+    Payload: { id, reason, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
-    task_id = data.get('task_id')
+    task_id = data.get('id', '')
     reason = data.get('reason', 'unknown')
-    print(f"[WebSocket] task:cancelled: {task_id} (reason: {reason})")
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] task:cancelled: {task_id[:20]}... (reason: {reason})")
     
     # Update fleet state
     if FLEET_STATE_AVAILABLE and fleet_state and task_id:
@@ -604,7 +713,7 @@ def handle_task_cancelled(data):
             print(f"[FleetState] Task cancelled: {task.restaurant_name}")
     
     emit('task:cancelled_ack', {
-        'task_id': task_id,
+        'id': task_id,
         'reason': reason,
         'received_at': datetime.now().isoformat(),
         'will_optimize': True
@@ -612,24 +721,26 @@ def handle_task_cancelled(data):
     
     # Trigger fleet optimization - cancelled task is removed, redistribute remaining
     trigger_fleet_optimization('task:cancelled', {
-        'task_id': task_id,
+        'id': task_id,
         'reason': reason,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'dashboard_url': dashboard_url
     })
 
 @socketio.on('task:updated')
 def handle_task_updated(data):
     """
     Task updated → Details changed (times, locations, tags, etc.), re-optimize.
-    Changes might affect agent compatibility or optimal routes.
+    Payload: { id, updated_fields, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
-    task_id = data.get('task_id')
+    task_id = data.get('id', '')
     updated_fields = data.get('updated_fields', [])
-    print(f"[WebSocket] task:updated: {task_id} (fields: {', '.join(updated_fields) if updated_fields else 'unknown'})")
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] task:updated: {task_id[:20]}... (fields: {', '.join(updated_fields) if updated_fields else 'unknown'})")
     
     emit('task:updated_ack', {
-        'task_id': task_id,
+        'id': task_id,
         'updated_fields': updated_fields,
         'received_at': datetime.now().isoformat(),
         'will_optimize': True
@@ -637,20 +748,77 @@ def handle_task_updated(data):
     
     # Trigger fleet optimization - task details changed, recalculate routes
     trigger_fleet_optimization('task:updated', {
-        'task_id': task_id,
+        'id': task_id,
         'updated_fields': updated_fields,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'dashboard_url': dashboard_url
+    })
+
+@socketio.on('task:assigned')
+def handle_task_assigned(data):
+    """
+    Task assigned to agent (manually or via optimization).
+    Payload: { id, agent_id, agent_name, assigned_at, dashboard_url }
+    """
+    performance_stats["websocket_events"] += 1
+    task_id = data.get('id', '')
+    agent_id = data.get('agent_id')
+    agent_name = data.get('agent_name', 'Unknown')
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] task:assigned: {task_id[:20]}... → {agent_name} ({agent_id})")
+    
+    # Update fleet state
+    if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
+        task = fleet_state.assign_task(task_id, str(agent_id), agent_name)
+        if task:
+            print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
+    
+    emit('task:assigned_ack', {
+        'id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'received_at': datetime.now().isoformat()
+    })
+
+@socketio.on('task:accepted')
+def handle_task_accepted(data):
+    """
+    Agent accepted the task assignment.
+    Payload: { id, agent_id, agent_name, accepted_at, dashboard_url }
+    """
+    performance_stats["websocket_events"] += 1
+    task_id = data.get('id', '')
+    agent_id = data.get('agent_id')
+    agent_name = data.get('agent_name', 'Unknown')
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] task:accepted: {task_id[:20]}... by {agent_name} ({agent_id})")
+    
+    # Update fleet state
+    if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
+        task = fleet_state.accept_task(task_id, str(agent_id))
+        if task:
+            print(f"[FleetState] Task {task.restaurant_name} accepted by {agent_name}")
+    
+    emit('task:accepted_ack', {
+        'id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'received_at': datetime.now().isoformat()
     })
 
 @socketio.on('agent:online')
 def handle_agent_online(data):
     """
     Agent came online → Update state and check for nearby tasks.
+    Payload: { agent_id, name, location, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
     agent_id = data.get('agent_id')
     name = data.get('name', 'Unknown')
     location = data.get('location')
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
     print(f"[WebSocket] agent:online: {name} ({agent_id})")
     
     # Update fleet state
@@ -677,17 +845,20 @@ def handle_agent_online(data):
     trigger_fleet_optimization('agent:online', {
         'agent_id': agent_id,
         'agent_name': name,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'dashboard_url': dashboard_url
     })
 
 @socketio.on('agent:offline')
 def handle_agent_offline(data):
     """
     Agent went offline → Update state and reassign their tasks.
+    Payload: { agent_id, name, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
     agent_id = data.get('agent_id')
     name = data.get('name', 'Unknown')
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
     print(f"[WebSocket] agent:offline: {name} ({agent_id})")
     
     # Update fleet state
@@ -707,7 +878,7 @@ def handle_agent_offline(data):
     trigger_fleet_optimization('agent:offline', {
         'agent_id': agent_id,
         'agent_name': name,
-        'dashboard_url': data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        'dashboard_url': dashboard_url
     })
 
 # -----------------------------------------------------------------------------
