@@ -898,7 +898,7 @@ def recommend_agents_batch_optimized(
         # Calculate minimum unavoidable lateness from best agent
         min_unavoidable_lateness = min((r.get('unavoidable_lateness_seconds', 0) for r in top_recommendations), default=0)
         min_additional_lateness = min((r.get('additional_lateness_seconds', 0) for r in top_recommendations), default=0)
-        
+
         return {
             "task_id": new_task.get('id', 'unknown'),
             "recommendations": top_recommendations,
