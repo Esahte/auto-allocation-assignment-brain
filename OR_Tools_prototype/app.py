@@ -222,22 +222,30 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         
         execution_time = time.time() - start_time
         
+        # EVENT-BASED: Full fleet optimization with unassigned_tasks + agents_considered
+        result['trigger_type'] = 'event'  # Clear identifier: 'event' or 'proximity'
         result['trigger_event'] = trigger_event
         result['trigger_data'] = trigger_data
         result['total_execution_time_seconds'] = round(execution_time, 3)
         
         # Emit updated routes to all connected clients
+        # Includes: agent_routes, unassigned_tasks (with agents_considered), metadata, compatibility
         emit('fleet:routes_updated', result, broadcast=True)
         
         assigned = result.get('metadata', {}).get('tasks_assigned', 0)
-        print(f"[WebSocket] Auto-optimization complete: {assigned} tasks assigned in {execution_time:.3f}s")
+        unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
+        print(f"[WebSocket] Auto-optimization complete: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
         
     except Exception as e:
         print(f"[WebSocket] Auto-optimization failed: {e}")
         emit('fleet:routes_updated', {
+            'trigger_type': 'event',
             'trigger_event': trigger_event,
+            'trigger_data': trigger_data,
             'error': str(e),
-            'success': False
+            'success': False,
+            'agent_routes': [],
+            'unassigned_tasks': []
         }, broadcast=True)
 
 
@@ -333,6 +341,7 @@ def trigger_incremental_optimization(
         execution_time = time.time() - start_time
         
         # Add trigger context
+        result['trigger_type'] = 'proximity'  # Clear identifier: 'event' or 'proximity'
         result['trigger_event'] = 'proximity_trigger'
         result['trigger_data'] = {
             'agent_id': agent_id,
@@ -340,15 +349,20 @@ def trigger_incremental_optimization(
             'triggering_task_id': task_id,
             'triggering_task_name': task_name,
             'trigger_distance_km': round(distance_km, 2),
-            'trigger_type': trigger_type
+            'trigger_reason': trigger_type  # 'entered_radius', 'existing_task_near', etc.
         }
         result['total_execution_time_seconds'] = round(execution_time, 3)
+        
+        # PROXIMITY: Remove unassigned_tasks - this is a suggestion for ONE agent
+        # Dashboard doesn't need to know about other unassigned tasks in proximity mode
+        if 'unassigned_tasks' in result:
+            del result['unassigned_tasks']
         
         # Check if any tasks were assigned
         assigned_count = result.get('metadata', {}).get('tasks_assigned', 0)
         
         if assigned_count > 0:
-            # Emit same format as event-based optimization
+            # Emit result (same base format as event-based, minus unassigned_tasks)
             emit('fleet:routes_updated', result, broadcast=True)
             
             # Log what was assigned
@@ -358,8 +372,7 @@ def trigger_incremental_optimization(
                     print(f"[FleetState] ✅ Proximity assigned {len(new_tasks)} task(s) to {agent_name}: {new_tasks}")
         else:
             print(f"[FleetState] ⚠️ Proximity trigger but no assignment possible for {agent_name}")
-            # Optionally emit result so dashboard knows optimization ran but nothing assigned
-            # emit('fleet:routes_updated', result, broadcast=True)
+            # Don't emit for proximity if nothing assigned - no need to spam dashboard
     
     except Exception as e:
         print(f"[FleetState] ❌ Proximity optimization failed: {e}")
@@ -564,16 +577,23 @@ def handle_fleet_optimize(data):
         result = process_fleet_optimization(data)
         execution_time = time.time() - start_time
         
+        # ON-DEMAND: Manual request from dashboard
+        result['trigger_type'] = 'manual'  # Clear identifier: 'event', 'proximity', or 'manual'
+        result['trigger_event'] = 'fleet:optimize_request'
         result['request_id'] = request_id
         result['total_execution_time_seconds'] = round(execution_time, 3)
         
         emit('fleet:routes_updated', result)
         
-        print(f"[WebSocket] Sent fleet routes ({result.get('metadata', {}).get('tasks_assigned', 0)} assigned) in {execution_time:.3f}s")
+        assigned = result.get('metadata', {}).get('tasks_assigned', 0)
+        unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
+        print(f"[WebSocket] Sent fleet routes: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
         
     except Exception as e:
         print(f"[WebSocket] Error in fleet:optimize_request: {e}")
         emit('fleet:routes_updated', {
+            'trigger_type': 'manual',
+            'trigger_event': 'fleet:optimize_request',
             'request_id': request_id,
             'error': str(e),
             'success': False,
