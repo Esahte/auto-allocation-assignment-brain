@@ -71,6 +71,21 @@ performance_stats = {
     "response_times": []
 }
 
+# Throttle location update logs (log every 60 seconds per agent, not every 5s)
+LOCATION_LOG_INTERVAL_SECONDS = 60
+_last_location_log_time = {}  # agent_id -> last log timestamp
+
+def _should_log_location(agent_id: str) -> bool:
+    """Check if we should log this agent's location update (throttled)"""
+    import time
+    now = time.time()
+    last_log = _last_location_log_time.get(agent_id, 0)
+    
+    if now - last_log >= LOCATION_LOG_INTERVAL_SECONDS:
+        _last_location_log_time[agent_id] = now
+        return True
+    return False
+
 # Add import for batch optimization
 try:
     from OR_tool_prototype_batch_optimized import recommend_agents_batch_optimized, clear_cache
@@ -131,6 +146,11 @@ def process_fleet_optimization(data: dict) -> dict:
     """
     Core function for fleet-wide optimization.
     Used by both HTTP API and WebSocket handlers.
+    
+    Data source priority:
+    1. Direct data in request (agents_data, tasks_data)
+    2. FleetState (in-memory, real-time)
+    3. HTTP API fallback (dashboard endpoints)
     """
     import requests as req
     from concurrent.futures import ThreadPoolExecutor
@@ -142,11 +162,20 @@ def process_fleet_optimization(data: dict) -> dict:
     if 'agents_data' in data and 'tasks_data' in data:
         agents_data = data['agents_data']
         tasks_data = data['tasks_data']
+        print("[FleetOptimizer] Using directly provided data")
+    
+    # Try FleetState first (faster, already in memory)
+    elif FLEET_STATE_AVAILABLE and fleet_state and fleet_state.get_stats().get('total_agents', 0) > 0:
+        agents_data = fleet_state.export_agents_for_optimizer()
+        tasks_data = fleet_state.export_tasks_for_optimizer()
+        print(f"[FleetOptimizer] Using FleetState: {len(agents_data.get('agents', []))} agents, {len(tasks_data.get('tasks', []))} tasks")
+    
     else:
-        # Fetch from dashboard
-        # Priority: request data > environment variable > localhost default
+        # Fallback: Fetch from dashboard HTTP API
         default_dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
         dashboard_url = data.get('dashboard_url', default_dashboard_url)
+        
+        print(f"[FleetOptimizer] FleetState empty, fetching from dashboard: {dashboard_url}")
         
         def fetch_agents():
             resp = req.get(f"{dashboard_url}/api/test/or-tools/agents", timeout=30)
@@ -222,137 +251,118 @@ def trigger_incremental_optimization(
     dashboard_url: str
 ):
     """
-    Trigger incremental optimization for a SINGLE agent near a specific task.
-    This is more efficient than full fleet optimization.
+    Trigger optimization for a SINGLE agent who entered proximity of a task.
     
-    Instead of optimizing the entire fleet, we:
-    1. Get the agent's current state
-    2. Get their nearby unassigned tasks
-    3. Run single-agent optimization
-    4. Emit assignment suggestion
+    Uses the full fleet optimizer but with only this ONE agent, so it can:
+    1. Consider ALL unassigned tasks (not just the triggering one)
+    2. Find optimal chains (Task A delivery near Task B pickup)
+    3. Assign multiple tasks if they chain well
+    
+    Emits same format as event-based optimization: fleet:routes_updated
     """
-    print(f"[FleetState] 🚀 Incremental optimization: {agent_name} → {task_name}")
+    print(f"[FleetState] 🚀 Proximity optimization: {agent_name} triggered by {task_name}")
     performance_stats["auto_optimizations"] += 1
     
     try:
         start_time = time.time()
         
-        # For now, we'll use the batch recommendation for single-agent optimization
-        # This finds the best task(s) for this specific agent
-        
-        if FLEET_STATE_AVAILABLE and fleet_state:
-            agent = fleet_state.get_agent(str(agent_id))
-            
-            if not agent:
-                print(f"[FleetState] ❌ Agent {agent_id} not found in state")
-                return
-            
-            # Find all tasks near this agent
-            nearby_tasks = fleet_state.find_tasks_near_agent(
-                str(agent_id),
-                radius_km=fleet_state.assignment_radius_km,
-                use_projected=False
-            )
-            
-            if not nearby_tasks:
-                print(f"[FleetState] No eligible tasks for {agent_name}")
-                return
-            
-            # Build recommendation request for this single agent
-            # We'll use the batch optimizer for this
-            if BATCH_AVAILABLE:
-                # Find the best task for this agent
-                best_task, best_distance = nearby_tasks[0]
-                
-                # Format agent data
-                agent_data = {
-                    'id': agent.id,
-                    'name': agent.name,
-                    'location': [agent.current_location.lat, agent.current_location.lng]
-                }
-                
-                # Format task data
-                task_data = {
-                    'id': best_task.id,
-                    'job_type': best_task.job_type,
-                    'restaurant_location': [best_task.restaurant_location.lat, best_task.restaurant_location.lng],
-                    'delivery_location': [best_task.delivery_location.lat, best_task.delivery_location.lng],
-                    'pickup_before': best_task.pickup_before.isoformat(),
-                    'delivery_before': best_task.delivery_before.isoformat()
-                }
-                
-                # Get agent's current tasks
-                current_tasks_data = []
-                for ct in agent.current_tasks:
-                    current_tasks_data.append({
-                        'id': ct.id,
-                        'job_type': ct.job_type,
-                        'restaurant_location': [ct.restaurant_location.lat, ct.restaurant_location.lng],
-                        'delivery_location': [ct.delivery_location.lat, ct.delivery_location.lng],
-                        'pickup_before': ct.pickup_before.isoformat(),
-                        'delivery_before': ct.delivery_before.isoformat(),
-                        'assigned_driver': agent.id,
-                        'pickup_completed': ct.pickup_completed
-                    })
-                
-                # Run single-agent optimization
-                result = process_batch_recommendation({
-                    'new_task': task_data,
-                    'agents': [agent_data],
-                    'current_tasks': current_tasks_data,
-                    'max_distance_km': fleet_state.max_distance_km,
-                    'optimization_mode': 'tardiness_min'
-                })
-                
-                execution_time = time.time() - start_time
-                
-                recommendations = result.get('recommendations', [])
-                
-                if recommendations:
-                    best_rec = recommendations[0]
-                    
-                    # Emit assignment suggestion
-                    emit('task:assignment_suggested', {
-                        'trigger_type': 'proximity',
-                        'agent_id': agent.id,
-                        'agent_name': agent.name,
-                        'task_id': best_task.id,
-                        'task_restaurant': best_task.restaurant_name,
-                        'task_customer': best_task.customer_name,
-                        'distance_km': round(best_distance, 2),
-                        'score': best_rec.get('score', 0),
-                        'lateness_seconds': best_rec.get('lateness_seconds', 0),
-                        'recommendation': best_rec,
-                        'other_nearby_tasks': len(nearby_tasks) - 1,
-                        'execution_time_seconds': round(execution_time, 3)
-                    }, broadcast=True)
-                    
-                    print(f"[FleetState] ✅ Suggested: {agent_name} → {best_task.restaurant_name} "
-                          f"(score: {best_rec.get('score', 0)}, {execution_time:.3f}s)")
-                else:
-                    print(f"[FleetState] ⚠️ No valid recommendation for {agent_name} → {best_task.restaurant_name}")
-            else:
-                # Fallback: just emit that we detected proximity
-                emit('task:assignment_suggested', {
-                    'trigger_type': 'proximity',
-                    'agent_id': agent_id,
-                    'agent_name': agent_name,
-                    'task_id': task_id,
-                    'task_name': task_name,
-                    'distance_km': round(distance_km, 2),
-                    'note': 'Batch optimizer not available for scoring'
-                }, broadcast=True)
-        else:
-            # Fallback to full fleet optimization if fleet state not available
+        if not FLEET_STATE_AVAILABLE or not fleet_state:
+            # Fallback to full fleet optimization
             trigger_fleet_optimization('proximity_trigger', {
                 'agent_id': agent_id,
                 'task_id': task_id,
-                'distance_km': distance_km,
                 'dashboard_url': dashboard_url
             })
+            return
+        
+        agent = fleet_state.get_agent(str(agent_id))
+        if not agent:
+            print(f"[FleetState] ❌ Agent {agent_id} not found in state")
+            return
+        
+        if not agent.has_capacity:
+            print(f"[FleetState] ⚠️ {agent_name} is at capacity, skipping")
+            return
+        
+        # Build single-agent optimization data
+        # Format agent with current tasks
+        current_tasks = []
+        for ct in agent.current_tasks:
+            current_tasks.append({
+                'id': ct.id,
+                'job_type': ct.job_type,
+                'restaurant_location': [ct.restaurant_location.lat, ct.restaurant_location.lng],
+                'delivery_location': [ct.delivery_location.lat, ct.delivery_location.lng],
+                'pickup_before': ct.pickup_before.isoformat() if ct.pickup_before else None,
+                'delivery_before': ct.delivery_before.isoformat() if ct.delivery_before else None,
+                'assigned_driver': agent.id,
+                'pickup_completed': ct.pickup_completed,
+                '_meta': ct.meta
+            })
+        
+        agents_data = {
+            'agents': [{
+                'id': agent.id,
+                'name': agent.name,
+                'location': [agent.current_location.lat, agent.current_location.lng],
+                'current_tasks': current_tasks,
+                'max_capacity': agent.max_capacity,
+                'wallet_balance': agent.wallet_balance,
+                'tags': agent.tags
+            }],
+            'geofence_data': [],
+            'settings_used': {
+                'walletNoCashThreshold': 500,
+                'maxDistanceKm': fleet_state.max_distance_km
+            }
+        }
+        
+        # Get ALL unassigned tasks (not just the triggering one)
+        # This allows OR-Tools to find chains
+        tasks_data = fleet_state.export_tasks_for_optimizer()
+        
+        if not tasks_data.get('tasks'):
+            print(f"[FleetState] No unassigned tasks available")
+            return
+        
+        print(f"[FleetState] Running single-agent optimization: {agent_name} vs {len(tasks_data['tasks'])} tasks")
+        
+        # Run optimization for this single agent against all tasks
+        result = optimize_fleet(agents_data, tasks_data)
+        
+        execution_time = time.time() - start_time
+        
+        # Add trigger context
+        result['trigger_event'] = 'proximity_trigger'
+        result['trigger_data'] = {
+            'agent_id': agent_id,
+            'agent_name': agent_name,
+            'triggering_task_id': task_id,
+            'triggering_task_name': task_name,
+            'trigger_distance_km': round(distance_km, 2),
+            'trigger_type': trigger_type
+        }
+        result['total_execution_time_seconds'] = round(execution_time, 3)
+        
+        # Check if any tasks were assigned
+        assigned_count = result.get('metadata', {}).get('tasks_assigned', 0)
+        
+        if assigned_count > 0:
+            # Emit same format as event-based optimization
+            emit('fleet:routes_updated', result, broadcast=True)
             
+            # Log what was assigned
+            for route in result.get('agent_routes', []):
+                new_tasks = route.get('assigned_new_tasks', [])
+                if new_tasks:
+                    print(f"[FleetState] ✅ Proximity assigned {len(new_tasks)} task(s) to {agent_name}: {new_tasks}")
+        else:
+            print(f"[FleetState] ⚠️ Proximity trigger but no assignment possible for {agent_name}")
+            # Optionally emit result so dashboard knows optimization ran but nothing assigned
+            # emit('fleet:routes_updated', result, broadcast=True)
+    
     except Exception as e:
-        print(f"[FleetState] ❌ Incremental optimization failed: {e}")
+        print(f"[FleetState] ❌ Proximity optimization failed: {e}")
         import traceback
         traceback.print_exc()
 
@@ -426,6 +436,9 @@ def handle_fleet_sync(data):
         if agents_data:
             fleet_state.sync_agents(agents_data)
             print(f"[FleetState] Synced {len(agents_data)} agents")
+        
+        # Clear existing tasks before full sync
+        fleet_state.clear_tasks()
         
         # Sync unassigned tasks
         unassigned_tasks = data.get('unassigned_tasks', [])
@@ -586,28 +599,59 @@ def handle_task_created(data):
     print(f"[WebSocket] task:created: {task_id[:20]}...")
     
     # Update fleet state
+    triggered_optimization = False
     if FLEET_STATE_AVAILABLE and fleet_state and task_data:
         task = fleet_state.add_task(task_data)
         print(f"[FleetState] Added task: {task.restaurant_name} → {task.customer_name}")
         
-        # Check if any agents are already near this task
+        # PROACTIVE CHECK: Are any agents already near this task?
         eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
         nearby_eligible = [
-            (a, d, r) for a, d, r in eligible_agents 
-            if r is None and d <= fleet_state.assignment_radius_km
+            (agent, dist, reason) for agent, dist, reason in eligible_agents 
+            if reason is None and dist <= fleet_state.assignment_radius_km
         ]
         
         if nearby_eligible:
+            # Sort by distance to find best agent
+            nearby_eligible.sort(key=lambda x: x[1])
             best_agent, best_dist, _ = nearby_eligible[0]
-            print(f"[FleetState] 🎯 Agent {best_agent.name} is already {best_dist:.2f}km from new task!")
+            
+            # Determine trigger type based on agent's current tasks
+            if best_agent.current_tasks:
+                trigger_type = "projected_location"  # Agent will be near after current tasks
+            else:
+                trigger_type = "current_location"  # Agent is idle and near
+            
+            print(f"[FleetState] 🎯 NEW TASK: {best_agent.name} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
+            
+            # Check cooldown and trigger optimization
+            if fleet_state.should_trigger_optimization(best_agent.id):
+                fleet_state.record_optimization(best_agent.id)
+                triggered_optimization = True
+                
+                # Trigger incremental optimization
+                trigger_incremental_optimization(
+                    agent_id=best_agent.id,
+                    agent_name=best_agent.name,
+                    task_id=task_id,
+                    task_name=task.restaurant_name,
+                    distance_km=best_dist,
+                    trigger_type=trigger_type,
+                    dashboard_url=dashboard_url
+                )
+            else:
+                print(f"[FleetState] ⏳ {best_agent.name} on cooldown, skipping immediate optimization")
+        else:
+            print(f"[FleetState] 📋 No eligible agents near {task.restaurant_name} - waiting for proximity trigger")
     
     emit('task:created_ack', {
         'id': task_id,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'added_to_fleet_state': True,
+        'triggered_optimization': True
     })
     
-    # Trigger fleet optimization
+    # EVENT-BASED: Immediately try to assign the new task
     trigger_fleet_optimization('task:created', {
         'id': task_id,
         'dashboard_url': dashboard_url
@@ -616,7 +660,7 @@ def handle_task_created(data):
 @socketio.on('task:declined')
 def handle_task_declined(data):
     """
-    Agent declined task → Record decline and re-optimize.
+    Agent declined task → Record decline and find another eligible agent.
     Payload: { id, declined_by: [...], latest_decline: { agent_id, agent_name, declined_at }, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
@@ -630,22 +674,63 @@ def handle_task_declined(data):
     print(f"[WebSocket] task:declined: {task_id[:20]}... by {latest_agent_name} (total: {len(declined_by)} declines)")
     
     # Update fleet state - record the declines
+    triggered_optimization = False
     if FLEET_STATE_AVAILABLE and fleet_state and task_id:
         fleet_state.record_task_decline(task_id, declined_by, latest_agent_id)
+        
+        # Get the task to check its restaurant name
+        task = fleet_state.get_task(task_id)
+        
+        if task:
+            # PROACTIVE CHECK: Find another eligible agent near this task
+            eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
+            nearby_eligible = [
+                (agent, dist, reason) for agent, dist, reason in eligible_agents 
+                if reason is None and dist <= fleet_state.assignment_radius_km
+            ]
+            
+            if nearby_eligible:
+                # Sort by distance to find best agent
+                nearby_eligible.sort(key=lambda x: x[1])
+                best_agent, best_dist, _ = nearby_eligible[0]
+                
+                # Determine trigger type
+                trigger_type = "projected_location" if best_agent.current_tasks else "current_location"
+                
+                print(f"[FleetState] 🔄 DECLINED: {best_agent.name} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
+                
+                # Check cooldown and trigger optimization
+                if fleet_state.should_trigger_optimization(best_agent.id):
+                    fleet_state.record_optimization(best_agent.id)
+                    triggered_optimization = True
+                    
+                    # Trigger incremental optimization
+                    trigger_incremental_optimization(
+                        agent_id=best_agent.id,
+                        agent_name=best_agent.name,
+                        task_id=task_id,
+                        task_name=task.restaurant_name,
+                        distance_km=best_dist,
+                        trigger_type=trigger_type,
+                        dashboard_url=dashboard_url
+                    )
+                else:
+                    print(f"[FleetState] ⏳ {best_agent.name} on cooldown, skipping immediate optimization")
+            else:
+                print(f"[FleetState] 📋 No other eligible agents near {task.restaurant_name} - waiting for proximity trigger")
     
     emit('task:declined_ack', {
         'id': task_id,
         'declined_by': declined_by,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'decline_recorded': True,
+        'triggered_optimization': True
     })
     
-    # Trigger fleet optimization
+    # EVENT-BASED: Immediately try to reassign to another agent
     trigger_fleet_optimization('task:declined', {
         'id': task_id,
         'declined_by': declined_by,
-        'latest_agent_id': latest_agent_id,
-        'latest_agent_name': latest_agent_name,
         'dashboard_url': dashboard_url
     })
 
@@ -682,16 +767,10 @@ def handle_task_completed(data):
         'id': task_id,
         'agent_id': agent_id,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'task_removed': True
     })
     
-    # Trigger fleet optimization
-    trigger_fleet_optimization('task:completed', {
-        'id': task_id,
-        'agent_id': agent_id,
-        'agent_name': agent_name,
-        'dashboard_url': dashboard_url
-    })
+    # No auto-optimization - proximity triggers will handle next assignment
 
 @socketio.on('task:cancelled')
 def handle_task_cancelled(data):
@@ -716,15 +795,10 @@ def handle_task_cancelled(data):
         'id': task_id,
         'reason': reason,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'task_removed': True
     })
     
-    # Trigger fleet optimization - cancelled task is removed, redistribute remaining
-    trigger_fleet_optimization('task:cancelled', {
-        'id': task_id,
-        'reason': reason,
-        'dashboard_url': dashboard_url
-    })
+    # No auto-optimization - task removed from state
 
 @socketio.on('task:updated')
 def handle_task_updated(data):
@@ -743,15 +817,10 @@ def handle_task_updated(data):
         'id': task_id,
         'updated_fields': updated_fields,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'task_updated': True
     })
     
-    # Trigger fleet optimization - task details changed, recalculate routes
-    trigger_fleet_optimization('task:updated', {
-        'id': task_id,
-        'updated_fields': updated_fields,
-        'dashboard_url': dashboard_url
-    })
+    # No auto-optimization - task details updated in state
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
@@ -838,10 +907,11 @@ def handle_agent_online(data):
         'agent_id': agent_id,
         'name': name,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'agent_added': True,
+        'triggered_optimization': True
     })
     
-    # Trigger fleet optimization
+    # EVENT-BASED: Immediately try to give this agent work
     trigger_fleet_optimization('agent:online', {
         'agent_id': agent_id,
         'agent_name': name,
@@ -871,15 +941,10 @@ def handle_agent_offline(data):
         'agent_id': agent_id,
         'name': name,
         'received_at': datetime.now().isoformat(),
-        'will_optimize': True
+        'agent_removed': True
     })
     
-    # Trigger fleet optimization
-    trigger_fleet_optimization('agent:offline', {
-        'agent_id': agent_id,
-        'agent_name': name,
-        'dashboard_url': dashboard_url
-    })
+    # No auto-optimization - tasks will remain unassigned until manually reassigned or proximity trigger
 
 # -----------------------------------------------------------------------------
 # EVENTS THAT JUST TRACK (no auto-optimization - too frequent)
@@ -935,19 +1000,21 @@ def handle_agent_location_update(data):
                     dashboard_url=data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
                 )
             else:
-                print(f"[FleetState] ⏳ Skipped optimization for {name} (cooldown)")
+                # Throttled log for cooldown skips
+                _should_log = _should_log_location(agent_id)
+                if _should_log:
+                    print(f"[FleetState] ⏳ {name} near tasks but on cooldown")
         else:
-            # No eligible triggers - just a regular update
-            agent = fleet_state.get_agent(str(agent_id))
-            if agent:
-                tasks_near = fleet_state.find_tasks_near_agent(str(agent_id))
-                if tasks_near:
-                    task, dist = tasks_near[0]
-                    print(f"[FleetState] 📍 {name} at {location}, nearest task: {task.restaurant_name} ({dist:.2f}km)")
-                else:
-                    print(f"[FleetState] 📍 {name} at {location}, no nearby tasks")
-    else:
-        print(f"[WebSocket] agent:location_update: {name} ({agent_id}) -> {location}")
+            # No eligible triggers - throttled logging for regular updates
+            if _should_log_location(agent_id):
+                agent = fleet_state.get_agent(str(agent_id))
+                if agent:
+                    tasks_near = fleet_state.find_tasks_near_agent(str(agent_id))
+                    if tasks_near:
+                        task, dist = tasks_near[0]
+                        print(f"[FleetState] 📍 {name} at {location}, nearest task: {task.restaurant_name} ({dist:.2f}km)")
+                    else:
+                        print(f"[FleetState] 📍 {name} at {location}, no nearby tasks")
 
 
 # =============================================================================
@@ -1119,7 +1186,8 @@ def get_fleet_agents():
             'capacity': f"{len(agent.current_tasks)}/{agent.max_capacity}",
             'has_capacity': agent.has_capacity,
             'is_idle': agent.is_idle,
-            'declined_tasks': len(agent.declined_task_ids),
+            'tags': agent.tags,
+            'wallet_balance': agent.wallet_balance,
             'last_update': agent.last_updated.isoformat()
         })
     
@@ -1246,6 +1314,7 @@ def sync_fleet_state():
         fleet_state.sync_agents(data['agents'])
     
     if 'tasks' in data:
+        fleet_state.clear_tasks()
         fleet_state.sync_tasks(data['tasks'])
     
     return jsonify({

@@ -202,7 +202,7 @@
             text-transform: uppercase;
         }
         
-        .status-badge.online { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
+        .status-badge.idle { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
         .status-badge.busy { background: rgba(0, 212, 255, 0.15); color: var(--accent-blue); }
         .status-badge.at_capacity { background: rgba(255, 149, 0, 0.15); color: var(--accent-orange); }
         .status-badge.offline { background: rgba(255, 68, 68, 0.15); color: var(--accent-red); }
@@ -503,7 +503,7 @@
                                 Loc: [${agent.current_location.lat.toFixed(4)}, ${agent.current_location.lng.toFixed(4)}]
                             </span>
                         </div>
-                        <span class="status-badge ${agent.status}">${agent.status}</span>
+                        <span class="status-badge ${agent.status.toLowerCase()}">${agent.status.toUpperCase()}</span>
                     </div>
                 `).join('');
             } catch (e) {

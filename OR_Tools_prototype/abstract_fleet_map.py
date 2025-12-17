@@ -694,10 +694,6 @@ class AbstractFleetMap:
             
             # Update tags
             self.agents[agent_id].tags = agent_data.get('tags', [])
-            
-            # Update declined history
-            declined = agent_data.get('declined_task_ids', [])
-            self.agents[agent_id].declined_tasks = set(declined)
         
         # Update tasks
         current_task_ids = set()
