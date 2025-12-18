@@ -1182,10 +1182,59 @@ def handle_task_updated(data):
     
     # Track what fields changed
     changes = []
+    status_changed_to_unassigned = False
     
     # Update task fields
     meta = data.get('_meta', {})
     restaurant_name = meta.get('restaurant_name', existing_task.restaurant_name)
+    
+    # CRITICAL: Handle status changes first (before other field updates)
+    # Status changes can unassign tasks or mark them as declined
+    new_status = data.get('status', '').lower() if data.get('status') else None
+    new_assigned_agent = data.get('assigned_agent_id')
+    old_assigned_agent = existing_task.assigned_agent_id
+    
+    if new_status:
+        # Check if task is being unassigned (status changed to unassigned/declined)
+        if new_status in ['unassigned', 'declined']:
+            # If task was previously assigned, remove it from that agent
+            if old_assigned_agent:
+                old_agent = fleet_state.get_agent(str(old_assigned_agent))
+                if old_agent:
+                    # Remove task from agent's current_tasks
+                    old_agent.current_tasks = [t for t in old_agent.current_tasks if t.task_id != task_id]
+                    # Recalculate agent status
+                    if not old_agent.current_tasks:
+                        old_agent.status = AgentStatus.IDLE
+                    print(f"[FleetState] Task unassigned from {old_agent.name} (status → {new_status})")
+                
+                # Clear the assignment on the task
+                existing_task.assigned_agent_id = None
+                existing_task.status = TaskStatus.UNASSIGNED
+                changes.append(f'status:{new_status}')
+                status_changed_to_unassigned = True
+        
+        # Check if task is being reassigned to a different agent
+        elif new_assigned_agent and str(new_assigned_agent) != str(old_assigned_agent or ''):
+            # First unassign from old agent if any
+            if old_assigned_agent:
+                old_agent = fleet_state.get_agent(str(old_assigned_agent))
+                if old_agent:
+                    old_agent.current_tasks = [t for t in old_agent.current_tasks if t.task_id != task_id]
+                    if not old_agent.current_tasks:
+                        old_agent.status = AgentStatus.IDLE
+                    print(f"[FleetState] Task removed from {old_agent.name} (reassigning)")
+            
+            # Then assign to new agent
+            new_agent = fleet_state.get_agent(str(new_assigned_agent))
+            if new_agent:
+                fleet_state.assign_task(task_id, str(new_assigned_agent), new_agent.name)
+                changes.append(f'reassigned_to:{new_agent.name}')
+            else:
+                # Agent not in fleet state, just update the task's assigned_agent_id
+                existing_task.assigned_agent_id = str(new_assigned_agent)
+                existing_task.status = TaskStatus.ASSIGNED
+                changes.append(f'assigned_agent_id:{new_assigned_agent}')
     
     # Location updates
     if 'restaurant_location' in data and data['restaurant_location']:
@@ -1284,8 +1333,19 @@ def handle_task_updated(data):
         'id': task_id,
         'success': True,
         'changes': changes,
+        'status_changed_to_unassigned': status_changed_to_unassigned,
         'received_at': datetime.now().isoformat()
     })
+    
+    # If task was unassigned, trigger optimization to reassign it
+    if status_changed_to_unassigned:
+        print(f"[FleetState] Task {restaurant_name} now unassigned - triggering optimization")
+        # Use the same pattern as task:declined - debounced event-based optimization
+        trigger_debounced_optimization(
+            trigger_type='task:updated_unassigned',
+            dashboard_url=dashboard_url,
+            task_id=task_id
+        )
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
