@@ -6,8 +6,63 @@ import time
 from datetime import datetime, timezone
 import uuid
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 
 app = Flask(__name__)
+
+# =============================================================================
+# PERSISTENT FILE LOGGING
+# =============================================================================
+# Create logs directory if it doesn't exist
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Configure file handler for ALL logs (rotating, max 10MB, keep 5 backups)
+all_log_file = os.path.join(LOG_DIR, 'fleet_optimizer.log')
+file_handler = RotatingFileHandler(all_log_file, maxBytes=10*1024*1024, backupCount=5)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)-7s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+# Configure file handler for IMPORTANT events only (assignments, errors, syncs)
+important_log_file = os.path.join(LOG_DIR, 'important_events.log')
+important_handler = RotatingFileHandler(important_log_file, maxBytes=5*1024*1024, backupCount=3)
+important_handler.setLevel(logging.INFO)
+important_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)-7s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+# Create loggers
+logger = logging.getLogger('fleet_optimizer')
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(important_handler)
+
+# Also add console handler so we still see logs in terminal
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+console_handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(console_handler)
+
+# Helper function for logging (replaces print statements for important events)
+def log_event(message: str, level: str = 'info'):
+    """Log an event to both file and console."""
+    if level == 'debug':
+        logger.debug(message)
+    elif level == 'warning':
+        logger.warning(message)
+    elif level == 'error':
+        logger.error(message)
+    else:
+        logger.info(message)
+
+print(f"[Logging] Logs saved to: {LOG_DIR}")
+print(f"[Logging] All logs: fleet_optimizer.log")
+print(f"[Logging] Important events: important_events.log")
 
 # Import Fleet State (Abstract Map)
 try:
@@ -367,10 +422,10 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         
         assigned = result.get('metadata', {}).get('tasks_assigned', 0)
         unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
-        print(f"[WebSocket] Auto-optimization complete: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
+        log_event(f"[WebSocket] Auto-optimization complete: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
         
     except Exception as e:
-        print(f"[WebSocket] Auto-optimization failed: {e}")
+        log_event(f"[WebSocket] Auto-optimization failed: {e}", 'error')
         emit('fleet:routes_updated', {
             'trigger_type': 'event',
             'trigger_event': trigger_event,
@@ -411,7 +466,7 @@ def trigger_incremental_optimization(
         # Mark this task as being optimized
         _tasks_being_optimized.add(task_id)
     
-    print(f"[FleetState] 🚀 Proximity optimization: {agent_name} triggered by {task_name}")
+    log_event(f"[FleetState] 🚀 Proximity optimization: {agent_name} triggered by {task_name}")
     performance_stats["auto_optimizations"] += 1
     
     try:
@@ -570,7 +625,7 @@ def trigger_incremental_optimization(
                 if new_tasks:
                     for assigned_task_id in new_tasks:
                         fleet_state.assign_task(assigned_task_id, agent_id, agent_name)
-                    print(f"[FleetState] ✅ Proximity assigned {len(new_tasks)} task(s) to {agent_name}: {new_tasks}")
+                    log_event(f"[FleetState] ✅ ASSIGNED: {len(new_tasks)} task(s) to {agent_name}: {new_tasks}")
             
             # Emit result (same base format as event-based, minus unassigned_tasks)
             emit('fleet:routes_updated', result, broadcast=True)
@@ -579,7 +634,7 @@ def trigger_incremental_optimization(
             # Don't emit for proximity if nothing assigned - no need to spam dashboard
     
     except Exception as e:
-        print(f"[FleetState] ❌ Proximity optimization failed: {e}")
+        log_event(f"[FleetState] ❌ Proximity optimization failed: {e}", 'error')
         import traceback
         traceback.print_exc()
     
@@ -643,7 +698,7 @@ def handle_fleet_sync(data):
     performance_stats["websocket_events"] += 1
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] fleet:sync received from dashboard")
+    log_event(f"[WebSocket] fleet:sync received from dashboard")
     
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         emit('fleet:sync_ack', {
@@ -747,11 +802,11 @@ def handle_fleet_sync(data):
             'fleet_stats': stats
         })
         
-        print(f"[FleetState] ✅ Initial sync complete: {stats['online_agents']} agents, {stats['unassigned_tasks']} tasks")
+        log_event(f"[FleetState] ✅ SYNC COMPLETE: {stats['online_agents']} agents, {stats['unassigned_tasks']} unassigned tasks")
         print(f"[FleetState] Config: max_dist={fleet_state.max_distance_km}km, max_lateness={fleet_state.max_lateness_minutes}min, wallet=${fleet_state.wallet_threshold}")
         
     except Exception as e:
-        print(f"[FleetState] ❌ Sync failed: {e}")
+        log_event(f"[FleetState] ❌ SYNC FAILED: {e}", 'error')
         import traceback
         traceback.print_exc()
         emit('fleet:sync_ack', {
@@ -1013,7 +1068,7 @@ def handle_task_created(data):
     task_id = task_data.get('id', data.get('id', ''))
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] task:created: {str(task_id)[:20]}...")
+    log_event(f"[WebSocket] task:created: {str(task_id)[:20]}...")
     
     # Update fleet state
     triggered_optimization = False
@@ -1100,7 +1155,7 @@ def handle_task_declined(data):
     latest_agent_name = latest_decline.get('agent_name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] task:declined: {str(task_id)[:20]}... by {latest_agent_name} (total: {len(declined_by)} declines)")
+    log_event(f"[WebSocket] task:declined: {str(task_id)[:20]}... by {latest_agent_name} (total: {len(declined_by)} declines)")
     
     # Update fleet state - record the declines
     triggered_optimization = False
@@ -1205,7 +1260,7 @@ def handle_task_completed(data):
             'pickup_completed': True
         })
     else:
-        print(f"[WebSocket] task:completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+        log_event(f"[WebSocket] task:completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
         
         # Full task completion - remove from agent
         if FLEET_STATE_AVAILABLE and fleet_state and task_id:
@@ -1543,7 +1598,7 @@ def handle_task_assigned(data):
     
     # Only log if this was a new assignment (not a duplicate)
     if task:
-        print(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
+        log_event(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
         print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
     
     emit('task:assigned_ack', {
