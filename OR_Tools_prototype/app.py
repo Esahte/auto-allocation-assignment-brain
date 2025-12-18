@@ -1132,24 +1132,160 @@ def handle_task_cancelled(data):
 @socketio.on('task:updated')
 def handle_task_updated(data):
     """
-    Task updated → Details changed (times, locations, tags, etc.), re-optimize.
-    Payload: { id, updated_fields, dashboard_url }
+    Task updated → Full task object with updated values.
+    
+    Payload (full task object):
+    {
+        "id": "task-order-id",
+        "job_type": "PAIRED",
+        "restaurant_location": [17.123, -61.845],
+        "delivery_location": [17.130, -61.850],
+        "pickup_before": "2025-12-18T17:00:00.000Z",
+        "delivery_before": "2025-12-18T17:30:00.000Z",
+        "tags": ["PRIORITY"],
+        "payment_method": "prepaid",
+        "delivery_fee": 5.00,
+        "tips": 2.00,
+        "max_distance_km": 3,
+        "declined_by": ["agent-123"],
+        "status": "Unassigned",
+        "assigned_agent_id": null,
+        "pickup_completed": false,
+        "_meta": { "restaurant_name": "Hey Pizza", ... },
+        "dashboard_url": "https://..."
+    }
     """
     performance_stats["websocket_events"] += 1
     task_id = data.get('id', '')
-    updated_fields = data.get('updated_fields', [])
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] task:updated: {str(task_id)[:20]}... (fields: {', '.join(updated_fields) if updated_fields else 'unknown'})")
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        emit('task:updated_ack', {
+            'id': task_id,
+            'success': False,
+            'error': 'Fleet state not available',
+            'received_at': datetime.now().isoformat()
+        })
+        return
+    
+    # Get existing task to compare what changed
+    existing_task = fleet_state.get_task(task_id)
+    if not existing_task:
+        print(f"[WebSocket] task:updated: {str(task_id)[:20]}... (task not found in fleet state)")
+        emit('task:updated_ack', {
+            'id': task_id,
+            'success': False,
+            'error': 'Task not found',
+            'received_at': datetime.now().isoformat()
+        })
+        return
+    
+    # Track what fields changed
+    changes = []
+    
+    # Update task fields
+    meta = data.get('_meta', {})
+    restaurant_name = meta.get('restaurant_name', existing_task.restaurant_name)
+    
+    # Location updates
+    if 'restaurant_location' in data and data['restaurant_location']:
+        loc = data['restaurant_location']
+        if [existing_task.restaurant_location.lat, existing_task.restaurant_location.lng] != loc:
+            existing_task.restaurant_location.lat = loc[0]
+            existing_task.restaurant_location.lng = loc[1]
+            changes.append('restaurant_location')
+    
+    if 'delivery_location' in data and data['delivery_location']:
+        loc = data['delivery_location']
+        if [existing_task.delivery_location.lat, existing_task.delivery_location.lng] != loc:
+            existing_task.delivery_location.lat = loc[0]
+            existing_task.delivery_location.lng = loc[1]
+            changes.append('delivery_location')
+    
+    # Time window updates
+    if 'pickup_before' in data and data['pickup_before']:
+        try:
+            new_time = fleet_state._parse_datetime(data['pickup_before'])
+            if new_time and existing_task.pickup_before != new_time:
+                existing_task.pickup_before = new_time
+                changes.append('pickup_before')
+        except Exception:
+            pass
+    
+    if 'delivery_before' in data and data['delivery_before']:
+        try:
+            new_time = fleet_state._parse_datetime(data['delivery_before'])
+            if new_time and existing_task.delivery_before != new_time:
+                existing_task.delivery_before = new_time
+                changes.append('delivery_before')
+        except Exception:
+            pass
+    
+    # Business rule updates
+    if 'tags' in data:
+        new_tags = data['tags'] or []
+        if existing_task.tags != new_tags:
+            existing_task.tags = new_tags
+            changes.append('tags')
+    
+    if 'payment_method' in data:
+        new_payment = data['payment_method'] or 'card'
+        if existing_task.payment_method != new_payment:
+            existing_task.payment_method = new_payment
+            changes.append('payment_method')
+    
+    if 'delivery_fee' in data:
+        new_fee = float(data['delivery_fee'] or 0)
+        if existing_task.delivery_fee != new_fee:
+            existing_task.delivery_fee = new_fee
+            changes.append('delivery_fee')
+    
+    if 'tips' in data:
+        new_tips = float(data['tips'] or 0)
+        if existing_task.tips != new_tips:
+            existing_task.tips = new_tips
+            changes.append('tips')
+    
+    if 'max_distance_km' in data and data['max_distance_km'] is not None:
+        new_dist = float(data['max_distance_km'])
+        if existing_task.max_distance_km != new_dist:
+            existing_task.max_distance_km = new_dist
+            changes.append('max_distance_km')
+    
+    if 'declined_by' in data:
+        new_declined = set(str(d) for d in (data['declined_by'] or []))
+        if existing_task.declined_by != new_declined:
+            existing_task.declined_by = new_declined
+            changes.append('declined_by')
+    
+    if 'pickup_completed' in data:
+        new_pickup = bool(data['pickup_completed'])
+        if existing_task.pickup_completed != new_pickup:
+            existing_task.pickup_completed = new_pickup
+            changes.append('pickup_completed')
+    
+    # Meta updates
+    if meta.get('restaurant_name') and existing_task.restaurant_name != meta['restaurant_name']:
+        existing_task.restaurant_name = meta['restaurant_name']
+        changes.append('restaurant_name')
+    
+    if meta.get('customer_name') and existing_task.customer_name != meta['customer_name']:
+        existing_task.customer_name = meta['customer_name']
+        changes.append('customer_name')
+    
+    # Update timestamp
+    existing_task.last_updated = datetime.now(timezone.utc)
+    
+    # Log the update
+    changes_str = ', '.join(changes) if changes else 'no changes'
+    print(f"[WebSocket] task:updated: {restaurant_name} ({str(task_id)[:20]}...) → {changes_str}")
     
     emit('task:updated_ack', {
         'id': task_id,
-        'updated_fields': updated_fields,
-        'received_at': datetime.now().isoformat(),
-        'task_updated': True
+        'success': True,
+        'changes': changes,
+        'received_at': datetime.now().isoformat()
     })
-    
-    # No auto-optimization - task details updated in state
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
