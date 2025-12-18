@@ -22,6 +22,49 @@ import threading
 import math
 import time
 import logging
+import re
+
+
+def _parse_datetime(dt_str: str) -> datetime:
+    """
+    Parse datetime from various formats:
+    - ISO: '2025-12-18T10:04:00.000Z' or '2025-12-18T10:04:00+00:00'
+    - US format: '12/18/2025 10:04 am' or '12/18/2025 10:04 AM'
+    - Simple: '2025-12-18 10:04:00'
+    """
+    if not dt_str:
+        return datetime.now(timezone.utc)
+    
+    # Try ISO format first (most common from API)
+    try:
+        if dt_str.endswith('Z'):
+            dt_str = dt_str[:-1] + '+00:00'
+        return datetime.fromisoformat(dt_str)
+    except ValueError:
+        pass
+    
+    # Try US format: '12/18/2025 10:04 am'
+    try:
+        # Match pattern: MM/DD/YYYY HH:MM am/pm
+        match = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)?', dt_str)
+        if match:
+            month, day, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            hour, minute = int(match.group(4)), int(match.group(5))
+            ampm = match.group(6)
+            
+            # Handle AM/PM
+            if ampm and ampm.lower() == 'pm' and hour != 12:
+                hour += 12
+            elif ampm and ampm.lower() == 'am' and hour == 12:
+                hour = 0
+            
+            return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        pass
+    
+    # Fallback: return current time
+    logger.warning(f"[FleetState] Could not parse datetime: {dt_str}, using current time")
+    return datetime.now(timezone.utc)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -454,9 +497,9 @@ class FleetState:
                 delivery_before = t.get('delivery_before')
                 
                 if isinstance(pickup_before, str):
-                    pickup_before = datetime.fromisoformat(pickup_before.replace('Z', '+00:00'))
+                    pickup_before = _parse_datetime(pickup_before)
                 if isinstance(delivery_before, str):
-                    delivery_before = datetime.fromisoformat(delivery_before.replace('Z', '+00:00'))
+                    delivery_before = _parse_datetime(delivery_before)
                 
                 current_task = CurrentTask(
                     id=t.get('id', ''),
@@ -655,9 +698,9 @@ class FleetState:
             delivery_before = task_data.get('delivery_before')
             
             if isinstance(pickup_before, str):
-                pickup_before = datetime.fromisoformat(pickup_before.replace('Z', '+00:00'))
+                pickup_before = _parse_datetime(pickup_before)
             if isinstance(delivery_before, str):
-                delivery_before = datetime.fromisoformat(delivery_before.replace('Z', '+00:00'))
+                delivery_before = _parse_datetime(delivery_before)
             
             # Determine status - convert to string for consistent lookup
             assigned_agent_raw = task_data.get('assigned_driver') or task_data.get('assigned_agent_id') or task_data.get('assigned_agent')
