@@ -856,12 +856,16 @@ def handle_task_declined(data):
         'triggered_optimization': True
     })
     
-    # EVENT-BASED: Immediately try to reassign to another agent
-    trigger_fleet_optimization('task:declined', {
-        'id': task_id,
-        'declined_by': declined_by,
-        'dashboard_url': dashboard_url
-    })
+    # EVENT-BASED: Only try to reassign if proximity didn't already assign it
+    task_after_proximity = fleet_state.get_task(str(task_id)) if (FLEET_STATE_AVAILABLE and fleet_state and task_id) else None
+    if task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
+        trigger_fleet_optimization('task:declined', {
+            'id': task_id,
+            'declined_by': declined_by,
+            'dashboard_url': dashboard_url
+        })
+    elif task_after_proximity:
+        print(f"[FleetState] ℹ️ Task {str(task_id)[:20]}... already assigned by proximity, skipping event-based optimization.")
 
 @socketio.on('task:completed')
 def handle_task_completed(data):
