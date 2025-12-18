@@ -1069,17 +1069,24 @@ def handle_task_completed(data):
             'task_removed': True
         })
         
-        # Trigger optimization if there are unassigned tasks and agent has capacity
-        unassigned_count = len([t for t in fleet_state.get_all_tasks() if t.status == TaskStatus.UNASSIGNED])
+        # EVENT-BASED: Trigger optimization if there are unassigned tasks and agent has capacity
+        # Note: Proximity triggers may also fire from agent:location_update - debouncing handles dedup
+        unassigned_tasks = [t for t in fleet_state.get_all_tasks() if t.status == TaskStatus.UNASSIGNED]
+        unassigned_count = len(unassigned_tasks)
         if unassigned_count > 0:
             agent = fleet_state.get_agent(str(agent_id)) if agent_id else None
             if agent and agent.has_capacity:
                 print(f"[FleetState] {agent_name} completed task, has capacity, {unassigned_count} unassigned tasks - triggering optimization")
+                # Use debounced optimization - will cancel if proximity triggers shortly after
                 trigger_debounced_optimization(
                     trigger_type='task:completed',
                     dashboard_url=dashboard_url,
                     agent_id=str(agent_id)
                 )
+            else:
+                print(f"[FleetState] {agent_name} completed task but at capacity - skipping optimization")
+        else:
+            print(f"[FleetState] {agent_name} completed task - no unassigned tasks to assign")
 
 @socketio.on('pickup:completed')
 def handle_pickup_completed(data):
