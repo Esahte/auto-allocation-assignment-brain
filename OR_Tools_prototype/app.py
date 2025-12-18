@@ -159,6 +159,11 @@ _tasks_being_optimized = set()  # Set of task IDs currently being optimized
 _task_optimization_lock = threading.Lock()
 _pending_trigger_type = None
 
+# GLOBAL optimization lock - prevents ANY optimization from running concurrently
+# This includes both event-based (full fleet) and proximity-based (single agent)
+_optimization_running = False
+_optimization_running_lock = threading.Lock()
+
 def is_sync_in_progress() -> bool:
     """Check if a fleet sync is currently in progress."""
     with _sync_lock:
@@ -379,11 +384,20 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
     Uses THOROUGH mode (prefilter_distance=False) - lets solver handle distance
     for comprehensive fleet-wide optimization.
     """
+    global _optimization_running
+    
     # Block if sync is in progress - queue to run after sync
     if is_sync_in_progress():
         print(f"[WebSocket] ⚠️ Sync in progress - queuing auto-optimization for {trigger_event}")
         queue_optimization_after_sync(trigger_event)
         return
+    
+    # Check global optimization lock - prevent concurrent optimizations
+    with _optimization_running_lock:
+        if _optimization_running:
+            print(f"[WebSocket] ⏳ Another optimization is running - skipping {trigger_event}")
+            return
+        _optimization_running = True
     
     print(f"[WebSocket] Auto-triggering fleet optimization due to: {trigger_event}")
     print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
@@ -435,6 +449,10 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
             'agent_routes': [],
             'unassigned_tasks': []
         }, broadcast=True)
+    finally:
+        # Always release the global optimization lock
+        with _optimization_running_lock:
+            _optimization_running = False
 
 
 def trigger_incremental_optimization(
@@ -456,7 +474,13 @@ def trigger_incremental_optimization(
     
     Emits same format as event-based optimization: fleet:routes_updated
     """
-    global _tasks_being_optimized
+    global _tasks_being_optimized, _optimization_running
+    
+    # GLOBAL LOCK: Check if any optimization is already running
+    with _optimization_running_lock:
+        if _optimization_running:
+            print(f"[FleetState] ⏳ Another optimization running - skipping proximity for {agent_name}")
+            return
     
     # TASK-LEVEL LOCK: Prevent concurrent optimizations for the same task
     with _task_optimization_lock:
@@ -465,6 +489,16 @@ def trigger_incremental_optimization(
             return
         # Mark this task as being optimized
         _tasks_being_optimized.add(task_id)
+    
+    # Now acquire the global lock for actual optimization
+    with _optimization_running_lock:
+        if _optimization_running:
+            # Another optimization started between our checks - release task lock and exit
+            with _task_optimization_lock:
+                _tasks_being_optimized.discard(task_id)
+            print(f"[FleetState] ⏳ Another optimization started - skipping proximity for {agent_name}")
+            return
+        _optimization_running = True
     
     log_event(f"[FleetState] 🚀 Proximity optimization: {agent_name} triggered by {task_name}")
     performance_stats["auto_optimizations"] += 1
@@ -639,7 +673,9 @@ def trigger_incremental_optimization(
         traceback.print_exc()
     
     finally:
-        # ALWAYS release the task lock
+        # ALWAYS release both locks
+        with _optimization_running_lock:
+            _optimization_running = False
         with _task_optimization_lock:
             _tasks_being_optimized.discard(task_id)
 
@@ -988,6 +1024,7 @@ def handle_fleet_optimize(data):
     
     Uses THOROUGH mode (prefilter_distance=False) for comprehensive optimization.
     """
+    global _optimization_running
     client_id = request.sid
     performance_stats["websocket_events"] += 1
     
@@ -1011,6 +1048,23 @@ def handle_fleet_optimize(data):
             'unassigned_tasks': []
         })
         return
+    
+    # Check global optimization lock - manual requests will wait
+    with _optimization_running_lock:
+        if _optimization_running:
+            print(f"[WebSocket] ⏳ Another optimization running - please wait")
+            emit('fleet:routes_updated', {
+                'trigger_type': 'manual',
+                'trigger_event': 'fleet:optimize_request',
+                'request_id': request_id,
+                'error': 'Another optimization is currently running - please wait',
+                'success': False,
+                'optimization_in_progress': True,
+                'agent_routes': [],
+                'unassigned_tasks': []
+            })
+            return
+        _optimization_running = True
     
     print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
     
@@ -1052,6 +1106,10 @@ def handle_fleet_optimize(data):
             'agent_routes': [],
             'unassigned_tasks': []
         })
+    finally:
+        # Always release the global optimization lock
+        with _optimization_running_lock:
+            _optimization_running = False
 
 # -----------------------------------------------------------------------------
 # EVENTS THAT TRIGGER AUTOMATIC FLEET RE-OPTIMIZATION
