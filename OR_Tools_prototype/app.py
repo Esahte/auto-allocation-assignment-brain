@@ -163,6 +163,8 @@ _pending_trigger_type = None
 # This includes both event-based (full fleet) and proximity-based (single agent)
 _optimization_running = False
 _optimization_running_lock = threading.Lock()
+_events_queued_during_optimization = []  # List of event types that arrived during optimization
+_queued_dashboard_url = None  # Dashboard URL to use for queued optimization
 
 def is_sync_in_progress() -> bool:
     """Check if a fleet sync is currently in progress."""
@@ -383,8 +385,11 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
     
     Uses THOROUGH mode (prefilter_distance=False) - lets solver handle distance
     for comprehensive fleet-wide optimization.
+    
+    If optimization is already running, queues the event and re-runs after completion
+    to ensure the new agent/task is considered.
     """
-    global _optimization_running
+    global _optimization_running, _events_queued_during_optimization, _queued_dashboard_url
     
     # Block if sync is in progress - queue to run after sync
     if is_sync_in_progress():
@@ -392,12 +397,16 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         queue_optimization_after_sync(trigger_event)
         return
     
-    # Check global optimization lock - prevent concurrent optimizations
+    # Check global optimization lock
     with _optimization_running_lock:
         if _optimization_running:
-            print(f"[WebSocket] ⏳ Another optimization is running - skipping {trigger_event}")
+            # QUEUE the event instead of skipping - we'll re-run after current optimization
+            _events_queued_during_optimization.append(trigger_event)
+            _queued_dashboard_url = trigger_data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+            print(f"[WebSocket] 📋 Queued {trigger_event} (will re-run after current optimization)")
             return
         _optimization_running = True
+        _events_queued_during_optimization = []  # Clear queue when starting new optimization
     
     print(f"[WebSocket] Auto-triggering fleet optimization due to: {trigger_event}")
     print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
@@ -450,9 +459,35 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
             'unassigned_tasks': []
         }, broadcast=True)
     finally:
-        # Always release the global optimization lock
-        with _optimization_running_lock:
-            _optimization_running = False
+        # Check if events were queued during this optimization
+        _run_queued_optimization_if_needed()
+
+
+def _run_queued_optimization_if_needed():
+    """Helper to check for queued events and run follow-up optimization."""
+    global _optimization_running, _events_queued_during_optimization, _queued_dashboard_url
+    
+    queued_events = []
+    dashboard_url = None
+    
+    with _optimization_running_lock:
+        _optimization_running = False
+        if _events_queued_during_optimization:
+            queued_events = _events_queued_during_optimization.copy()
+            dashboard_url = _queued_dashboard_url
+        _events_queued_during_optimization = []
+        _queued_dashboard_url = None
+    
+    # If events were queued, re-run optimization with fresh state
+    if queued_events:
+        merged_trigger = '+'.join(set(queued_events))  # e.g., "task:created+agent:online"
+        print(f"[WebSocket] ▶️ Re-running optimization for queued events: {merged_trigger}")
+        # Small delay to let state settle, then re-run
+        timer = threading.Timer(0.1, lambda: trigger_fleet_optimization(
+            f'merged:{merged_trigger}',
+            {'dashboard_url': dashboard_url}
+        ))
+        timer.start()
 
 
 def trigger_incremental_optimization(
@@ -673,11 +708,12 @@ def trigger_incremental_optimization(
         traceback.print_exc()
     
     finally:
-        # ALWAYS release both locks
-        with _optimization_running_lock:
-            _optimization_running = False
+        # Release task lock first
         with _task_optimization_lock:
             _tasks_being_optimized.discard(task_id)
+        
+        # Check if events were queued during this optimization and run them
+        _run_queued_optimization_if_needed()
 
 
 # =============================================================================
