@@ -440,8 +440,8 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
                     fleet_state.assign_task(assigned_task_id, str(agent_id), agent_name)
         
         # Emit updated routes to all connected clients
-        # Includes: agent_routes, unassigned_tasks (with agents_considered), metadata, compatibility
-        emit('fleet:routes_updated', result, broadcast=True)
+        # Use socketio.emit() instead of emit() to work from background threads
+        socketio.emit('fleet:routes_updated', result, namespace='/')
         
         assigned = result.get('metadata', {}).get('tasks_assigned', 0)
         unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
@@ -449,7 +449,7 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         
     except Exception as e:
         log_event(f"[WebSocket] Auto-optimization failed: {e}", 'error')
-        emit('fleet:routes_updated', {
+        socketio.emit('fleet:routes_updated', {
             'trigger_type': 'event',
             'trigger_event': trigger_event,
             'trigger_data': trigger_data,
@@ -457,7 +457,7 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
             'success': False,
             'agent_routes': [],
             'unassigned_tasks': []
-        }, broadcast=True)
+        }, namespace='/')
     finally:
         # Check if events were queued during this optimization
         _run_queued_optimization_if_needed()
@@ -697,7 +697,8 @@ def trigger_incremental_optimization(
                     log_event(f"[FleetState] ✅ ASSIGNED: {len(new_tasks)} task(s) to {agent_name}: {new_tasks}")
             
             # Emit result (same base format as event-based, minus unassigned_tasks)
-            emit('fleet:routes_updated', result, broadcast=True)
+            # Use socketio.emit() instead of emit() to work from background threads
+            socketio.emit('fleet:routes_updated', result, namespace='/')
         else:
             print(f"[FleetState] ⚠️ Proximity trigger but no assignment possible for {agent_name}")
             # Don't emit for proximity if nothing assigned - no need to spam dashboard
