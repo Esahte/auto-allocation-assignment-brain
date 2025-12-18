@@ -340,7 +340,8 @@ class FleetState:
         chain_lookahead_radius_km: float = 5.0,
         max_distance_km: float = 3.0,
         optimization_cooldown_seconds: float = 30.0,
-        max_lateness_minutes: int = 45
+        max_lateness_minutes: int = 45,
+        max_pickup_delay_minutes: int = 60
     ):
         """
         Initialize the fleet state.
@@ -351,12 +352,14 @@ class FleetState:
             max_distance_km: Maximum distance for agent-task compatibility
             optimization_cooldown_seconds: Minimum time between optimizations per agent
             max_lateness_minutes: Maximum allowed delivery lateness before rejecting assignments
+            max_pickup_delay_minutes: Maximum delay after food is ready before rejecting pickup
         """
         self.assignment_radius_km = assignment_radius_km
         self.chain_lookahead_radius_km = chain_lookahead_radius_km
         self.max_distance_km = max_distance_km
         self.optimization_cooldown_seconds = optimization_cooldown_seconds
         self.max_lateness_minutes = max_lateness_minutes
+        self.max_pickup_delay_minutes = max_pickup_delay_minutes
         self.wallet_threshold = 500.0  # Minimum wallet balance for cash orders
         self.default_max_capacity = 2  # Default max tasks per agent
         
@@ -384,7 +387,7 @@ class FleetState:
         
         logger.info(f"[FleetState] Initialized with radius={assignment_radius_km}km, "
                    f"max_distance={max_distance_km}km, max_lateness={max_lateness_minutes}min, "
-                   f"cooldown={optimization_cooldown_seconds}s")
+                   f"max_pickup_delay={max_pickup_delay_minutes}min, cooldown={optimization_cooldown_seconds}s")
     
     # =========================================================================
     # AGENT STATE MANAGEMENT
@@ -1498,7 +1501,8 @@ class FleetState:
                 'settings_used': {
                     'walletNoCashThreshold': self.wallet_threshold,
                     'maxDistanceKm': self.max_distance_km,
-                    'maxLatenessMinutes': self.max_lateness_minutes
+                    'maxLatenessMinutes': self.max_lateness_minutes,
+                    'maxPickupDelayMinutes': self.max_pickup_delay_minutes
                 }
             }
     
@@ -1556,6 +1560,7 @@ fleet_state = FleetState(
     chain_lookahead_radius_km=5.0,
     max_distance_km=3.0,
     optimization_cooldown_seconds=30.0,
-    max_lateness_minutes=45  # Reject assignments that would cause >45min late deliveries
+    max_lateness_minutes=45,  # Reject assignments that would cause >45min late deliveries
+    max_pickup_delay_minutes=60  # Reject if pickup would be >60min after food ready
 )
 

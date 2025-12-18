@@ -30,6 +30,10 @@ OSRM_SERVER = "https://osrm-caribbean-785077267034.us-central1.run.app"
 # If a new task assignment would make ANY delivery (new or existing) later than this, drop the new task
 DEFAULT_MAX_LATENESS_MINUTES = 45
 
+# Maximum allowed delay for pickups (in minutes)
+# How long after food is ready can the agent arrive before the task is considered infeasible
+DEFAULT_MAX_PICKUP_DELAY_MINUTES = 60
+
 # =============================================================================
 # HTTP SESSION WITH RETRY LOGIC
 # =============================================================================
@@ -346,12 +350,14 @@ class CompatibilityChecker:
                  geofence_regions: List[GeofenceRegion] = None,
                  max_distance_km: float = None,
                  prefilter_distance: bool = True,
-                 max_lateness_minutes: int = DEFAULT_MAX_LATENESS_MINUTES):
+                 max_lateness_minutes: int = DEFAULT_MAX_LATENESS_MINUTES,
+                 max_pickup_delay_minutes: int = DEFAULT_MAX_PICKUP_DELAY_MINUTES):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
         self.max_distance_km = max_distance_km  # Max distance for assignment
         self.prefilter_distance = prefilter_distance  # Whether to pre-filter by distance
         self.max_lateness_minutes = max_lateness_minutes  # Max allowed delivery lateness
+        self.max_pickup_delay_minutes = max_pickup_delay_minutes  # Max delay after food ready
         self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
@@ -759,6 +765,9 @@ class FleetOptimizer:
         # Store max lateness for post-solution validation
         self.max_lateness_minutes = getattr(compatibility_checker, 'max_lateness_minutes', DEFAULT_MAX_LATENESS_MINUTES)
         
+        # Store max pickup delay for time window constraints
+        self.max_pickup_delay_minutes = getattr(compatibility_checker, 'max_pickup_delay_minutes', DEFAULT_MAX_PICKUP_DELAY_MINUTES)
+        
         # Build compatibility matrix
         self.compatibility_matrix = compatibility_checker.build_compatibility_matrix(
             agents, unassigned_tasks
@@ -1140,8 +1149,9 @@ class FleetOptimizer:
             # Pickup: Don't arrive before food is ready (or you wait)
             # Set minimum arrival time to when food is ready
             time_dimension.CumulVar(pickup_index).SetMin(pickup_ready_time)
-            # Allow late pickup with grace period (food can wait a bit)
-            time_dimension.CumulVar(pickup_index).SetMax(pickup_ready_time + 3600)  # 1hr grace for pickup
+            # Allow late pickup with configurable grace period (food can wait)
+            max_pickup_delay = self.max_pickup_delay_minutes * 60  # Convert to seconds
+            time_dimension.CumulVar(pickup_index).SetMax(pickup_ready_time + max_pickup_delay)
             
             # Delivery: Use configurable max lateness as hard constraint
             # This is the real deadline - prioritize this!
@@ -1640,8 +1650,10 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     wallet_threshold = settings.get('walletNoCashThreshold', DEFAULT_WALLET_THRESHOLD)
     max_distance_km = settings.get('maxDistanceKm', None)  # Max distance for assignment
     max_lateness_minutes = settings.get('maxLatenessMinutes', DEFAULT_MAX_LATENESS_MINUTES)  # Max allowed delivery lateness
+    max_pickup_delay_minutes = settings.get('maxPickupDelayMinutes', DEFAULT_MAX_PICKUP_DELAY_MINUTES)  # Max delay after food ready
     
-    print(f"[optimize_fleet] Settings: wallet_threshold={wallet_threshold}, max_distance_km={max_distance_km}, max_lateness_minutes={max_lateness_minutes}")
+    print(f"[optimize_fleet] Settings: wallet_threshold={wallet_threshold}, max_distance_km={max_distance_km}, "
+          f"max_lateness={max_lateness_minutes}min, max_pickup_delay={max_pickup_delay_minutes}min")
     
     # Build compatibility checker
     compatibility_checker = CompatibilityChecker(
@@ -1649,7 +1661,8 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         geofence_regions=geofences,
         max_distance_km=max_distance_km,
         prefilter_distance=prefilter_distance,
-        max_lateness_minutes=max_lateness_minutes
+        max_lateness_minutes=max_lateness_minutes,
+        max_pickup_delay_minutes=max_pickup_delay_minutes
     )
     
     # Run optimizer

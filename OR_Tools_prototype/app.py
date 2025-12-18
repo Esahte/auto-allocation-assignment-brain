@@ -563,6 +563,10 @@ def handle_fleet_sync(data):
                 fleet_state.max_lateness_minutes = int(config['max_lateness_minutes'])
                 print(f"[FleetState] → max_lateness_minutes = {fleet_state.max_lateness_minutes}min")
             
+            if 'max_pickup_delay_minutes' in config:
+                fleet_state.max_pickup_delay_minutes = int(config['max_pickup_delay_minutes'])
+                print(f"[FleetState] → max_pickup_delay_minutes = {fleet_state.max_pickup_delay_minutes}min")
+            
             if 'wallet_threshold' in config:
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
                 print(f"[FleetState] → wallet_threshold = ${fleet_state.wallet_threshold}")
@@ -594,6 +598,7 @@ def handle_fleet_sync(data):
             'config_applied': {
                 'max_distance_km': fleet_state.max_distance_km,
                 'max_lateness_minutes': fleet_state.max_lateness_minutes,
+                'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
                 'wallet_threshold': fleet_state.wallet_threshold,
                 'max_tasks_per_agent': fleet_state.default_max_capacity,
                 'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km
@@ -1606,6 +1611,7 @@ def fleet_state_config():
         return jsonify({
             'max_distance_km': fleet_state.max_distance_km,  # Also used as assignment trigger radius
             'max_lateness_minutes': fleet_state.max_lateness_minutes,  # Max allowed delivery lateness
+            'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,  # Max delay after food ready
             'wallet_threshold': fleet_state.wallet_threshold,  # Max wallet balance for cash orders
             'max_tasks_per_agent': fleet_state.default_max_capacity,  # Agent capacity limit
             'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
@@ -1627,6 +1633,8 @@ def fleet_state_config():
         fleet_state.max_distance_km = radius
     if 'max_lateness_minutes' in data:
         fleet_state.max_lateness_minutes = int(data['max_lateness_minutes'])
+    if 'max_pickup_delay_minutes' in data:
+        fleet_state.max_pickup_delay_minutes = int(data['max_pickup_delay_minutes'])
     if 'wallet_threshold' in data:
         fleet_state.wallet_threshold = float(data['wallet_threshold'])
     if 'max_tasks_per_agent' in data:
@@ -1640,6 +1648,7 @@ def fleet_state_config():
         'message': 'Configuration updated',
         'max_distance_km': fleet_state.max_distance_km,
         'max_lateness_minutes': fleet_state.max_lateness_minutes,
+        'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
         'wallet_threshold': fleet_state.wallet_threshold,
         'max_tasks_per_agent': fleet_state.default_max_capacity,
         'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
