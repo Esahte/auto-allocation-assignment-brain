@@ -147,6 +147,11 @@ class TaskState:
         return self.payment_method == "cash" or "cash_order" in self.tags
     
     @property
+    def is_premium_task(self) -> bool:
+        """Check if this is a premium task (tips >= $5 OR delivery_fee >= $18)"""
+        return self.tips >= 5.0 or self.delivery_fee >= 18.0
+    
+    @property
     def total_earnings(self) -> float:
         """Total earnings for this task (delivery_fee + tips)"""
         return self.delivery_fee + self.tips
@@ -176,6 +181,7 @@ class AgentState:
     # Business rule fields
     tags: List[str] = field(default_factory=list)  # ["cash_enabled", "bike", "zone_a"]
     wallet_balance: float = 0.0  # Cash on hand for cash orders
+    priority: Optional[int] = None  # Priority level: 1 = highest priority (premium tasks only)
     # Timestamps
     last_location_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -232,8 +238,14 @@ class AgentState:
         return tag in self.tags
     
     def is_cash_enabled(self) -> bool:
-        """Check if agent can handle cash orders"""
-        return "cash_enabled" in self.tags
+        """Check if agent can handle cash orders (case-insensitive)
+        
+        All agents can handle cash BY DEFAULT.
+        Only agents with NoCash/no_cash tag are blocked.
+        """
+        tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in self.tags]
+        has_no_cash = any(t in ['nocash', 'no_cash'] for t in tags_lower)
+        return not has_no_cash  # Can handle cash unless they have NoCash tag
     
     def estimated_time_to_idle(self) -> Optional[float]:
         """
@@ -299,10 +311,13 @@ class FleetState:
         self.chain_lookahead_radius_km = chain_lookahead_radius_km
         self.max_distance_km = max_distance_km
         self.optimization_cooldown_seconds = optimization_cooldown_seconds
+        self.wallet_threshold = 500.0  # Minimum wallet balance for cash orders
+        self.default_max_capacity = 2  # Default max tasks per agent
         
         # State storage
         self._agents: Dict[str, AgentState] = {}
         self._tasks: Dict[str, TaskState] = {}  # All tasks (unassigned, in-progress)
+        self._geofences: Dict[str, Any] = {}  # Geofence regions
         
         # Optimization tracking
         self._last_optimization_time: Dict[str, float] = {}  # agent_id -> timestamp
@@ -372,7 +387,8 @@ class FleetState:
         self,
         agent_id: str,
         name: Optional[str] = None,
-        location: Optional[Tuple[float, float]] = None
+        location: Optional[Tuple[float, float]] = None,
+        priority: Optional[int] = None
     ) -> Optional[AgentState]:
         """Mark agent as online"""
         with self._lock:
@@ -383,8 +399,11 @@ class FleetState:
                     agent.name = name
                 if location:
                     agent.current_location = Location(lat=location[0], lng=location[1])
+                if priority is not None:
+                    agent.priority = priority
                 agent.last_updated = datetime.now(timezone.utc)
-                logger.info(f"[FleetState] Agent online: {agent.name}")
+                priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
+                logger.info(f"[FleetState] Agent online: {agent.name}{priority_str}")
                 return agent
             elif location:
                 # Create new agent
@@ -392,10 +411,12 @@ class FleetState:
                     id=agent_id,
                     name=name or f"Agent {agent_id}",
                     current_location=Location(lat=location[0], lng=location[1]),
-                    status=AgentStatus.IDLE
+                    status=AgentStatus.IDLE,
+                    priority=priority
                 )
                 self._agents[agent_id] = agent
-                logger.info(f"[FleetState] New agent online: {agent.name}")
+                priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
+                logger.info(f"[FleetState] New agent online: {agent.name}{priority_str}")
                 return agent
             return None
     
@@ -465,6 +486,7 @@ class FleetState:
     def record_task_decline(self, task_id: str, agent_ids: List[str], latest_agent_id: Optional[str] = None):
         """
         Record that agents declined a task.
+        This moves the task back to UNASSIGNED status so it can be reassigned.
         
         Args:
             task_id: The task that was declined
@@ -472,11 +494,37 @@ class FleetState:
             latest_agent_id: The agent who most recently declined (for logging)
         """
         with self._lock:
+            # Convert to strings for consistent lookup
+            task_id = str(task_id) if task_id else ''
+            agent_ids = [str(aid) for aid in agent_ids] if agent_ids else []
+            latest_agent_id = str(latest_agent_id) if latest_agent_id else None
             if task_id in self._tasks:
                 task = self._tasks[task_id]
+                
                 # Add all declined agents
                 for agent_id in agent_ids:
                     task.declined_by.add(agent_id)
+                
+                # If the task was assigned to the agent who declined, remove the assignment
+                previous_agent_id = task.assigned_agent_id
+                if previous_agent_id:
+                    # Remove task from agent's current_tasks
+                    if previous_agent_id in self._agents:
+                        agent = self._agents[previous_agent_id]
+                        agent.current_tasks = [t for t in agent.current_tasks if t.id != task_id]
+                        
+                        # Update agent status based on remaining tasks
+                        if len(agent.current_tasks) == 0:
+                            agent.status = AgentStatus.IDLE
+                        elif len(agent.current_tasks) < agent.max_capacity:
+                            agent.status = AgentStatus.BUSY
+                        # else keep AT_CAPACITY
+                    
+                    # Clear assignment and reset status to UNASSIGNED
+                    task.assigned_agent_id = None
+                    task.status = TaskStatus.UNASSIGNED
+                    logger.info(f"[FleetState] Task {task_id[:20]}... moved back to UNASSIGNED after decline")
+                
                 task.last_updated = datetime.now(timezone.utc)
                 
                 if latest_agent_id and latest_agent_id in self._agents:
@@ -495,6 +543,10 @@ class FleetState:
             agent_name: Optional agent name for logging
         """
         with self._lock:
+            # Convert to strings for consistent lookup
+            task_id = str(task_id) if task_id else ''
+            agent_id = str(agent_id) if agent_id else ''
+            
             if task_id not in self._tasks:
                 logger.warning(f"[FleetState] Cannot assign - task {task_id[:20]}... not found")
                 return None
@@ -504,28 +556,37 @@ class FleetState:
             task.status = TaskStatus.ASSIGNED
             task.last_updated = datetime.now(timezone.utc)
             
-            # Add to agent's current tasks if agent exists
+            # GLOBAL DEDUPLICATION: Remove this task from ALL agents first
+            # This prevents the same task from being in multiple agents' lists
+            for ag in self._agents.values():
+                if any(t.id == task_id for t in ag.current_tasks):
+                    ag.current_tasks = [t for t in ag.current_tasks if t.id != task_id]
+                    # Recalculate status for agents who lost a task
+                    if len(ag.current_tasks) == 0:
+                        ag.status = AgentStatus.IDLE
+                    elif len(ag.current_tasks) < ag.max_capacity:
+                        ag.status = AgentStatus.BUSY
+            
+            # Add to new agent's current tasks if agent exists
             if agent_id in self._agents:
                 agent = self._agents[agent_id]
-                # Check if task already in agent's list
-                if not any(t.id == task_id for t in agent.current_tasks):
-                    current_task = CurrentTask(
-                        id=task.id,
-                        job_type=task.job_type,
-                        restaurant_location=task.restaurant_location,
-                        delivery_location=task.delivery_location,
-                        pickup_before=task.pickup_before,
-                        delivery_before=task.delivery_before,
-                        pickup_completed=task.pickup_completed,
-                        meta=task.meta
-                    )
-                    agent.current_tasks.append(current_task)
-                    
-                    # Update agent status
-                    if len(agent.current_tasks) >= agent.max_capacity:
-                        agent.status = AgentStatus.AT_CAPACITY
-                    else:
-                        agent.status = AgentStatus.BUSY
+                current_task = CurrentTask(
+                    id=task.id,
+                    job_type=task.job_type,
+                    restaurant_location=task.restaurant_location,
+                    delivery_location=task.delivery_location,
+                    pickup_before=task.pickup_before,
+                    delivery_before=task.delivery_before,
+                    pickup_completed=task.pickup_completed,
+                    meta=task.meta
+                )
+                agent.current_tasks.append(current_task)
+                
+                # Update agent status
+                if len(agent.current_tasks) >= agent.max_capacity:
+                    agent.status = AgentStatus.AT_CAPACITY
+                else:
+                    agent.status = AgentStatus.BUSY
                 
                 logger.info(f"[FleetState] Task {task.restaurant_name} assigned to {agent.name}")
             else:
@@ -539,6 +600,10 @@ class FleetState:
         Mark task as accepted by agent (status change from ASSIGNED).
         """
         with self._lock:
+            # Convert to strings for consistent lookup
+            task_id = str(task_id) if task_id else ''
+            agent_id = str(agent_id) if agent_id else ''
+            
             if task_id in self._tasks:
                 task = self._tasks[task_id]
                 # Could add an ACCEPTED status if needed, for now just log
@@ -553,6 +618,7 @@ class FleetState:
     def get_agent(self, agent_id: str) -> Optional[AgentState]:
         """Get agent state by ID"""
         with self._lock:
+            agent_id = str(agent_id) if agent_id else ''
             return self._agents.get(agent_id)
     
     def get_all_agents(self) -> List[AgentState]:
@@ -577,7 +643,8 @@ class FleetState:
     def add_task(self, task_data: Dict[str, Any]) -> TaskState:
         """Add or update a task"""
         with self._lock:
-            task_id = task_data.get('id', '')
+            # Convert task_id to string for consistent lookup
+            task_id = str(task_data.get('id', ''))
             
             # Parse locations
             restaurant_loc = task_data.get('restaurant_location', [0, 0])
@@ -592,8 +659,9 @@ class FleetState:
             if isinstance(delivery_before, str):
                 delivery_before = datetime.fromisoformat(delivery_before.replace('Z', '+00:00'))
             
-            # Determine status
-            assigned_agent = task_data.get('assigned_driver') or task_data.get('assigned_agent_id') or task_data.get('assigned_agent')
+            # Determine status - convert to string for consistent lookup
+            assigned_agent_raw = task_data.get('assigned_driver') or task_data.get('assigned_agent_id') or task_data.get('assigned_agent')
+            assigned_agent = str(assigned_agent_raw) if assigned_agent_raw else None
             status = TaskStatus.ASSIGNED if assigned_agent else TaskStatus.UNASSIGNED
             
             # Parse business rule fields
@@ -608,6 +676,8 @@ class FleetState:
             if task_id in self._tasks:
                 # Update existing
                 task = self._tasks[task_id]
+                old_assigned_agent = task.assigned_agent_id
+                
                 task.restaurant_location = Location(lat=restaurant_loc[0], lng=restaurant_loc[1])
                 task.delivery_location = Location(lat=delivery_loc[0], lng=delivery_loc[1])
                 task.pickup_before = pickup_before or task.pickup_before
@@ -623,7 +693,13 @@ class FleetState:
                 task.meta = task_data.get('_meta', task.meta)
                 task.last_updated = datetime.now(timezone.utc)
                 
-                # If task is assigned, ensure it's in agent's current_tasks
+                # ALWAYS remove this task from ALL agents first (global deduplication)
+                # This prevents the same task from being in multiple agents' lists
+                for agent in self._agents.values():
+                    if any(t.id == task_id for t in agent.current_tasks):
+                        agent.current_tasks = [t for t in agent.current_tasks if t.id != task_id]
+                
+                # If task is assigned, ensure it's in new agent's current_tasks
                 if assigned_agent and assigned_agent in self._agents:
                     agent = self._agents[assigned_agent]
                     if not any(t.id == task_id for t in agent.current_tasks):
@@ -666,10 +742,14 @@ class FleetState:
                 logger.info(f"[FleetState] New task added: {task.restaurant_name} → {task.customer_name}")
             
             # If task is assigned, add to agent's current_tasks
-            if assigned_agent and assigned_agent in self._agents:
-                agent = self._agents[assigned_agent]
-                # Check if task is not already in agent's list
-                if not any(t.id == task_id for t in agent.current_tasks):
+            # First, remove from ALL agents to prevent duplicates (global deduplication)
+            if assigned_agent:
+                for ag in self._agents.values():
+                    if any(t.id == task_id for t in ag.current_tasks):
+                        ag.current_tasks = [t for t in ag.current_tasks if t.id != task_id]
+                
+                if assigned_agent in self._agents:
+                    agent = self._agents[assigned_agent]
                     current_task = CurrentTask(
                         id=task.id,
                         job_type=task.job_type,
@@ -696,6 +776,7 @@ class FleetState:
     def update_task_status(self, task_id: str, status: TaskStatus) -> Optional[TaskState]:
         """Update task status"""
         with self._lock:
+            task_id = str(task_id) if task_id else ''
             if task_id in self._tasks:
                 task = self._tasks[task_id]
                 task.status = status
@@ -703,9 +784,34 @@ class FleetState:
                 return task
             return None
     
-    def complete_task(self, task_id: str) -> Optional[TaskState]:
-        """Mark task as completed and remove from active tasks"""
+    def mark_pickup_complete(self, task_id: str) -> Optional[TaskState]:
+        """
+        Mark pickup as completed for a PAIRED task.
+        Does NOT remove task from agent - they still need to do delivery.
+        """
         with self._lock:
+            task_id = str(task_id) if task_id else ''
+            if task_id in self._tasks:
+                task = self._tasks[task_id]
+                task.pickup_completed = True
+                task.last_updated = datetime.now(timezone.utc)
+                
+                # Also update in agent's current_tasks
+                if task.assigned_agent_id and task.assigned_agent_id in self._agents:
+                    agent = self._agents[task.assigned_agent_id]
+                    for ct in agent.current_tasks:
+                        if ct.id == task_id:
+                            ct.pickup_completed = True
+                            break
+                
+                logger.info(f"[FleetState] Pickup completed: {task_id[:20]}... (delivery pending)")
+                return task
+            return None
+    
+    def complete_task(self, task_id: str) -> Optional[TaskState]:
+        """Mark task as completed and remove from active tasks (delivery done)"""
+        with self._lock:
+            task_id = str(task_id) if task_id else ''
             if task_id in self._tasks:
                 task = self._tasks[task_id]
                 task.status = TaskStatus.COMPLETED
@@ -729,6 +835,7 @@ class FleetState:
     def cancel_task(self, task_id: str) -> Optional[TaskState]:
         """Mark task as cancelled"""
         with self._lock:
+            task_id = str(task_id) if task_id else ''
             if task_id in self._tasks:
                 task = self._tasks[task_id]
                 task.status = TaskStatus.CANCELLED
@@ -746,12 +853,18 @@ class FleetState:
     def get_task(self, task_id: str) -> Optional[TaskState]:
         """Get task by ID"""
         with self._lock:
+            task_id = str(task_id) if task_id else ''
             return self._tasks.get(task_id)
     
     def get_unassigned_tasks(self) -> List[TaskState]:
         """Get all unassigned tasks"""
         with self._lock:
             return [t for t in self._tasks.values() if t.status == TaskStatus.UNASSIGNED]
+    
+    def get_unassigned_task_count(self) -> int:
+        """Get count of unassigned tasks (lightweight check)"""
+        with self._lock:
+            return sum(1 for t in self._tasks.values() if t.status == TaskStatus.UNASSIGNED)
     
     def get_active_tasks(self) -> List[TaskState]:
         """Get all active (not completed/cancelled) tasks"""
@@ -814,24 +927,72 @@ class FleetState:
         """
         Check if agent is eligible to take task.
         Returns None if eligible, or reason string if not.
+        
+        Business Rules Checked:
+        0. Priority - Priority 1 agents only get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        1. Declined - Agent hasn't declined this task
+        2. Capacity - Agent has room for more tasks
+        3. Online - Agent is not offline
+        4. Cash Enabled - Agent can handle cash if task is cash order
+        5. Wallet Balance - Agent has sufficient balance for cash orders
+        6. Geofence - Agent is assigned to task's pickup zone
+        7. Max Distance - Agent is within allowed distance (bypassed for Priority 1 on premium tasks)
         """
-        # Check if agent declined this task
+        # 0. PRIORITY AGENT RULES
+        # Priority 1 agents ONLY get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        if agent.priority == 1:
+            if not task.is_premium_task:
+                return "priority1_non_premium"
+        
+        # 1. Check if agent declined this task
         if task.was_declined_by(agent.id):
             return "declined"
         
-        # Check capacity
+        # 2. Check capacity
         if not agent.has_capacity:
             return "at_capacity"
         
-        # Check online
+        # 3. Check online
         if not agent.is_online:
             return "offline"
         
-        # Check cash handling
+        # 4. Check cash handling capability - only NoCash tag blocks cash orders
         if task.is_cash_order and not agent.is_cash_enabled():
-            return "not_cash_enabled"
+            return "no_cash_tag"
         
-        # Check max distance (using current or projected location)
+        # 5. Check wallet balance for cash orders - reject if agent has too much cash
+        if task.is_cash_order:
+            if agent.wallet_balance > self.wallet_threshold:
+                return f"wallet_too_high ({agent.wallet_balance:.2f} > {self.wallet_threshold:.2f})"
+        
+        # 6. Check geofence - is agent assigned to the pickup zone?
+        if self._geofences:
+            agent_in_any_geofence = False
+            task_in_agent_geofence = False
+            
+            for gf in self._geofences.values():
+                agent_ids = gf.get('agent_ids', set())
+                if agent.id in agent_ids:
+                    agent_in_any_geofence = True
+                    # Check if task pickup is within this geofence
+                    polygon = gf.get('polygon', [])
+                    if polygon and self._point_in_polygon(
+                        task.restaurant_location.lat, 
+                        task.restaurant_location.lng, 
+                        polygon
+                    ):
+                        task_in_agent_geofence = True
+                        break
+            
+            # If agent is assigned to geofences, task must be in one of them
+            if agent_in_any_geofence and not task_in_agent_geofence:
+                return "outside_geofence"
+        
+        # 7. Check max distance (using current or projected location)
+        # Priority 1 agents BYPASS distance for premium tasks
+        if agent.priority == 1 and task.is_premium_task:
+            return None  # Priority 1 agents bypass distance for premium tasks
+        
         if agent.current_tasks:
             # Use projected location for busy agents
             distance = agent.projected_location.distance_to(task.restaurant_location)
@@ -845,6 +1006,29 @@ class FleetState:
             return f"too_far ({distance:.1f}km > {max_dist}km)"
         
         return None  # Eligible!
+    
+    def _point_in_polygon(self, lat: float, lng: float, polygon: List[List[float]]) -> bool:
+        """
+        Ray casting algorithm to check if point is inside polygon.
+        Polygon is list of [lat, lng] points.
+        """
+        n = len(polygon)
+        if n < 3:
+            return False
+        
+        inside = False
+        j = n - 1
+        
+        for i in range(n):
+            yi, xi = polygon[i][0], polygon[i][1]
+            yj, xj = polygon[j][0], polygon[j][1]
+            
+            if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+                inside = not inside
+            
+            j = i
+        
+        return inside
     
     def find_eligible_agents_for_task(self, task_id: str) -> List[Tuple[AgentState, float, Optional[str]]]:
         """
@@ -995,6 +1179,7 @@ class FleetState:
                     agent.tags = agent_data.get('tags', agent.tags)
                     agent.wallet_balance = float(agent_data.get('wallet_balance', agent.wallet_balance))
                     agent.max_capacity = int(agent_data.get('max_capacity', agent.max_capacity))
+                    agent.priority = agent_data.get('priority')  # None if not priority agent
                 else:
                     agent = AgentState(
                         id=agent_id,
@@ -1003,7 +1188,8 @@ class FleetState:
                         status=status,
                         tags=agent_data.get('tags', []),
                         wallet_balance=float(agent_data.get('wallet_balance') or 0),
-                        max_capacity=int(agent_data.get('max_capacity', 2))
+                        max_capacity=int(agent_data.get('max_capacity', 2)),
+                        priority=agent_data.get('priority')  # None if not priority agent
                     )
                     self._agents[agent_id] = agent
                 
@@ -1030,6 +1216,23 @@ class FleetState:
             self._recalculate_agent_statuses()
             
             logger.info(f"[FleetState] Synced {len(tasks_data)} tasks")
+    
+    def sync_geofences(self, geofences_data: List[Dict[str, Any]]):
+        """Sync geofences from dashboard data"""
+        with self._lock:
+            self._geofences.clear()
+            
+            for gf_data in geofences_data:
+                gf_id = str(gf_data.get('id', ''))
+                if gf_id:
+                    self._geofences[gf_id] = {
+                        'id': gf_id,
+                        'name': gf_data.get('name', ''),
+                        'polygon': gf_data.get('polygon', []),
+                        'agent_ids': set(gf_data.get('agent_ids', []))
+                    }
+            
+            logger.info(f"[FleetState] Synced {len(self._geofences)} geofences")
     
     def _recalculate_agent_statuses(self):
         """Recalculate all agent statuses based on their current tasks"""
@@ -1114,6 +1317,21 @@ class FleetState:
         Used by optimize_fleet() function.
         """
         with self._lock:
+            # DUPLICATE DETECTION FIRST: Check if any task appears in multiple agents
+            all_task_ids = {}
+            for agent in self._agents.values():
+                tasks_to_remove = []
+                for ct in agent.current_tasks:
+                    if ct.id in all_task_ids:
+                        # Found duplicate - log warning and mark for removal
+                        logger.warning(f"[FleetState] DUPLICATE TASK {str(ct.id)[:20]}... found in {agent.name} and {all_task_ids[ct.id]} - removing from {agent.name}")
+                        tasks_to_remove.append(ct.id)
+                    else:
+                        all_task_ids[ct.id] = agent.name
+                # Remove duplicates from this agent
+                if tasks_to_remove:
+                    agent.current_tasks = [t for t in agent.current_tasks if t.id not in tasks_to_remove]
+            
             agents_list = []
             for agent in self._agents.values():
                 if not agent.is_online:
@@ -1135,30 +1353,37 @@ class FleetState:
                     })
                 
                 agents_list.append({
-                    'id': agent.id,
+                    'driver_id': agent.id,  # Agent.from_dict expects 'driver_id'
                     'name': agent.name,
-                    'location': [agent.current_location.lat, agent.current_location.lng],
+                    'current_location': [agent.current_location.lat, agent.current_location.lng],  # Agent.from_dict expects 'current_location'
                     'current_tasks': current_tasks,
-                    'max_capacity': agent.max_capacity,
                     'wallet_balance': agent.wallet_balance,
-                    'tags': agent.tags
+                    '_meta': {
+                        'max_tasks': agent.max_capacity,
+                        'available_capacity': agent.available_capacity,
+                        'tags': agent.tags,
+                        # Case-insensitive check for NoCash/no_cash/nocash variations
+                        'has_no_cash_tag': any(t.lower().replace('-', '_').replace(' ', '_') in ['nocash', 'no_cash'] for t in agent.tags),
+                        'is_scooter_agent': 'scooter' in [t.lower() for t in agent.tags],
+                        'priority': agent.priority  # None if not a priority agent
+                    }
                 })
             
             # Export geofences
             geofence_data = []
             for gf in self._geofences.values():
                 geofence_data.append({
-                    'id': gf.id,
-                    'name': gf.name,
-                    'polygon': gf.polygon,
-                    'agent_ids': list(gf.agent_ids)
+                    'id': gf.get('id', ''),
+                    'name': gf.get('name', ''),
+                    'polygon': gf.get('polygon', []),
+                    'agent_ids': list(gf.get('agent_ids', []))
                 })
             
             return {
                 'agents': agents_list,
                 'geofence_data': geofence_data,
                 'settings_used': {
-                    'walletNoCashThreshold': 500,  # Default, could be configurable
+                    'walletNoCashThreshold': self.wallet_threshold,
                     'maxDistanceKm': self.max_distance_km
                 }
             }
@@ -1174,8 +1399,17 @@ class FleetState:
                 if task.status != TaskStatus.UNASSIGNED:
                     continue
                 
-                # Get declined_by from task
-                declined_by = list(task.declined_by) if hasattr(task, 'declined_by') else []
+                # Get declined_by from task - convert to format optimizer expects
+                # Optimizer expects: [{"driver_id": "123"}, ...] not just ["123", ...]
+                declined_by_list = list(task.declined_by) if hasattr(task, 'declined_by') else []
+                declined_by = [{'driver_id': agent_id} for agent_id in declined_by_list]
+                
+                # Build _meta with payment_type in format optimizer expects
+                task_meta = dict(task.meta) if task.meta else {}
+                # Convert payment_method to payment_type in uppercase for optimizer
+                payment_type = "CASH" if task.payment_method.lower() == "cash" else "CARD"
+                task_meta['payment_type'] = payment_type
+                task_meta['tags'] = task.tags
                 
                 tasks_list.append({
                     'id': task.id,
@@ -1190,7 +1424,7 @@ class FleetState:
                     'tips': task.tips,
                     'max_distance_km': task.max_distance_km,
                     'declined_by': declined_by,
-                    '_meta': task.meta
+                    '_meta': task_meta
                 })
             
             return {

@@ -91,6 +91,13 @@ class Task:
     tags: List[str] = field(default_factory=list)
     declined_by: List[str] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
+    tips: float = 0.0
+    delivery_fee: float = 0.0
+    
+    @property
+    def is_premium_task(self) -> bool:
+        """Check if this is a premium task (tips >= $5 OR delivery_fee >= $18)"""
+        return self.tips >= 5.0 or self.delivery_fee >= 18.0
     
     @classmethod
     def from_dict(cls, data: dict) -> 'Task':
@@ -122,7 +129,9 @@ class Task:
             payment_type=meta.get('payment_type', 'CARD'),
             tags=meta.get('tags', []),
             declined_by=declined_by,
-            meta=meta
+            meta=meta,
+            tips=float(data.get('tips') or meta.get('tips') or 0.0),
+            delivery_fee=float(data.get('delivery_fee') or meta.get('delivery_fee') or 0.0)
         )
     
     @staticmethod
@@ -153,6 +162,7 @@ class Agent:
     has_no_cash_tag: bool = False
     is_scooter_agent: bool = False
     geofence_regions: List[str] = field(default_factory=list)
+    priority: Optional[int] = None  # Priority level: 1 = highest (premium tasks only)
     
     @classmethod
     def from_dict(cls, data: dict) -> 'Agent':
@@ -181,7 +191,8 @@ class Agent:
             tags=meta.get('tags', []),
             has_no_cash_tag=meta.get('has_no_cash_tag', False),
             is_scooter_agent=meta.get('is_scooter_agent', False),
-            geofence_regions=meta.get('geofence_regions', [])
+            geofence_regions=meta.get('geofence_regions', []),
+            priority=meta.get('priority')  # None if not a priority agent
         )
 
 
@@ -320,18 +331,27 @@ def get_osrm_distances_matrix(origins: List[Location], destinations: List[Locati
 class CompatibilityChecker:
     """
     Builds and checks agent-task compatibility based on business rules.
+    
+    Supports two modes controlled by prefilter_distance:
+    - True (default): Pre-filter by distance for FAST proximity-based optimization
+    - False: Skip distance pre-filter, let solver handle it for THOROUGH event-based optimization
     """
     
     def __init__(self, 
                  wallet_threshold: float = DEFAULT_WALLET_THRESHOLD,
                  geofence_regions: List[GeofenceRegion] = None,
-                 max_distance_km: float = None):
+                 max_distance_km: float = None,
+                 prefilter_distance: bool = True):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
         self.max_distance_km = max_distance_km  # Max distance for assignment
+        self.prefilter_distance = prefilter_distance  # Whether to pre-filter by distance
         self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
+        
+        if not prefilter_distance:
+            print(f"[CompatibilityChecker] Distance pre-filter DISABLED - solver will handle distance")
     
     def _get_agent_projected_location(self, agent: Agent) -> Location:
         """
@@ -355,34 +375,58 @@ class CompatibilityChecker:
         """
         Precompute OSRM road distances from all agents to all task pickup locations.
         
-        IMPORTANT: For agents with existing tasks, we use their PROJECTED location
-        (last delivery) instead of current location. This enables smart chaining
-        where an agent finishing nearby can pick up new tasks in the area.
+        For agents with existing tasks, we compute BOTH:
+        1. Distance from CURRENT location (for opportunistic pickups)
+        2. Distance from PROJECTED location (for efficient chaining)
+        
+        If EITHER distance is within max_distance_km, the agent is compatible.
+        This allows agents to pick up nearby tasks while on their way to deliveries.
         """
         if not agents or not tasks:
             return
         
-        # Use projected locations (last delivery) for agents with existing tasks
-        agent_projected_locations = [self._get_agent_projected_location(agent) for agent in agents]
         task_locations = [task.restaurant_location for task in tasks]
         
-        # Log which agents are using projected locations
-        for agent in agents:
-            if agent.current_tasks:
+        # Get projected locations for all agents
+        agent_projected_locations = [self._get_agent_projected_location(agent) for agent in agents]
+        
+        # Get current locations for busy agents (for opportunistic pickup check)
+        agent_current_locations = [agent.current_location for agent in agents]
+        
+        # Log which agents have both locations
+        busy_agents = [a for a in agents if a.current_tasks]
+        if busy_agents:
+            print(f"[CompatibilityChecker] {len(busy_agents)} busy agents - checking BOTH current and projected locations")
+            for agent in busy_agents:
                 proj_loc = self._get_agent_projected_location(agent)
-                print(f"[CompatibilityChecker] {agent.name}: Using projected location "
-                      f"(last delivery at {proj_loc.lat:.4f}, {proj_loc.lng:.4f}) instead of current location")
+                print(f"[CompatibilityChecker] {agent.name}: current=({agent.current_location.lat:.4f}, {agent.current_location.lng:.4f}), "
+                      f"projected=({proj_loc.lat:.4f}, {proj_loc.lng:.4f})")
         
         print(f"[CompatibilityChecker] Getting OSRM distances for {len(agents)} agents x {len(tasks)} tasks...")
         
-        distances = get_osrm_distances_matrix(agent_projected_locations, task_locations)
+        # Get distances from PROJECTED locations
+        projected_distances = get_osrm_distances_matrix(agent_projected_locations, task_locations)
         
-        # Store in cache with projected flag
+        # Get distances from CURRENT locations (for busy agents only, but compute for all)
+        current_distances = get_osrm_distances_matrix(agent_current_locations, task_locations)
+        
+        # Store BOTH in cache - use the MINIMUM of current and projected
         for i, agent in enumerate(agents):
             for j, task in enumerate(tasks):
-                self.distance_cache[(agent.id, task.id)] = distances[i][j] if distances else float('inf')
+                proj_dist = projected_distances[i][j] if projected_distances else float('inf')
+                curr_dist = current_distances[i][j] if current_distances else float('inf')
+                
+                # Use the MINIMUM distance - if agent is near NOW or will be near LATER
+                min_dist = min(proj_dist, curr_dist)
+                self.distance_cache[(agent.id, task.id)] = min_dist
+                
+                # Also store both for logging
+                self.projected_distance_cache = getattr(self, 'projected_distance_cache', {})
+                self.current_distance_cache = getattr(self, 'current_distance_cache', {})
+                self.projected_distance_cache[(agent.id, task.id)] = proj_dist
+                self.current_distance_cache[(agent.id, task.id)] = curr_dist
         
-        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} distances (using projected locations)")
+        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} distances (using MIN of current and projected)")
     
     def is_compatible(self, agent: Agent, task: Task) -> Tuple[bool, str]:
         """
@@ -391,13 +435,33 @@ class CompatibilityChecker:
         Returns:
             (is_compatible, reason) tuple
         """
+        # =================================================================
+        # PRIORITY AGENT RULES (Check first)
+        # =================================================================
+        # Priority 1 agents ONLY get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        # They bypass distance constraints for qualifying tasks
+        if agent.priority == 1:
+            if not task.is_premium_task:
+                return False, "priority1_non_premium_task"
+            # Priority 1 agents bypass distance for premium tasks (handled below)
+        
+        # =================================================================
+        # STANDARD RULES
+        # =================================================================
+        
         # Rule 1: Decline History - Agent previously declined this task
         if task.declined_by and agent.id in task.declined_by:
             return False, "agent_declined_task"
         
-        # Rule 2: NoCash Tag - Agent can't handle cash
-        if task.payment_type == "CASH" and agent.has_no_cash_tag:
-            return False, "no_cash_tag"
+        # Rule 2: Cash Handling - All agents can handle cash BY DEFAULT
+        # Only agents with NoCash tag are blocked from cash orders
+        # Case-insensitive checks for tag variations: nocash, NoCash, no_cash, NO_CASH, etc.
+        if task.payment_type == "CASH":
+            tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in agent.tags]
+            has_no_cash = any(t in ['nocash', 'no_cash'] for t in tags_lower)
+            
+            if has_no_cash:
+                return False, "no_cash_tag"
         
         # Rule 3: Wallet Threshold - Agent wallet too high for cash orders
         if task.payment_type == "CASH" and agent.wallet_balance > self.wallet_threshold:
@@ -426,25 +490,42 @@ class CompatibilityChecker:
                         return False, "outside_scooter_geofence"
         
         # Rule 6: Max Distance - Agent must be within maxDistanceKm of pickup location
-        # Uses OSRM road distance (precomputed) for accuracy
-        # IMPORTANT: Uses PROJECTED location (last delivery) for agents with existing tasks
-        if self.max_distance_km is not None:
-            # Check cache first (OSRM road distance from projected location)
+        # Uses MINIMUM of current and projected distance (opportunistic pickup + chaining)
+        # SKIP this rule if prefilter_distance=False (solver will handle distance with soft constraints)
+        # SKIP for Priority 1 agents on premium tasks (they bypass distance)
+        bypass_distance = (agent.priority == 1 and task.is_premium_task)
+        
+        if self.max_distance_km is not None and self.prefilter_distance and not bypass_distance:
+            # Check cache first (uses MIN of current and projected)
             cache_key = (agent.id, task.id)
             if cache_key in self.distance_cache:
                 distance = self.distance_cache[cache_key]
             else:
-                # Fallback to Haversine if not in cache - use projected location
+                # Fallback to Haversine - check BOTH current and projected
+                curr_distance = _haversine_km(
+                    agent.current_location.lat, agent.current_location.lng,
+                    task.restaurant_location.lat, task.restaurant_location.lng
+                )
                 projected_loc = self._get_agent_projected_location(agent)
-                distance = _haversine_km(
+                proj_distance = _haversine_km(
                     projected_loc.lat, projected_loc.lng,
                     task.restaurant_location.lat, task.restaurant_location.lng
                 )
+                distance = min(curr_distance, proj_distance)
             
             if distance > self.max_distance_km:
-                # Include whether this is from projected location in the reason
-                loc_type = "projected" if agent.current_tasks else "current"
-                return False, f"distance_exceeded_{distance:.1f}km_from_{loc_type}"
+                # Get both distances for detailed logging
+                proj_dist = getattr(self, 'projected_distance_cache', {}).get(cache_key, float('inf'))
+                curr_dist = getattr(self, 'current_distance_cache', {}).get(cache_key, float('inf'))
+                
+                if agent.current_tasks:
+                    return False, f"distance_exceeded_curr={curr_dist:.1f}km_proj={proj_dist:.1f}km"
+                else:
+                    return False, f"distance_exceeded_{distance:.1f}km"
+        
+        # Priority 1 agents get a special compatible reason for premium tasks
+        if agent.priority == 1 and task.is_premium_task:
+            return True, "compatible_priority1_premium"
         
         return True, "compatible"
     
@@ -517,6 +598,12 @@ def get_travel_time_matrix(locations: List[Location]) -> List[List[int]]:
     
     try:
         session = get_osrm_session()
+        
+        # For large requests (>50 locations), use chunking to avoid URL length limits
+        if len(locations) > 50:
+            print(f"[OSRM] Large request ({len(locations)} locations) - using chunked approach")
+            return _get_travel_times_chunked(locations, session)
+        
         response = session.get(url, timeout=30)
         response.raise_for_status()
         data = response.json()
@@ -529,7 +616,72 @@ def get_travel_time_matrix(locations: List[Location]) -> List[List[int]]:
         print(f"[OSRM] Error getting travel times: {e}")
     
     # Fallback to Haversine estimation
+    print(f"[OSRM] Using Haversine fallback for {len(locations)} locations")
     return _estimate_travel_times(locations)
+
+
+def _get_travel_times_chunked(locations: List[Location], session) -> List[List[int]]:
+    """
+    Get travel times in chunks to avoid OSRM URL length limits.
+    Splits large requests into smaller batches and combines results.
+    """
+    n = len(locations)
+    matrix = [[999999] * n for _ in range(n)]  # Initialize with high values
+    
+    # Set diagonal to 0
+    for i in range(n):
+        matrix[i][i] = 0
+    
+    CHUNK_SIZE = 40  # Safe size for OSRM GET requests
+    
+    # Process in chunks
+    for i_start in range(0, n, CHUNK_SIZE):
+        i_end = min(i_start + CHUNK_SIZE, n)
+        
+        for j_start in range(0, n, CHUNK_SIZE):
+            j_end = min(j_start + CHUNK_SIZE, n)
+            
+            # Get subset of locations
+            sources = list(range(i_start, i_end))
+            destinations = list(range(j_start, j_end))
+            
+            # Build URL with sources and destinations parameters
+            coords_str = ";".join([locations[idx].to_osrm_str() for idx in sources + destinations])
+            
+            # Create source and destination indices for the combined array
+            source_indices = ";".join(str(i) for i in range(len(sources)))
+            dest_indices = ";".join(str(i) for i in range(len(sources), len(sources) + len(destinations)))
+            
+            url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=duration&sources={source_indices}&destinations={dest_indices}"
+            
+            try:
+                response = session.get(url, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('code') == 'Ok':
+                    durations = data.get('durations', [])
+                    
+                    # Copy results into the main matrix
+                    for i_local, i_global in enumerate(sources):
+                        for j_local, j_global in enumerate(destinations):
+                            if i_local < len(durations) and j_local < len(durations[i_local]):
+                                val = durations[i_local][j_local]
+                                matrix[i_global][j_global] = int(val) if val is not None else 999999
+            except Exception as e:
+                print(f"[OSRM] Chunk error ({i_start}-{i_end} x {j_start}-{j_end}): {e}")
+                # Fill chunk with Haversine estimates
+                for i_global in sources:
+                    for j_global in destinations:
+                        if i_global != j_global:
+                            dist = _haversine_km(
+                                locations[i_global].lat, locations[i_global].lng,
+                                locations[j_global].lat, locations[j_global].lng
+                            )
+                            matrix[i_global][j_global] = int(dist / 30 * 3600)
+    
+    print(f"[OSRM] Chunked request complete: {n}x{n} matrix built")
+    return matrix
 
 
 def _estimate_travel_times(locations: List[Location]) -> List[List[int]]:
@@ -585,14 +737,18 @@ class FleetOptimizer:
                  agents: List[Agent],
                  unassigned_tasks: List[Task],
                  compatibility_checker: CompatibilityChecker,
-                 current_time: datetime = None):
+                 current_time: datetime = None,
+                 prefilter_distance: bool = True):
         self.agents = agents
         self.unassigned_tasks = unassigned_tasks
         self.compatibility_checker = compatibility_checker
         self.current_time = current_time or datetime.now(timezone.utc)
+        self.prefilter_distance = prefilter_distance
         
         # Store max distance for chain-aware filtering
-        self.max_distance_km = getattr(compatibility_checker, 'max_distance_km', None)
+        # Only enforce distance penalty if prefilter_distance=True (FAST mode)
+        # In THOROUGH mode, let routing cost handle distance naturally
+        self.max_distance_km = getattr(compatibility_checker, 'max_distance_km', None) if prefilter_distance else None
         
         # Build compatibility matrix
         self.compatibility_matrix = compatibility_checker.build_compatibility_matrix(
@@ -757,6 +913,8 @@ class FleetOptimizer:
         self.pre_filtered_tasks = []
         self.routable_tasks = []  # Tasks that have at least one compatible agent
         
+        print(f"[FleetOptimizer] Checking compatibility for {len(self.unassigned_tasks)} unassigned task(s)...")
+        
         for task in self.unassigned_tasks:
             # Check if ANY agent is compatible with this task
             compatible_agents = []
@@ -782,6 +940,14 @@ class FleetOptimizer:
         
         print(f"[FleetOptimizer] Pre-filtered {len(self.pre_filtered_tasks)} tasks, {len(self.routable_tasks)} tasks routable")
         
+        # Show why there's nothing to assign
+        if len(self.routable_tasks) == 0 and len(self.unassigned_tasks) > 0:
+            print(f"[FleetOptimizer] ⚠️ ALL {len(self.unassigned_tasks)} tasks were pre-filtered!")
+            for pf in self.pre_filtered_tasks[:3]:
+                task = pf['task']
+                reason = pf['reason']
+                print(f"  → {task.meta.get('restaurant_name', task.id[:15])}: {reason}")
+        
         # Build location index with ONLY routable tasks
         locations, index_map = self._build_location_index(self.routable_tasks)
         num_locations = len(locations)
@@ -796,11 +962,14 @@ class FleetOptimizer:
         
         # Build distance matrix for chain-aware enforcement
         # This ensures every hop in the route is within maxDistanceKm
+        # ONLY applies in FAST/proximity mode - in THOROUGH mode, routing cost handles distance
         max_distance_km = self.max_distance_km
         distance_matrix = None
         if max_distance_km is not None:
             print(f"[FleetOptimizer] Building distance matrix for chain-aware filtering (max {max_distance_km}km per hop)...")
             distance_matrix = self._build_distance_matrix(locations)
+        else:
+            print(f"[FleetOptimizer] Distance enforcement DISABLED (THOROUGH mode) - routing cost handles distance")
         
         # Create routing model
         manager = pywrapcp.RoutingIndexManager(
@@ -1019,8 +1188,38 @@ class FleetOptimizer:
         if solution:
             return self._extract_solution(routing, manager, solution, index_map, time_dimension, solve_time)
         else:
-            print("[FleetOptimizer] No solution found")
-            return self._empty_result("no_solution", solve_time)
+            # Diagnose WHY no solution was found
+            status = routing.status()
+            status_names = {
+                0: "ROUTING_NOT_SOLVED",
+                1: "ROUTING_SUCCESS", 
+                2: "ROUTING_PARTIAL_SUCCESS_LOCAL_OPTIMUM_NOT_REACHED",
+                3: "ROUTING_FAIL",
+                4: "ROUTING_FAIL_TIMEOUT",
+                5: "ROUTING_INVALID"
+            }
+            status_name = status_names.get(status, f"UNKNOWN_{status}")
+            
+            # Check capacity issues
+            agents_at_capacity = sum(1 for a in self.agents if a.available_capacity <= 0)
+            agents_with_space = len(self.agents) - agents_at_capacity
+            
+            # Build detailed reason
+            if agents_with_space == 0:
+                reason = "all_agents_at_capacity"
+                print(f"[FleetOptimizer] No solution: ALL {len(self.agents)} agents at max capacity")
+            elif status == 4:
+                reason = "solver_timeout"
+                print(f"[FleetOptimizer] No solution: Solver timed out ({solve_time:.1f}s)")
+            elif status == 5:
+                reason = "invalid_model"
+                print(f"[FleetOptimizer] No solution: Model invalid (check constraints)")
+            else:
+                reason = f"infeasible_{status_name}"
+                print(f"[FleetOptimizer] No solution: {status_name} - {agents_with_space}/{len(self.agents)} agents have capacity")
+                print(f"[FleetOptimizer] Hint: Check time windows, distances, or constraint conflicts")
+            
+            return self._empty_result(reason, solve_time)
     
     def _extract_solution(self, routing, manager, solution, index_map, time_dimension, solve_time) -> Dict:
         """Extract solution into structured format"""
@@ -1028,6 +1227,32 @@ class FleetOptimizer:
         agent_routes = []
         assigned_task_ids = set()
         total_lateness = 0
+        
+        # DEBUG: Check which tasks were dropped
+        dropped_tasks = []
+        for task in self.routable_tasks:
+            task_id = task.id
+            is_assigned = False
+            for vehicle_idx in range(len(self.agents)):
+                index = routing.Start(vehicle_idx)
+                while not routing.IsEnd(index):
+                    node = manager.IndexToNode(index)
+                    task_info = index_map['task_at_index'].get(node)
+                    if task_info and task_info[0] == task_id:
+                        is_assigned = True
+                        break
+                    index = solution.Value(routing.NextVar(index))
+                if is_assigned:
+                    break
+            if not is_assigned:
+                dropped_tasks.append(task)
+        
+        if dropped_tasks:
+            print(f"[FleetOptimizer] ⚠️ Solver DROPPED {len(dropped_tasks)} task(s):")
+            for task in dropped_tasks:
+                time_to_pickup = (task.pickup_before - self.current_time).total_seconds() / 60
+                time_to_delivery = (task.delivery_before - self.current_time).total_seconds() / 60
+                print(f"  → {task.meta.get('restaurant_name', task.id[:15])}: pickup in {time_to_pickup:.1f}min, deliver in {time_to_delivery:.1f}min")
         
         for vehicle_idx, agent in enumerate(self.agents):
             route_stops = []
@@ -1280,18 +1505,23 @@ class FleetOptimizer:
 # MAIN OPTIMIZATION FUNCTION
 # =============================================================================
 
-def optimize_fleet(agents_data: Dict, tasks_data: Dict) -> Dict:
+def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True) -> Dict:
     """
     Main entry point for fleet optimization.
     
     Args:
         agents_data: Response from /api/test/or-tools/agents endpoint
         tasks_data: Response from /api/test/or-tools/unassigned-tasks endpoint
+        prefilter_distance: Whether to pre-filter by distance (True for fast proximity,
+                           False for thorough event-based where solver handles distance)
     
     Returns:
         Optimization results with routes for each agent
     """
     start_time = time.time()
+    
+    mode = "PROXIMITY (fast pre-filter)" if prefilter_distance else "EVENT-BASED (solver handles distance)"
+    print(f"[optimize_fleet] Mode: {mode}")
     
     # Parse agents
     agents = [Agent.from_dict(a) for a in agents_data.get('agents', [])]
@@ -1316,14 +1546,16 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict) -> Dict:
     compatibility_checker = CompatibilityChecker(
         wallet_threshold=wallet_threshold,
         geofence_regions=geofences,
-        max_distance_km=max_distance_km
+        max_distance_km=max_distance_km,
+        prefilter_distance=prefilter_distance
     )
     
     # Run optimizer
     optimizer = FleetOptimizer(
         agents=agents,
         unassigned_tasks=tasks,
-        compatibility_checker=compatibility_checker
+        compatibility_checker=compatibility_checker,
+        prefilter_distance=prefilter_distance
     )
     
     result = optimizer.optimize()

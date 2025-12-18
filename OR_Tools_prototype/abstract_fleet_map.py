@@ -694,7 +694,7 @@ class AbstractFleetMap:
             
             # Update tags
             self.agents[agent_id].tags = agent_data.get('tags', [])
-        
+            
         # Update tasks
         current_task_ids = set()
         for task_data in tasks_data:

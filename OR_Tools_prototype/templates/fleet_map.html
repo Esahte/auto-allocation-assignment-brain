@@ -409,20 +409,16 @@
         <h3>⚙️ Configuration</h3>
         <div class="config-grid">
             <div class="config-item">
-                <label>Assignment Radius (km)</label>
-                <input type="number" id="assignmentRadius" step="0.5" value="3.0">
-            </div>
-            <div class="config-item">
-                <label>Chain Lookahead Radius (km)</label>
-                <input type="number" id="chainRadius" step="0.5" value="5.0">
-            </div>
-            <div class="config-item">
                 <label>Max Distance (km)</label>
-                <input type="number" id="maxDistance" step="0.5" value="3.0">
+                <input type="number" id="maxDistance" step="0.5" value="3.0" title="Max distance for agent-task compatibility AND assignment trigger">
             </div>
             <div class="config-item">
-                <label>Optimization Cooldown (s)</label>
-                <input type="number" id="cooldown" step="5" value="30">
+                <label>Chain Lookahead (km)</label>
+                <input type="number" id="chainRadius" step="0.5" value="5.0" title="Distance to look ahead for chaining opportunities">
+            </div>
+            <div class="config-item">
+                <label>Cooldown (s)</label>
+                <input type="number" id="cooldown" step="5" value="30" title="Time between re-optimizations for same agent">
             </div>
             <div class="config-item" style="justify-content: flex-end;">
                 <button class="btn btn-primary" onclick="updateConfig()">Update Config</button>
@@ -549,7 +545,7 @@
                 const data = await resp.json();
                 
                 document.getElementById('triggerCount').textContent = data.count || 0;
-                document.getElementById('triggerRefresh').textContent = `Radius: ${data.assignment_radius_km}km`;
+                document.getElementById('triggerRefresh').textContent = `Radius: ${data.max_distance_km}km`;
                 
                 const list = document.getElementById('triggerList');
                 if (!data.triggers || data.triggers.length === 0) {
@@ -585,9 +581,8 @@
                 const resp = await fetch('/fleet-state/config');
                 const data = await resp.json();
                 
-                document.getElementById('assignmentRadius').value = data.assignment_radius_km || 3;
-                document.getElementById('chainRadius').value = data.chain_lookahead_radius_km || 5;
                 document.getElementById('maxDistance').value = data.max_distance_km || 3;
+                document.getElementById('chainRadius').value = data.chain_lookahead_radius_km || 5;
                 document.getElementById('cooldown').value = data.optimization_cooldown_seconds || 30;
             } catch (e) {
                 console.error('Failed to refresh config:', e);
@@ -597,9 +592,8 @@
         async function updateConfig() {
             try {
                 const config = {
-                    assignment_radius_km: parseFloat(document.getElementById('assignmentRadius').value),
-                    chain_lookahead_radius_km: parseFloat(document.getElementById('chainRadius').value),
                     max_distance_km: parseFloat(document.getElementById('maxDistance').value),
+                    chain_lookahead_radius_km: parseFloat(document.getElementById('chainRadius').value),
                     optimization_cooldown_seconds: parseFloat(document.getElementById('cooldown').value)
                 };
                 
@@ -610,7 +604,7 @@
                 });
                 
                 const data = await resp.json();
-                addLog('system', `Config updated: radius=${data.assignment_radius_km}km, cooldown=${data.optimization_cooldown_seconds}s`);
+                addLog('system', `Config updated: max_dist=${data.max_distance_km}km, chain=${data.chain_lookahead_radius_km}km, cooldown=${data.optimization_cooldown_seconds}s`);
             } catch (e) {
                 addLog('error', `Failed to update config: ${e.message}`);
             }
