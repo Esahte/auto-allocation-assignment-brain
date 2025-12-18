@@ -98,6 +98,10 @@ DEBOUNCE_DELAY_SECONDS = 0.5  # Wait 500ms before running optimization
 _sync_in_progress = False
 _sync_lock = threading.Lock()
 _optimization_pending_after_sync = False  # Queue optimization to run after sync
+
+# Task-level lock - prevents multiple proximity optimizations for the same task
+_tasks_being_optimized = set()  # Set of task IDs currently being optimized
+_task_optimization_lock = threading.Lock()
 _pending_trigger_type = None
 
 def is_sync_in_progress() -> bool:
@@ -397,6 +401,16 @@ def trigger_incremental_optimization(
     
     Emits same format as event-based optimization: fleet:routes_updated
     """
+    global _tasks_being_optimized
+    
+    # TASK-LEVEL LOCK: Prevent concurrent optimizations for the same task
+    with _task_optimization_lock:
+        if task_id in _tasks_being_optimized:
+            print(f"[FleetState] ⏳ Task {task_name} already being optimized - skipping {agent_name}")
+            return
+        # Mark this task as being optimized
+        _tasks_being_optimized.add(task_id)
+    
     print(f"[FleetState] 🚀 Proximity optimization: {agent_name} triggered by {task_name}")
     performance_stats["auto_optimizations"] += 1
     
@@ -410,6 +424,12 @@ def trigger_incremental_optimization(
                 'task_id': task_id,
                 'dashboard_url': dashboard_url
             })
+            return
+        
+        # EARLY CHECK: Verify task is still unassigned
+        task = fleet_state.get_task(str(task_id))
+        if task and task.status != TaskStatus.UNASSIGNED:
+            print(f"[FleetState] ⚠️ Task {task_name} already {task.status.name} - skipping optimization")
             return
         
         agent = fleet_state.get_agent(str(agent_id))
@@ -539,7 +559,7 @@ def trigger_incremental_optimization(
                             break
                     if not found:
                         print(f"  → {task_name}: {reason} - {reason_detail}")
-                else:
+        else:
                     print(f"  → {task_name}: {reason} - {reason_detail}")
         
         if assigned_count > 0:
@@ -562,6 +582,11 @@ def trigger_incremental_optimization(
         print(f"[FleetState] ❌ Proximity optimization failed: {e}")
         import traceback
         traceback.print_exc()
+    
+    finally:
+        # ALWAYS release the task lock
+        with _task_optimization_lock:
+            _tasks_being_optimized.discard(task_id)
 
 
 # =============================================================================
@@ -1858,9 +1883,8 @@ def recommend():
 @app.route('/recommend/batch-optimized', methods=['POST'])
 def recommend_batch_optimized():
     """Batch-optimized recommendation endpoint."""
-    start_time = time.time()
-    
     try:
+        start_time = time.time()
         data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
@@ -1985,7 +2009,7 @@ def get_fleet_agents():
             'last_update': agent.last_updated.isoformat()
         })
     
-    return jsonify({
+        return jsonify({
         'count': len(agents),
         'online': len([a for a in agents if a['status'] != 'offline']),
         'available': len([a for a in agents if a['has_capacity']]),
