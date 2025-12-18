@@ -657,7 +657,7 @@ class FleetState:
             task = self._tasks[task_id]
             
             # DUPLICATE CHECK: Skip if already assigned to this agent
-            if task.assigned_agent_id == agent_id and task.status in [TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS]:
+            if task.assigned_agent_id == agent_id and task.status in [TaskStatus.ASSIGNED, TaskStatus.PICKUP_IN_PROGRESS, TaskStatus.DELIVERY_IN_PROGRESS]:
                 # Already assigned to this agent - silently skip
                 return None
             
