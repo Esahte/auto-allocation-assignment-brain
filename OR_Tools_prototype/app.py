@@ -222,7 +222,7 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
     performance_stats["auto_optimizations"] += 1
     
     try:
-        start_time = time.time()
+    start_time = time.time()
         
         # Use dashboard_url from trigger_data, env var, or default
         default_dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
@@ -375,7 +375,7 @@ def trigger_incremental_optimization(
                     pickup_dt = dt.fromisoformat(pickup_before.replace('Z', '+00:00'))
                     time_to_pickup = (pickup_dt.replace(tzinfo=None) - dt.utcnow()).total_seconds() / 60
                     print(f"[FleetState] Task: {task_name} | pickup in {time_to_pickup:.1f}min | deadline: {delivery_before}")
-                else:
+            else:
                     print(f"[FleetState] Task: {task_name} | pickup: {pickup_before} | delivery: {delivery_before}")
             except Exception as e:
                 print(f"[FleetState] Task: {task_name} | pickup: {pickup_before} | delivery: {delivery_before}")
@@ -426,7 +426,7 @@ def trigger_incremental_optimization(
                         if ac.get('agent_name') == agent_name:
                             print(f"  → {task_name}: {ac.get('reason', reason)} - {ac.get('reason_detail', reason_detail)}")
                             break
-                else:
+        else:
                     print(f"  → {task_name}: {reason} - {reason_detail}")
         
         if assigned_count > 0:
@@ -1068,8 +1068,18 @@ def handle_task_completed(data):
             'received_at': datetime.now().isoformat(),
             'task_removed': True
         })
-    
-    # No auto-optimization - proximity triggers will handle next assignment
+        
+        # Trigger optimization if there are unassigned tasks and agent has capacity
+        unassigned_count = len([t for t in fleet_state.get_all_tasks() if t.status == TaskStatus.UNASSIGNED])
+        if unassigned_count > 0:
+            agent = fleet_state.get_agent(str(agent_id)) if agent_id else None
+            if agent and agent.has_capacity:
+                print(f"[FleetState] {agent_name} completed task, has capacity, {unassigned_count} unassigned tasks - triggering optimization")
+                trigger_debounced_optimization(
+                    trigger_type='task:completed',
+                    dashboard_url=dashboard_url,
+                    agent_id=str(agent_id)
+                )
 
 @socketio.on('pickup:completed')
 def handle_pickup_completed(data):
@@ -1665,7 +1675,7 @@ def handle_agent_location_update(data):
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({
+        return jsonify({
         "status": "healthy",
         "websocket_enabled": True,
         "connected_clients": len(connected_clients),
@@ -1706,8 +1716,8 @@ def recommend():
 @app.route('/recommend/batch-optimized', methods=['POST'])
 def recommend_batch_optimized():
     """Batch-optimized recommendation endpoint."""
-    start_time = time.time()
-    
+        start_time = time.time()
+        
     try:
         data = request.get_json()
         if not data:
@@ -1833,7 +1843,7 @@ def get_fleet_agents():
             'last_update': agent.last_updated.isoformat()
         })
     
-    return jsonify({
+        return jsonify({
         'count': len(agents),
         'online': len([a for a in agents if a['status'] != 'offline']),
         'available': len([a for a in agents if a['has_capacity']]),
