@@ -546,17 +546,32 @@ def handle_fleet_sync(data):
         # Apply config (if provided)
         config = data.get('config', {})
         if config:
+            print(f"[FleetState] Config received: {config}")
+            
             if 'default_max_distance_km' in config:
                 max_dist = float(config['default_max_distance_km'])
                 fleet_state.max_distance_km = max_dist
                 # Use max_distance as assignment radius too (consolidated)
                 fleet_state.assignment_radius_km = max_dist
+                print(f"[FleetState] → max_distance_km = {max_dist}km")
+            
             if 'chain_lookahead_radius_km' in config:
                 fleet_state.chain_lookahead_radius_km = float(config['chain_lookahead_radius_km'])
+                print(f"[FleetState] → chain_lookahead_radius_km = {fleet_state.chain_lookahead_radius_km}km")
+            
+            if 'max_lateness_minutes' in config:
+                fleet_state.max_lateness_minutes = int(config['max_lateness_minutes'])
+                print(f"[FleetState] → max_lateness_minutes = {fleet_state.max_lateness_minutes}min")
+            
+            if 'wallet_threshold' in config:
+                fleet_state.wallet_threshold = float(config['wallet_threshold'])
+                print(f"[FleetState] → wallet_threshold = ${fleet_state.wallet_threshold}")
+            
             if 'max_tasks_per_agent' in config:
                 new_capacity = int(config['max_tasks_per_agent'])
                 old_capacity = fleet_state.default_max_capacity
                 fleet_state.default_max_capacity = new_capacity
+                print(f"[FleetState] → max_tasks_per_agent = {new_capacity}")
                 # Update all existing agents that still have the old default
                 for agent in fleet_state.get_all_agents():
                     if agent.max_capacity == old_capacity:
@@ -576,10 +591,18 @@ def handle_fleet_sync(data):
                 'in_progress_tasks': len(in_progress_tasks),
                 'geofences': len(geofences)
             },
+            'config_applied': {
+                'max_distance_km': fleet_state.max_distance_km,
+                'max_lateness_minutes': fleet_state.max_lateness_minutes,
+                'wallet_threshold': fleet_state.wallet_threshold,
+                'max_tasks_per_agent': fleet_state.default_max_capacity,
+                'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km
+            },
             'fleet_stats': stats
         })
         
         print(f"[FleetState] ✅ Initial sync complete: {stats['online_agents']} agents, {stats['unassigned_tasks']} tasks")
+        print(f"[FleetState] Config: max_dist={fleet_state.max_distance_km}km, max_lateness={fleet_state.max_lateness_minutes}min, wallet=${fleet_state.wallet_threshold}")
         
     except Exception as e:
         print(f"[FleetState] ❌ Sync failed: {e}")
@@ -1582,6 +1605,9 @@ def fleet_state_config():
     if request.method == 'GET':
         return jsonify({
             'max_distance_km': fleet_state.max_distance_km,  # Also used as assignment trigger radius
+            'max_lateness_minutes': fleet_state.max_lateness_minutes,  # Max allowed delivery lateness
+            'wallet_threshold': fleet_state.wallet_threshold,  # Max wallet balance for cash orders
+            'max_tasks_per_agent': fleet_state.default_max_capacity,  # Agent capacity limit
             'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
             'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds
         }), 200
@@ -1599,6 +1625,12 @@ def fleet_state_config():
         radius = float(data['assignment_radius_km'])
         fleet_state.assignment_radius_km = radius
         fleet_state.max_distance_km = radius
+    if 'max_lateness_minutes' in data:
+        fleet_state.max_lateness_minutes = int(data['max_lateness_minutes'])
+    if 'wallet_threshold' in data:
+        fleet_state.wallet_threshold = float(data['wallet_threshold'])
+    if 'max_tasks_per_agent' in data:
+        fleet_state.default_max_capacity = int(data['max_tasks_per_agent'])
     if 'chain_lookahead_radius_km' in data:
         fleet_state.chain_lookahead_radius_km = float(data['chain_lookahead_radius_km'])
     if 'optimization_cooldown_seconds' in data:
@@ -1607,6 +1639,9 @@ def fleet_state_config():
     return jsonify({
         'message': 'Configuration updated',
         'max_distance_km': fleet_state.max_distance_km,
+        'max_lateness_minutes': fleet_state.max_lateness_minutes,
+        'wallet_threshold': fleet_state.wallet_threshold,
+        'max_tasks_per_agent': fleet_state.default_max_capacity,
         'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
         'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds
     }), 200
