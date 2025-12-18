@@ -559,7 +559,7 @@ def trigger_incremental_optimization(
                             break
                     if not found:
                         print(f"  → {task_name}: {reason} - {reason_detail}")
-        else:
+                else:
                     print(f"  → {task_name}: {reason} - {reason_detail}")
         
         if assigned_count > 0:
@@ -2009,7 +2009,7 @@ def get_fleet_agents():
             'last_update': agent.last_updated.isoformat()
         })
     
-        return jsonify({
+    return jsonify({
         'count': len(agents),
         'online': len([a for a in agents if a['status'] != 'offline']),
         'available': len([a for a in agents if a['has_capacity']]),
