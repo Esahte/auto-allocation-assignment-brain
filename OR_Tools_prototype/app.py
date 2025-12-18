@@ -1654,24 +1654,53 @@ def handle_task_updated(data):
     
     # Log the update
     changes_str = ', '.join(changes) if changes else 'no changes'
-    print(f"[WebSocket] task:updated: {restaurant_name} ({str(task_id)[:20]}...) → {changes_str}")
+    app.logger.info(f"[WebSocket] task:updated: {restaurant_name} ({str(task_id)[:20]}...) → {changes_str}")
     
+    # Determine if optimization should be triggered
+    # IMPORTANT: We trigger optimization if:
+    # 1. Task status changed to unassigned (needs reassignment)
+    # 2. Location changed (might affect which agents are eligible/nearby)
+    # 3. Time windows changed (might make previously infeasible assignments feasible)
+    # 4. Tags changed (might affect agent eligibility)
+    # 5. Declined_by changed (new agents might be eligible)
+    
+    should_optimize = False
+    optimization_reason = None
+    
+    # Check for changes that warrant optimization
+    routing_affecting_changes = {
+        'restaurant_location', 'delivery_location',
+        'pickup_before', 'delivery_before',
+        'tags', 'declined_by', 'max_distance_km'
+    }
+    
+    changed_routing_fields = routing_affecting_changes.intersection(set(changes))
+    
+    if status_changed_to_unassigned:
+        should_optimize = True
+        optimization_reason = 'task_unassigned'
+    elif changed_routing_fields and existing_task.status == TaskStatus.UNASSIGNED:
+        # Only optimize for field changes if task is still unassigned
+        should_optimize = True
+        optimization_reason = f'fields_changed:{",".join(changed_routing_fields)}'
+    
+    # Emit acknowledgment
     emit('task:updated_ack', {
         'id': task_id,
         'success': True,
         'changes': changes,
         'status_changed_to_unassigned': status_changed_to_unassigned,
+        'triggered_optimization': should_optimize,
         'received_at': datetime.now().isoformat()
     })
     
-    # If task was unassigned, trigger optimization to reassign it
-    if status_changed_to_unassigned:
-        print(f"[FleetState] Task {restaurant_name} now unassigned - triggering optimization")
-        # Use the same pattern as task:declined - debounced event-based optimization
+    # Trigger optimization with all safety nets (debouncing, sync lock, global lock)
+    if should_optimize:
+        app.logger.info(f"[FleetState] Task {restaurant_name} updated ({optimization_reason}) - triggering optimization")
+        # Use debounced optimization (same safety nets as task:created, task:declined)
         trigger_debounced_optimization(
-            trigger_type='task:updated_unassigned',
-            dashboard_url=dashboard_url,
-            task_id=task_id
+            trigger_type=f'task:updated:{optimization_reason}',
+            dashboard_url=dashboard_url
         )
 
 @socketio.on('task:assigned')
