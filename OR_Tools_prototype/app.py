@@ -619,6 +619,118 @@ def handle_fleet_sync(data):
             'received_at': datetime.now().isoformat()
         })
 
+@socketio.on('config:update')
+def handle_config_update(data):
+    """
+    Update fleet configuration dynamically.
+    
+    Payload:
+    {
+        "config": {
+            "default_max_distance_km": 3.0,
+            "max_lateness_minutes": 45,
+            "max_pickup_delay_minutes": 35,
+            "wallet_threshold": 2500,
+            "max_tasks_per_agent": 2,
+            "chain_lookahead_radius_km": 5.0
+        },
+        "dashboard_url": "https://..."
+    }
+    """
+    performance_stats["websocket_events"] += 1
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    print(f"[WebSocket] config:update received from dashboard")
+    
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        emit('config:update_ack', {
+            'success': False,
+            'error': 'Fleet state not available',
+            'received_at': datetime.now().isoformat()
+        })
+        return
+    
+    config = data.get('config', {})
+    if not config:
+        emit('config:update_ack', {
+            'success': False,
+            'error': 'No config provided',
+            'received_at': datetime.now().isoformat()
+        })
+        return
+    
+    try:
+        changes = []
+        
+        if 'default_max_distance_km' in config:
+            old_val = fleet_state.max_distance_km
+            max_dist = float(config['default_max_distance_km'])
+            fleet_state.max_distance_km = max_dist
+            fleet_state.assignment_radius_km = max_dist  # Keep them in sync
+            changes.append(f"max_distance_km: {old_val} → {max_dist}")
+        
+        if 'max_lateness_minutes' in config:
+            old_val = fleet_state.max_lateness_minutes
+            fleet_state.max_lateness_minutes = int(config['max_lateness_minutes'])
+            changes.append(f"max_lateness_minutes: {old_val} → {fleet_state.max_lateness_minutes}")
+        
+        if 'max_pickup_delay_minutes' in config:
+            old_val = fleet_state.max_pickup_delay_minutes
+            fleet_state.max_pickup_delay_minutes = int(config['max_pickup_delay_minutes'])
+            changes.append(f"max_pickup_delay_minutes: {old_val} → {fleet_state.max_pickup_delay_minutes}")
+        
+        if 'wallet_threshold' in config:
+            old_val = fleet_state.wallet_threshold
+            fleet_state.wallet_threshold = float(config['wallet_threshold'])
+            changes.append(f"wallet_threshold: {old_val} → {fleet_state.wallet_threshold}")
+        
+        if 'max_tasks_per_agent' in config:
+            old_val = fleet_state.default_max_capacity
+            new_capacity = int(config['max_tasks_per_agent'])
+            fleet_state.default_max_capacity = new_capacity
+            # Update all existing agents that still have the old default
+            for agent in fleet_state.get_all_agents():
+                if agent.max_capacity == old_val:
+                    agent.max_capacity = new_capacity
+            changes.append(f"max_tasks_per_agent: {old_val} → {new_capacity}")
+        
+        if 'chain_lookahead_radius_km' in config:
+            old_val = fleet_state.chain_lookahead_radius_km
+            fleet_state.chain_lookahead_radius_km = float(config['chain_lookahead_radius_km'])
+            changes.append(f"chain_lookahead_radius_km: {old_val} → {fleet_state.chain_lookahead_radius_km}")
+        
+        # Log changes
+        if changes:
+            print(f"[FleetState] ✅ Config updated:")
+            for change in changes:
+                print(f"  → {change}")
+        else:
+            print(f"[FleetState] ℹ️ No config changes applied")
+        
+        emit('config:update_ack', {
+            'success': True,
+            'received_at': datetime.now().isoformat(),
+            'changes': changes,
+            'config_applied': {
+                'max_distance_km': fleet_state.max_distance_km,
+                'max_lateness_minutes': fleet_state.max_lateness_minutes,
+                'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
+                'wallet_threshold': fleet_state.wallet_threshold,
+                'max_tasks_per_agent': fleet_state.default_max_capacity,
+                'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km
+            }
+        })
+        
+    except Exception as e:
+        print(f"[FleetState] ❌ Config update failed: {e}")
+        import traceback
+        traceback.print_exc()
+        emit('config:update_ack', {
+            'success': False,
+            'error': str(e),
+            'received_at': datetime.now().isoformat()
+        })
+
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handle client disconnection."""
