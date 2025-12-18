@@ -239,6 +239,15 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         result['trigger_data'] = trigger_data
         result['total_execution_time_seconds'] = round(execution_time, 3)
         
+        # OPTIMISTIC UPDATE: Mark tasks as assigned immediately to prevent race conditions
+        for route in result.get('agent_routes', []):
+            agent_id = route.get('driver_id')
+            agent_name = route.get('driver_name', 'Unknown')
+            new_tasks = route.get('assigned_new_tasks', [])
+            if new_tasks and agent_id and fleet_state:
+                for assigned_task_id in new_tasks:
+                    fleet_state.assign_task(assigned_task_id, str(agent_id), agent_name)
+        
         # Emit updated routes to all connected clients
         # Includes: agent_routes, unassigned_tasks (with agents_considered), metadata, compatibility
         emit('fleet:routes_updated', result, broadcast=True)
@@ -421,14 +430,17 @@ def trigger_incremental_optimization(
                     print(f"  → {task_name}: {reason} - {reason_detail}")
         
         if assigned_count > 0:
-            # Emit result (same base format as event-based, minus unassigned_tasks)
-            emit('fleet:routes_updated', result, broadcast=True)
-            
-            # Log what was assigned
+            # OPTIMISTIC UPDATE: Mark tasks as assigned immediately to prevent race conditions
+            # This prevents other triggers from picking up the same task while dashboard processes
             for route in result.get('agent_routes', []):
                 new_tasks = route.get('assigned_new_tasks', [])
                 if new_tasks:
+                    for assigned_task_id in new_tasks:
+                        fleet_state.assign_task(assigned_task_id, agent_id, agent_name)
                     print(f"[FleetState] ✅ Proximity assigned {len(new_tasks)} task(s) to {agent_name}: {new_tasks}")
+            
+            # Emit result (same base format as event-based, minus unassigned_tasks)
+            emit('fleet:routes_updated', result, broadcast=True)
         else:
             print(f"[FleetState] ⚠️ Proximity trigger but no assignment possible for {agent_name}")
             # Don't emit for proximity if nothing assigned - no need to spam dashboard
@@ -659,6 +671,15 @@ def handle_fleet_optimize(data):
         result['request_id'] = request_id
         result['total_execution_time_seconds'] = round(execution_time, 3)
         
+        # OPTIMISTIC UPDATE: Mark tasks as assigned immediately to prevent race conditions
+        for route in result.get('agent_routes', []):
+            agent_id = route.get('driver_id')
+            agent_name = route.get('driver_name', 'Unknown')
+            new_tasks = route.get('assigned_new_tasks', [])
+            if new_tasks and agent_id and fleet_state:
+                for assigned_task_id in new_tasks:
+                    fleet_state.assign_task(assigned_task_id, str(agent_id), agent_name)
+        
         emit('fleet:routes_updated', result)
         
         assigned = result.get('metadata', {}).get('tasks_assigned', 0)
@@ -751,14 +772,19 @@ def handle_task_created(data):
         'id': task_id,
         'received_at': datetime.now().isoformat(),
         'added_to_fleet_state': True,
-        'triggered_optimization': True
+        'triggered_optimization': triggered_optimization
     })
     
-    # EVENT-BASED: Immediately try to assign the new task
-    trigger_fleet_optimization('task:created', {
-        'id': task_id,
-        'dashboard_url': dashboard_url
-    })
+    # EVENT-BASED: Only trigger if proximity didn't already assign the task
+    # Check if task is still unassigned after proximity optimization
+    task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
+    if task_after and task_after.status == TaskStatus.UNASSIGNED:
+        trigger_fleet_optimization('task:created', {
+            'id': task_id,
+            'dashboard_url': dashboard_url
+        })
+    elif task_after:
+        print(f"[FleetState] ⏩ Skipping event-based optimization - task already {task_after.status.value}")
 
 @socketio.on('task:declined')
 def handle_task_declined(data):
@@ -993,13 +1019,15 @@ def handle_task_assigned(data):
     agent_name = data.get('agent_name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
-    
-    # Update fleet state
+    # Update fleet state (returns None if already assigned to this agent)
+    task = None
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
         task = fleet_state.assign_task(task_id, str(agent_id), agent_name)
-        if task:
-            print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
+    
+    # Only log if this was a new assignment (not a duplicate)
+    if task:
+        print(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
+        print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
     
     emit('task:assigned_ack', {
         'id': task_id,

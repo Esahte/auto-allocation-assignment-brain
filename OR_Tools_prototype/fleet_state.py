@@ -641,6 +641,9 @@ class FleetState:
             task_id: The task to assign
             agent_id: The agent to assign it to
             agent_name: Optional agent name for logging
+            
+        Returns:
+            TaskState if assignment was made, None if task not found or already assigned to same agent
         """
         with self._lock:
             # Convert to strings for consistent lookup
@@ -652,6 +655,12 @@ class FleetState:
                 return None
             
             task = self._tasks[task_id]
+            
+            # DUPLICATE CHECK: Skip if already assigned to this agent
+            if task.assigned_agent_id == agent_id and task.status in [TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS]:
+                # Already assigned to this agent - silently skip
+                return None
+            
             task.assigned_agent_id = agent_id
             task.status = TaskStatus.ASSIGNED
             task.last_updated = datetime.now(timezone.utc)
