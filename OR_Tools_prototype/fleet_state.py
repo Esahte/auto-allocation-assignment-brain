@@ -1046,6 +1046,7 @@ class FleetState:
         
         Business Rules Checked:
         0. Priority - Priority 1 agents only get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        0b. Tag Matching - TEST agents only get TEST tasks, tagged tasks go to matching agents
         1. Declined - Agent hasn't declined this task
         2. Capacity - Agent has room for more tasks
         3. Online - Agent is not offline
@@ -1059,6 +1060,31 @@ class FleetState:
         if agent.priority == 1:
             if not task.is_premium_task:
                 return "priority1_non_premium"
+        
+        # 0b. TAG MATCHING RULES
+        # Normalize tags for comparison (lowercase, replace - and space with _)
+        agent_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in agent.tags]
+        task_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in task.tags] if task.tags else []
+        
+        # Check if agent has TEST/INTERNAL tag
+        agent_is_test = any(t in ['test', 'internal'] for t in agent_tags_lower)
+        # Check if task has TEST/INTERNAL tag
+        task_is_test = any(t in ['test', 'internal'] for t in task_tags_lower)
+        
+        # Rule: TEST agents can ONLY get TEST tasks
+        if agent_is_test and not task_is_test:
+            return "test_agent_non_test_task"
+        
+        # Rule: TEST tasks can ONLY go to TEST agents
+        if task_is_test and not agent_is_test:
+            return "test_task_non_test_agent"
+        
+        # Rule: If task has other tags (excluding TEST), agent must have at least one matching tag
+        non_test_task_tags = [t for t in task_tags_lower if t not in ['test', 'internal']]
+        if non_test_task_tags:
+            non_test_agent_tags = [t for t in agent_tags_lower if t not in ['test', 'internal']]
+            if not any(tag in non_test_agent_tags for tag in non_test_task_tags):
+                return "tag_mismatch"
         
         # 1. Check if agent declined this task
         if task.was_declined_by(agent.id):

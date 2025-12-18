@@ -479,10 +479,29 @@ class CompatibilityChecker:
         if task.payment_type == "CASH" and agent.wallet_balance > self.wallet_threshold:
             return False, "wallet_threshold_exceeded"
         
-        # Rule 4: Tag Matching - Task tags must match agent tags
-        # task.tags must be a non-empty list for tag filtering to apply
-        if task.tags and len(task.tags) > 0:
-            if not any(tag in agent.tags for tag in task.tags):
+        # Rule 4: Tag Matching
+        # Normalize tags for comparison (lowercase, replace - and space with _)
+        agent_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in agent.tags]
+        task_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in task.tags] if task.tags else []
+        
+        # Check if agent has TEST/INTERNAL tag
+        agent_is_test = any(t in ['test', 'internal'] for t in agent_tags_lower)
+        # Check if task has TEST/INTERNAL tag
+        task_is_test = any(t in ['test', 'internal'] for t in task_tags_lower)
+        
+        # Rule 4a: TEST agents can ONLY get TEST tasks
+        if agent_is_test and not task_is_test:
+            return False, "test_agent_non_test_task"
+        
+        # Rule 4b: TEST tasks can ONLY go to TEST agents
+        if task_is_test and not agent_is_test:
+            return False, "test_task_non_test_agent"
+        
+        # Rule 4c: If task has tags (excluding TEST), agent must have at least one matching tag
+        non_test_task_tags = [t for t in task_tags_lower if t not in ['test', 'internal']]
+        if non_test_task_tags:
+            non_test_agent_tags = [t for t in agent_tags_lower if t not in ['test', 'internal']]
+            if not any(tag in non_test_agent_tags for tag in non_test_task_tags):
                 return False, "tag_mismatch"
         
         # Rule 5: Scooter Geofence - Both locations must be in geofence
