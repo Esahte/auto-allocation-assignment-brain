@@ -26,6 +26,10 @@ import math
 
 OSRM_SERVER = "https://osrm-caribbean-785077267034.us-central1.run.app"
 
+# Maximum allowed lateness for deliveries (in minutes)
+# If a new task assignment would make ANY delivery (new or existing) later than this, drop the new task
+DEFAULT_MAX_LATENESS_MINUTES = 45
+
 # =============================================================================
 # HTTP SESSION WITH RETRY LOGIC
 # =============================================================================
@@ -341,11 +345,13 @@ class CompatibilityChecker:
                  wallet_threshold: float = DEFAULT_WALLET_THRESHOLD,
                  geofence_regions: List[GeofenceRegion] = None,
                  max_distance_km: float = None,
-                 prefilter_distance: bool = True):
+                 prefilter_distance: bool = True,
+                 max_lateness_minutes: int = DEFAULT_MAX_LATENESS_MINUTES):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
         self.max_distance_km = max_distance_km  # Max distance for assignment
         self.prefilter_distance = prefilter_distance  # Whether to pre-filter by distance
+        self.max_lateness_minutes = max_lateness_minutes  # Max allowed delivery lateness
         self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
@@ -750,6 +756,9 @@ class FleetOptimizer:
         # In THOROUGH mode, let routing cost handle distance naturally
         self.max_distance_km = getattr(compatibility_checker, 'max_distance_km', None) if prefilter_distance else None
         
+        # Store max lateness for post-solution validation
+        self.max_lateness_minutes = getattr(compatibility_checker, 'max_lateness_minutes', DEFAULT_MAX_LATENESS_MINUTES)
+        
         # Build compatibility matrix
         self.compatibility_matrix = compatibility_checker.build_compatibility_matrix(
             agents, unassigned_tasks
@@ -1134,9 +1143,10 @@ class FleetOptimizer:
             # Allow late pickup with grace period (food can wait a bit)
             time_dimension.CumulVar(pickup_index).SetMax(pickup_ready_time + 3600)  # 1hr grace for pickup
             
-            # Delivery: This is the real deadline - prioritize this!
-            # Allow some grace but less than pickup
-            time_dimension.CumulVar(delivery_index).SetMax(delivery_deadline + 1800)  # 30min grace for delivery
+            # Delivery: Use configurable max lateness as hard constraint
+            # This is the real deadline - prioritize this!
+            max_lateness_grace = self.max_lateness_minutes * 60  # Convert to seconds
+            time_dimension.CumulVar(delivery_index).SetMax(delivery_deadline + max_lateness_grace)
         
         # Add pickup-delivery constraints
         for pickup_idx, delivery_idx in pickup_delivery_pairs:
@@ -1340,14 +1350,89 @@ class FleetOptimizer:
                 
                 index = solution.Value(routing.NextVar(index))
             
+            # ================================================================
+            # POST-SOLUTION LATENESS VALIDATION
+            # ================================================================
+            # Check if adding new tasks causes ANY delivery to exceed max lateness
+            # If so, reject the new task assignments to protect existing deliveries
+            
+            max_lateness_seconds = self.max_lateness_minutes * 60
+            rejected_new_tasks = []
+            
+            if assigned_new_tasks:
+                # Check lateness for all delivery stops
+                max_delivery_lateness = 0
+                max_existing_delivery_lateness = 0
+                late_existing_tasks = []
+                
+                for stop in route_stops:
+                    if 'lateness_seconds' in stop:
+                        lateness = stop.get('lateness_seconds', 0)
+                        max_delivery_lateness = max(max_delivery_lateness, lateness)
+                        
+                        # Track lateness specifically for EXISTING tasks
+                        if stop['type'].startswith('existing_task'):
+                            max_existing_delivery_lateness = max(max_existing_delivery_lateness, lateness)
+                            if lateness > max_lateness_seconds:
+                                late_existing_tasks.append({
+                                    'task_id': stop['task_id'],
+                                    'restaurant_name': stop.get('restaurant_name', ''),
+                                    'lateness_minutes': lateness // 60
+                                })
+                
+                # RULE: If new tasks cause existing tasks to exceed max lateness, reject the new tasks
+                if late_existing_tasks and assigned_new_tasks:
+                    print(f"[FleetOptimizer] ⚠️ LATENESS VIOLATION for {agent.name}:")
+                    print(f"  → New tasks would make {len(late_existing_tasks)} existing delivery(ies) >{self.max_lateness_minutes}min late")
+                    for lt in late_existing_tasks:
+                        print(f"    - {lt['restaurant_name']}: {lt['lateness_minutes']}min late")
+                    print(f"  → Rejecting {len(assigned_new_tasks)} new task(s) to protect existing deliveries")
+                    
+                    # Move new tasks to rejected (they'll be added to unassigned)
+                    rejected_new_tasks = assigned_new_tasks.copy()
+                    assigned_new_tasks.clear()
+                    
+                    # Also remove new task stops from the route
+                    route_stops = [s for s in route_stops if not s['type'].startswith('new_task')]
+                    
+                    # Remove from global assigned set
+                    for task_id in rejected_new_tasks:
+                        assigned_task_ids.discard(task_id)
+                
+                # RULE: Also reject new tasks if THEY themselves would be too late
+                elif max_delivery_lateness > max_lateness_seconds and assigned_new_tasks:
+                    # Find which new tasks are too late
+                    too_late_new_tasks = []
+                    for stop in route_stops:
+                        if stop['type'] == 'new_task_delivery':
+                            lateness = stop.get('lateness_seconds', 0)
+                            if lateness > max_lateness_seconds:
+                                too_late_new_tasks.append(stop['task_id'])
+                    
+                    if too_late_new_tasks:
+                        print(f"[FleetOptimizer] ⚠️ NEW TASK TOO LATE for {agent.name}:")
+                        print(f"  → {len(too_late_new_tasks)} new task(s) would be >{self.max_lateness_minutes}min late - rejecting")
+                        
+                        rejected_new_tasks = too_late_new_tasks
+                        assigned_new_tasks = [t for t in assigned_new_tasks if t not in too_late_new_tasks]
+                        
+                        # Remove late new task stops from the route
+                        route_stops = [s for s in route_stops if s.get('task_id') not in too_late_new_tasks]
+                        
+                        # Remove from global assigned set
+                        for task_id in too_late_new_tasks:
+                            assigned_task_ids.discard(task_id)
+            
             # Build route info
             route_info = {
                 'agent_id': agent.id,
                 'agent_name': agent.name,
                 'assigned_new_tasks': assigned_new_tasks,
+                'rejected_due_to_lateness': rejected_new_tasks,
                 'total_stops': len(route_stops),
                 'route': route_stops,
-                'total_lateness_seconds': sum(s.get('lateness_seconds', 0) for s in route_stops)
+                'total_lateness_seconds': sum(s.get('lateness_seconds', 0) for s in route_stops),
+                'max_lateness_minutes_setting': self.max_lateness_minutes
             }
             
             # Generate Google Maps URL
@@ -1391,6 +1476,12 @@ class FleetOptimizer:
                 'agents_considered': agent_details
             })
         
+        # Collect tasks rejected due to lateness
+        lateness_rejected_task_ids = set()
+        for route in agent_routes:
+            for task_id in route.get('rejected_due_to_lateness', []):
+                lateness_rejected_task_ids.add(task_id)
+        
         # Then add routable tasks that were in the routing model but not assigned
         for task in getattr(self, 'routable_tasks', []):
             if task.id not in assigned_task_ids:
@@ -1411,7 +1502,11 @@ class FleetOptimizer:
                             compatible_agents.append(agent.name)
                 
                 # Determine primary reason
-                if compatible_agents:
+                if task.id in lateness_rejected_task_ids:
+                    # Task was rejected due to lateness constraint
+                    primary_reason = "would_cause_excessive_lateness"
+                    reason_detail = f"Assignment would cause delivery to be >{self.max_lateness_minutes}min late"
+                elif compatible_agents:
                     # Had compatible agents but solver couldn't fit it
                     primary_reason = "no_feasible_route"
                     reason_detail = f"Compatible with {', '.join(compatible_agents)} but no feasible time slot"
@@ -1432,6 +1527,9 @@ class FleetOptimizer:
         # Get compatibility stats
         compat_stats = getattr(self.compatibility_checker, 'compatibility_stats', {})
         
+        # Count tasks rejected due to lateness
+        tasks_rejected_for_lateness = len(lateness_rejected_task_ids)
+        
         return {
             'success': True,
             'metadata': {
@@ -1439,6 +1537,8 @@ class FleetOptimizer:
                 'total_unassigned_tasks': len(self.unassigned_tasks),
                 'tasks_assigned': len(assigned_task_ids),
                 'tasks_unassigned': len(unassigned_tasks),
+                'tasks_rejected_for_lateness': tasks_rejected_for_lateness,
+                'max_lateness_minutes_setting': self.max_lateness_minutes,
                 'total_lateness_seconds': int(total_lateness),
                 'optimization_time_seconds': round(solve_time, 3),
                 'solver': 'or_tools_vrp'
@@ -1539,15 +1639,17 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     settings = agents_data.get('settings_used', {})
     wallet_threshold = settings.get('walletNoCashThreshold', DEFAULT_WALLET_THRESHOLD)
     max_distance_km = settings.get('maxDistanceKm', None)  # Max distance for assignment
+    max_lateness_minutes = settings.get('maxLatenessMinutes', DEFAULT_MAX_LATENESS_MINUTES)  # Max allowed delivery lateness
     
-    print(f"[optimize_fleet] Settings: wallet_threshold={wallet_threshold}, max_distance_km={max_distance_km}")
+    print(f"[optimize_fleet] Settings: wallet_threshold={wallet_threshold}, max_distance_km={max_distance_km}, max_lateness_minutes={max_lateness_minutes}")
     
     # Build compatibility checker
     compatibility_checker = CompatibilityChecker(
         wallet_threshold=wallet_threshold,
         geofence_regions=geofences,
         max_distance_km=max_distance_km,
-        prefilter_distance=prefilter_distance
+        prefilter_distance=prefilter_distance,
+        max_lateness_minutes=max_lateness_minutes
     )
     
     # Run optimizer
