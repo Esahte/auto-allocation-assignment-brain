@@ -1039,24 +1039,50 @@ def handle_task_accepted(data):
 def handle_agent_online(data):
     """
     Agent came online → Update state and check for nearby tasks.
-    Payload: { agent_id, name, location, dashboard_url, priority? }
+    
+    Payload (same format as sync agents):
+    {
+        "agent_id": "123456",       // or "id"
+        "name": "John Smith",
+        "location": [17.125, -61.827],
+        "max_capacity": 2,
+        "tags": ["NoCash", "scooter"],
+        "wallet_balance": 1500.00,
+        "priority": 1,              // Optional: only for priority agents
+        "dashboard_url": "..."
+    }
     """
     performance_stats["websocket_events"] += 1
-    agent_id = data.get('agent_id')
+    
+    # Parse agent data (support both 'agent_id' and 'id' keys)
+    agent_id = data.get('agent_id') or data.get('id')
     name = data.get('name', 'Unknown')
     location = data.get('location')
-    priority = data.get('priority')  # Optional: 1, 2, etc. for priority agents
+    priority = data.get('priority')
+    max_capacity = data.get('max_capacity')
+    tags = data.get('tags', [])
+    wallet_balance = data.get('wallet_balance')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
+    # Build log string with key info
     priority_str = f" [Priority {priority}]" if priority else ""
-    print(f"[WebSocket] agent:online: {name} ({agent_id}){priority_str}")
+    tags_str = f" tags={tags}" if tags else ""
+    print(f"[WebSocket] agent:online: {name} ({agent_id}){priority_str}{tags_str}")
     
-    # Update fleet state
+    # Update fleet state with full agent profile
     if FLEET_STATE_AVAILABLE and fleet_state and agent_id:
         loc_tuple = tuple(location) if location and len(location) >= 2 else None
-        agent = fleet_state.set_agent_online(str(agent_id), name=name, location=loc_tuple, priority=priority)
+        agent = fleet_state.set_agent_online(
+            str(agent_id),
+            name=name,
+            location=loc_tuple,
+            priority=priority,
+            max_capacity=int(max_capacity) if max_capacity else None,
+            tags=tags,
+            wallet_balance=float(wallet_balance) if wallet_balance is not None else None
+        )
         if agent:
-            print(f"[FleetState] Agent online: {name} at {agent.current_location}{priority_str}")
+            print(f"[FleetState] Agent online: {name} at {agent.current_location}{priority_str} capacity={agent.max_capacity}")
             
             # Check for nearby tasks
             nearby_tasks = fleet_state.find_tasks_near_agent(str(agent_id))

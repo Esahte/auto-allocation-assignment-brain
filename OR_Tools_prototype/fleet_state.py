@@ -431,11 +431,26 @@ class FleetState:
         agent_id: str,
         name: Optional[str] = None,
         location: Optional[Tuple[float, float]] = None,
-        priority: Optional[int] = None
+        priority: Optional[int] = None,
+        max_capacity: Optional[int] = None,
+        tags: Optional[List[str]] = None,
+        wallet_balance: Optional[float] = None
     ) -> Optional[AgentState]:
-        """Mark agent as online"""
+        """
+        Mark agent as online with full profile data (same format as sync).
+        
+        Args:
+            agent_id: Unique agent identifier
+            name: Agent's display name
+            location: (lat, lng) tuple
+            priority: Priority level (1 = highest, for premium tasks only)
+            max_capacity: Max tasks agent can handle (default 2)
+            tags: List of tags like ["NoCash", "scooter", "Priority1"]
+            wallet_balance: Current cash on hand
+        """
         with self._lock:
             if agent_id in self._agents:
+                # Update existing agent
                 agent = self._agents[agent_id]
                 agent.status = AgentStatus.IDLE
                 if name:
@@ -444,18 +459,27 @@ class FleetState:
                     agent.current_location = Location(lat=location[0], lng=location[1])
                 if priority is not None:
                     agent.priority = priority
+                if max_capacity is not None:
+                    agent.max_capacity = max_capacity
+                if tags is not None:
+                    agent.tags = tags
+                if wallet_balance is not None:
+                    agent.wallet_balance = wallet_balance
                 agent.last_updated = datetime.now(timezone.utc)
                 priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
                 logger.info(f"[FleetState] Agent online: {agent.name}{priority_str}")
                 return agent
             elif location:
-                # Create new agent
+                # Create new agent with full profile
                 agent = AgentState(
                     id=agent_id,
                     name=name or f"Agent {agent_id}",
                     current_location=Location(lat=location[0], lng=location[1]),
                     status=AgentStatus.IDLE,
-                    priority=priority
+                    priority=priority,
+                    max_capacity=max_capacity or 2,
+                    tags=tags or [],
+                    wallet_balance=wallet_balance or 0.0
                 )
                 self._agents[agent_id] = agent
                 priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
