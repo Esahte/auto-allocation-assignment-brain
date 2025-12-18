@@ -498,6 +498,39 @@ class FleetState:
                 return agent
             return None
     
+    def update_agent(
+        self,
+        agent_id: str,
+        name: Optional[str] = None,
+        max_capacity: Optional[int] = None,
+        tags: Optional[List[str]] = None,
+        priority: Optional[int] = None,
+        wallet_balance: Optional[float] = None
+    ) -> Optional[AgentState]:
+        """
+        Update agent profile settings (not location).
+        Only updates fields that are provided (not None).
+        """
+        with self._lock:
+            if agent_id not in self._agents:
+                return None
+            
+            agent = self._agents[agent_id]
+            
+            if name is not None:
+                agent.name = name
+            if max_capacity is not None:
+                agent.max_capacity = max_capacity
+            if tags is not None:
+                agent.tags = tags
+            if priority is not None:
+                agent.priority = priority
+            if wallet_balance is not None:
+                agent.wallet_balance = wallet_balance
+            
+            agent.last_updated = datetime.now(timezone.utc)
+            return agent
+    
     def update_agent_tasks(
         self,
         agent_id: str,

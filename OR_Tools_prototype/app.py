@@ -1142,6 +1142,70 @@ def handle_agent_offline(data):
     
     # No auto-optimization - tasks will remain unassigned until manually reassigned or proximity trigger
 
+
+@socketio.on('agent:update')
+def handle_agent_update(data):
+    """
+    Agent profile updated → Update their settings in fleet state.
+    
+    Payload:
+    {
+        "agent_id": "2068032",
+        "name": "Esahtengang Asonganyi",
+        "max_capacity": 3,
+        "tags": ["INTERNAL", "HEAVY"],
+        "priority": 1,
+        "wallet_balance": 500.00,
+        "dashboard_url": "https://..."
+    }
+    """
+    performance_stats["websocket_events"] += 1
+    
+    agent_id = data.get('agent_id') or data.get('id')
+    name = data.get('name')
+    max_capacity = data.get('max_capacity')
+    tags = data.get('tags')
+    priority = data.get('priority')
+    wallet_balance = data.get('wallet_balance')
+    
+    # Build update summary for logging
+    updates = []
+    if max_capacity is not None:
+        updates.append(f"capacity={max_capacity}")
+    if tags is not None:
+        updates.append(f"tags={tags}")
+    if priority is not None:
+        updates.append(f"priority={priority}")
+    if wallet_balance is not None:
+        updates.append(f"wallet=${wallet_balance}")
+    
+    update_str = ", ".join(updates) if updates else "no changes"
+    print(f"[WebSocket] agent:update: {name or agent_id} → {update_str}")
+    
+    # Update fleet state
+    updated = False
+    if FLEET_STATE_AVAILABLE and fleet_state and agent_id:
+        agent = fleet_state.update_agent(
+            str(agent_id),
+            name=name,
+            max_capacity=int(max_capacity) if max_capacity is not None else None,
+            tags=tags,
+            priority=priority,
+            wallet_balance=float(wallet_balance) if wallet_balance is not None else None
+        )
+        if agent:
+            updated = True
+            print(f"[FleetState] ✓ Updated {agent.name}: capacity={agent.max_capacity}, tags={agent.tags}")
+        else:
+            print(f"[FleetState] ⚠️ Agent {agent_id} not found in fleet state")
+    
+    emit('agent:update_ack', {
+        'agent_id': agent_id,
+        'received_at': datetime.now().isoformat(),
+        'updated': updated
+    })
+
+
 # -----------------------------------------------------------------------------
 # EVENTS THAT JUST TRACK (no auto-optimization - too frequent)
 # -----------------------------------------------------------------------------
