@@ -86,6 +86,109 @@ def _should_log_location(agent_id: str) -> bool:
         return True
     return False
 
+# Debouncing for event-based optimization
+# Prevents redundant runs when multiple events fire in quick succession
+import threading
+_pending_optimization_timer = None
+_optimization_epoch = 0
+_optimization_lock = threading.Lock()
+DEBOUNCE_DELAY_SECONDS = 0.5  # Wait 500ms before running optimization
+
+# Sync lock - prevents optimizations during fleet sync
+_sync_in_progress = False
+_sync_lock = threading.Lock()
+_optimization_pending_after_sync = False  # Queue optimization to run after sync
+_pending_trigger_type = None
+
+def is_sync_in_progress() -> bool:
+    """Check if a fleet sync is currently in progress."""
+    with _sync_lock:
+        return _sync_in_progress
+
+def queue_optimization_after_sync(trigger_type: str):
+    """Queue an optimization to run after sync completes."""
+    global _optimization_pending_after_sync, _pending_trigger_type
+    with _sync_lock:
+        _optimization_pending_after_sync = True
+        _pending_trigger_type = trigger_type
+        print(f"[FleetState] 📋 Queued optimization ({trigger_type}) to run after sync")
+
+def set_sync_in_progress(value: bool):
+    """Set the sync in progress flag."""
+    global _sync_in_progress, _optimization_pending_after_sync, _pending_trigger_type
+    with _sync_lock:
+        _sync_in_progress = value
+        if value:
+            print("[FleetState] 🔒 Sync started - blocking optimizations")
+            _optimization_pending_after_sync = False  # Reset queue
+            _pending_trigger_type = None
+        else:
+            print("[FleetState] 🔓 Sync complete - optimizations unblocked")
+            # Check if optimization was queued during sync
+            if _optimization_pending_after_sync:
+                trigger = _pending_trigger_type or 'post_sync'
+                _optimization_pending_after_sync = False
+                _pending_trigger_type = None
+                print(f"[FleetState] ▶️ Running queued optimization ({trigger})")
+                # Schedule with small delay to let sync fully complete
+                timer = threading.Timer(0.2, lambda: trigger_debounced_optimization(f'{trigger}_post_sync'))
+                timer.start()
+
+def trigger_debounced_optimization(trigger_type: str, dashboard_url: str = None, agent_id: str = None):
+    """
+    Schedule a debounced fleet optimization.
+    
+    If called multiple times in quick succession, only the last call
+    will actually trigger the optimization (after DEBOUNCE_DELAY_SECONDS).
+    
+    This prevents:
+    - Duplicate optimizations when task:created + proximity trigger fire together
+    - Stale optimizations from older events
+    - Optimizations during sync (would see incomplete state)
+    """
+    global _pending_optimization_timer, _optimization_epoch
+    
+    # Block if sync is in progress - queue to run after sync
+    if is_sync_in_progress():
+        print(f"[Debounce] ⚠️ Sync in progress - queuing {trigger_type} for after sync")
+        queue_optimization_after_sync(trigger_type)
+        return
+    
+    with _optimization_lock:
+        # Cancel any pending optimization
+        if _pending_optimization_timer is not None:
+            _pending_optimization_timer.cancel()
+            print(f"[Debounce] Cancelled pending optimization (new trigger: {trigger_type})")
+        
+        # Increment epoch to invalidate any in-flight optimizations
+        _optimization_epoch += 1
+        current_epoch = _optimization_epoch
+        
+        # Get default dashboard URL
+        if dashboard_url is None:
+            dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
+        
+        def run_optimization():
+            global _pending_optimization_timer
+            with _optimization_lock:
+                # Check if this optimization is still valid (epoch hasn't changed)
+                if current_epoch != _optimization_epoch:
+                    print(f"[Debounce] Skipping stale optimization (epoch {current_epoch} != {_optimization_epoch})")
+                    return
+                _pending_optimization_timer = None
+            
+            # Run the actual optimization
+            print(f"[Debounce] Running optimization for: {trigger_type}")
+            trigger_fleet_optimization(trigger_type, {
+                'dashboard_url': dashboard_url,
+                'agent_id': agent_id
+            })
+        
+        # Schedule the optimization
+        _pending_optimization_timer = threading.Timer(DEBOUNCE_DELAY_SECONDS, run_optimization)
+        _pending_optimization_timer.start()
+        print(f"[Debounce] Scheduled optimization in {DEBOUNCE_DELAY_SECONDS}s for: {trigger_type}")
+
 # Add import for batch optimization
 try:
     from OR_tool_prototype_batch_optimized import recommend_agents_batch_optimized, clear_cache
@@ -217,12 +320,18 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
     Uses THOROUGH mode (prefilter_distance=False) - lets solver handle distance
     for comprehensive fleet-wide optimization.
     """
+    # Block if sync is in progress - queue to run after sync
+    if is_sync_in_progress():
+        print(f"[WebSocket] ⚠️ Sync in progress - queuing auto-optimization for {trigger_event}")
+        queue_optimization_after_sync(trigger_event)
+        return
+    
     print(f"[WebSocket] Auto-triggering fleet optimization due to: {trigger_event}")
     print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
     performance_stats["auto_optimizations"] += 1
     
     try:
-    start_time = time.time()
+        start_time = time.time()
         
         # Use dashboard_url from trigger_data, env var, or default
         default_dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
@@ -375,7 +484,7 @@ def trigger_incremental_optimization(
                     pickup_dt = dt.fromisoformat(pickup_before.replace('Z', '+00:00'))
                     time_to_pickup = (pickup_dt.replace(tzinfo=None) - dt.utcnow()).total_seconds() / 60
                     print(f"[FleetState] Task: {task_name} | pickup in {time_to_pickup:.1f}min | deadline: {delivery_before}")
-            else:
+                else:
                     print(f"[FleetState] Task: {task_name} | pickup: {pickup_before} | delivery: {delivery_before}")
             except Exception as e:
                 print(f"[FleetState] Task: {task_name} | pickup: {pickup_before} | delivery: {delivery_before}")
@@ -422,11 +531,15 @@ def trigger_incremental_optimization(
                 agents_considered = ut.get('agents_considered', [])
                 
                 if agents_considered:
+                    found = False
                     for ac in agents_considered:
                         if ac.get('agent_name') == agent_name:
                             print(f"  → {task_name}: {ac.get('reason', reason)} - {ac.get('reason_detail', reason_detail)}")
+                            found = True
                             break
-        else:
+                    if not found:
+                        print(f"  → {task_name}: {reason} - {reason_detail}")
+                else:
                     print(f"  → {task_name}: {reason} - {reason_detail}")
         
         if assigned_count > 0:
@@ -514,6 +627,9 @@ def handle_fleet_sync(data):
             'received_at': datetime.now().isoformat()
         })
         return
+    
+    # Block optimizations during sync
+    set_sync_in_progress(True)
     
     try:
         # Sync agents
@@ -618,6 +734,9 @@ def handle_fleet_sync(data):
             'error': str(e),
             'received_at': datetime.now().isoformat()
         })
+    finally:
+        # Always unblock optimizations when sync is done (success or failure)
+        set_sync_in_progress(False)
 
 @socketio.on('config:update')
 def handle_config_update(data):
@@ -797,6 +916,22 @@ def handle_fleet_optimize(data):
     
     request_id = data.get('request_id', str(uuid.uuid4()))
     print(f"[WebSocket] fleet:optimize_request from {client_id}, request_id={request_id}")
+    
+    # Block if sync is in progress
+    if is_sync_in_progress():
+        print(f"[WebSocket] ⚠️ Sync in progress - deferring optimize request")
+        emit('fleet:routes_updated', {
+            'trigger_type': 'manual',
+            'trigger_event': 'fleet:optimize_request',
+            'request_id': request_id,
+            'error': 'Sync in progress - please wait and retry',
+            'success': False,
+            'sync_in_progress': True,
+            'agent_routes': [],
+            'unassigned_tasks': []
+        })
+        return
+    
     print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
     
     try:
@@ -1071,7 +1206,7 @@ def handle_task_completed(data):
         
         # EVENT-BASED: Trigger optimization if there are unassigned tasks and agent has capacity
         # Note: Proximity triggers may also fire from agent:location_update - debouncing handles dedup
-        unassigned_tasks = [t for t in fleet_state.get_all_tasks() if t.status == TaskStatus.UNASSIGNED]
+        unassigned_tasks = fleet_state.get_unassigned_tasks()
         unassigned_count = len(unassigned_tasks)
         if unassigned_count > 0:
             agent = fleet_state.get_agent(str(agent_id)) if agent_id else None
@@ -1723,8 +1858,8 @@ def recommend():
 @app.route('/recommend/batch-optimized', methods=['POST'])
 def recommend_batch_optimized():
     """Batch-optimized recommendation endpoint."""
-        start_time = time.time()
-        
+    start_time = time.time()
+    
     try:
         data = request.get_json()
         if not data:
@@ -1850,7 +1985,7 @@ def get_fleet_agents():
             'last_update': agent.last_updated.isoformat()
         })
     
-        return jsonify({
+    return jsonify({
         'count': len(agents),
         'online': len([a for a in agents if a['status'] != 'offline']),
         'available': len([a for a in agents if a['has_capacity']]),
