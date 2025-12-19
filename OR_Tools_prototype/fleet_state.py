@@ -284,11 +284,16 @@ class AgentState:
         """Check if agent can handle cash orders (case-insensitive)
         
         All agents can handle cash BY DEFAULT.
-        Only agents with NoCash/no_cash tag are blocked.
+        Only agents with NoCash/no_cash/AbsolutelyNoCash etc. tag are blocked.
+        Checks if 'nocash' appears ANYWHERE in the tag (after normalization).
         """
-        tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in self.tags]
-        has_no_cash = any(t in ['nocash', 'no_cash'] for t in tags_lower)
-        return not has_no_cash  # Can handle cash unless they have NoCash tag
+        for tag in self.tags:
+            # Normalize: lowercase, remove dashes/spaces/underscores
+            normalized = tag.lower().replace('-', '').replace('_', '').replace(' ', '')
+            # Check if 'nocash' appears anywhere in the normalized tag
+            if 'nocash' in normalized:
+                return False  # Agent cannot handle cash
+        return True  # Can handle cash (default)
     
     def estimated_time_to_idle(self) -> Optional[float]:
         """
@@ -1504,8 +1509,8 @@ class FleetState:
                         'max_tasks': agent.max_capacity,
                         'available_capacity': agent.available_capacity,
                         'tags': agent.tags,
-                        # Case-insensitive check for NoCash/no_cash/nocash variations
-                        'has_no_cash_tag': any(t.lower().replace('-', '_').replace(' ', '_') in ['nocash', 'no_cash'] for t in agent.tags),
+                        # Check if 'nocash' appears anywhere in any tag (handles AbsolutelyNoCash, etc.)
+                        'has_no_cash_tag': any('nocash' in t.lower().replace('-', '').replace('_', '').replace(' ', '') for t in agent.tags),
                         'is_scooter_agent': 'scooter' in [t.lower() for t in agent.tags],
                         'priority': agent.priority  # None if not a priority agent
                     }

@@ -592,7 +592,7 @@ def trigger_incremental_optimization(
                     'max_tasks': agent.max_capacity,
                     'available_capacity': agent.available_capacity,
                     'tags': agent.tags,
-                    'has_no_cash_tag': 'NoCash' in agent.tags,
+                    'has_no_cash_tag': any('nocash' in t.lower().replace('-', '').replace('_', '').replace(' ', '') for t in agent.tags),
                     'is_scooter_agent': 'scooter' in [t.lower() for t in agent.tags]
                 }
             }],

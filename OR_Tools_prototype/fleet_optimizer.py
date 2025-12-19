@@ -467,10 +467,15 @@ class CompatibilityChecker:
         
         # Rule 2: Cash Handling - All agents can handle cash BY DEFAULT
         # Only agents with NoCash tag are blocked from cash orders
-        # Case-insensitive checks for tag variations: nocash, NoCash, no_cash, NO_CASH, etc.
+        # Checks if 'nocash' appears ANYWHERE in the tag (handles AbsolutelyNoCash, etc.)
         if task.payment_type == "CASH":
-            tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in agent.tags]
-            has_no_cash = any(t in ['nocash', 'no_cash'] for t in tags_lower)
+            has_no_cash = False
+            for tag in agent.tags:
+                # Normalize: lowercase, remove dashes/spaces/underscores
+                normalized = tag.lower().replace('-', '').replace('_', '').replace(' ', '')
+                if 'nocash' in normalized:
+                    has_no_cash = True
+                    break
             
             if has_no_cash:
                 return False, "no_cash_tag"
