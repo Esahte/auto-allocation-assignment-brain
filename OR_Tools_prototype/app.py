@@ -1144,9 +1144,10 @@ def handle_fleet_optimize(data):
             'unassigned_tasks': []
         })
     finally:
-        # Always release the global optimization lock
-        with _optimization_running_lock:
-            _optimization_running = False
+        # Check if events were queued during this optimization and run them
+        # This ensures task:created, task:declined, etc. events that arrived
+        # during an on-demand optimization are not lost
+        _run_queued_optimization_if_needed()
 
 # -----------------------------------------------------------------------------
 # EVENTS THAT TRIGGER AUTOMATIC FLEET RE-OPTIMIZATION
