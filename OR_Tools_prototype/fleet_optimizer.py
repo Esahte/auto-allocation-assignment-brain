@@ -10,10 +10,14 @@ Conservative mode: Only assigns unassigned/declined tasks, doesn't reassign exis
 """
 
 import time
+import logging
 import requests
+
+# Set up logger for fleet optimizer
+logger = logging.getLogger('fleet_optimizer')
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from ortools.constraint_solver import routing_enums_pb2
@@ -119,9 +123,21 @@ class Task:
         delivery_before = cls._parse_timestamp(data.get('delivery_before'))
         
         # Get declined_by list (extract just driver IDs)
+        # CRITICAL: Ensure all IDs are strings for consistent comparison
         declined_by = []
-        if 'declined_by' in data:
-            declined_by = [d.get('driver_id') for d in data['declined_by'] if d.get('driver_id')]
+        if 'declined_by' in data and data['declined_by']:
+            raw_declined = data['declined_by']
+            # Handle both formats: [{"driver_id": "123"}, ...] or ["123", ...]
+            for d in raw_declined:
+                if isinstance(d, dict):
+                    driver_id = d.get('driver_id')
+                    if driver_id:
+                        declined_by.append(str(driver_id))
+                else:
+                    # Direct ID (string or int)
+                    declined_by.append(str(d))
+            if declined_by:
+                logger.info(f"[FleetOptimizer] 📥 Task {data.get('id', '')[:20]}... has {len(declined_by)} declines: {declined_by}")
         
         # Get metadata
         meta = data.get('_meta', {})
@@ -342,7 +358,10 @@ class CompatibilityChecker:
     
     Supports two modes controlled by prefilter_distance:
     - True (default): Pre-filter by distance for FAST proximity-based optimization
-    - False: Skip distance pre-filter, let solver handle it for THOROUGH event-based optimization
+    - False: THOROUGH event-based optimization (still enforces max_distance_km as hard constraint)
+    
+    NOTE: max_distance_km is ALWAYS enforced as a hard constraint in both modes.
+    The prefilter_distance flag only affects whether we pre-filter candidates for the solver.
     """
     
     def __init__(self, 
@@ -363,7 +382,7 @@ class CompatibilityChecker:
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
         
         if not prefilter_distance:
-            print(f"[CompatibilityChecker] Distance pre-filter DISABLED - solver will handle distance")
+            print(f"[CompatibilityChecker] THOROUGH mode - max_distance_km={max_distance_km}km still enforced as hard constraint")
     
     def _get_agent_projected_location(self, agent: Agent) -> Location:
         """
@@ -385,7 +404,12 @@ class CompatibilityChecker:
     
     def precompute_distances(self, agents: List[Agent], tasks: List[Task]):
         """
-        Precompute OSRM road distances from all agents to all task pickup locations.
+        Precompute Haversine (straight-line) distances from all agents to all task pickup locations.
+        
+        Uses Haversine instead of OSRM for:
+        - Faster computation (no API calls)
+        - More reliable (no network dependency)
+        - Sufficient accuracy for proximity checks
         
         For agents with existing tasks, we compute BOTH:
         1. Distance from CURRENT location (for opportunistic pickups)
@@ -397,14 +421,6 @@ class CompatibilityChecker:
         if not agents or not tasks:
             return
         
-        task_locations = [task.restaurant_location for task in tasks]
-        
-        # Get projected locations for all agents
-        agent_projected_locations = [self._get_agent_projected_location(agent) for agent in agents]
-        
-        # Get current locations for busy agents (for opportunistic pickup check)
-        agent_current_locations = [agent.current_location for agent in agents]
-        
         # Log which agents have both locations
         busy_agents = [a for a in agents if a.current_tasks]
         if busy_agents:
@@ -414,19 +430,19 @@ class CompatibilityChecker:
                 print(f"[CompatibilityChecker] {agent.name}: current=({agent.current_location.lat:.4f}, {agent.current_location.lng:.4f}), "
                       f"projected=({proj_loc.lat:.4f}, {proj_loc.lng:.4f})")
         
-        print(f"[CompatibilityChecker] Getting OSRM distances for {len(agents)} agents x {len(tasks)} tasks...")
+        print(f"[CompatibilityChecker] Computing Haversine distances for {len(agents)} agents x {len(tasks)} tasks...")
         
-        # Get distances from PROJECTED locations
-        projected_distances = get_osrm_distances_matrix(agent_projected_locations, task_locations)
-        
-        # Get distances from CURRENT locations (for busy agents only, but compute for all)
-        current_distances = get_osrm_distances_matrix(agent_current_locations, task_locations)
-        
-        # Store BOTH in cache - use the MINIMUM of current and projected
-        for i, agent in enumerate(agents):
-            for j, task in enumerate(tasks):
-                proj_dist = projected_distances[i][j] if projected_distances else float('inf')
-                curr_dist = current_distances[i][j] if current_distances else float('inf')
+        # Compute distances using Haversine (fast, no API calls)
+        for agent in agents:
+            proj_loc = self._get_agent_projected_location(agent)
+            curr_loc = agent.current_location
+            
+            for task in tasks:
+                task_loc = task.restaurant_location
+                
+                # Calculate both distances using Haversine
+                proj_dist = _haversine_km(proj_loc.lat, proj_loc.lng, task_loc.lat, task_loc.lng)
+                curr_dist = _haversine_km(curr_loc.lat, curr_loc.lng, task_loc.lat, task_loc.lng)
                 
                 # Use the MINIMUM distance - if agent is near NOW or will be near LATER
                 min_dist = min(proj_dist, curr_dist)
@@ -438,7 +454,7 @@ class CompatibilityChecker:
                 self.projected_distance_cache[(agent.id, task.id)] = proj_dist
                 self.current_distance_cache[(agent.id, task.id)] = curr_dist
         
-        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} distances (using MIN of current and projected)")
+        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} Haversine distances (using MIN of current and projected)")
     
     def is_compatible(self, agent: Agent, task: Task) -> Tuple[bool, str]:
         """
@@ -462,7 +478,12 @@ class CompatibilityChecker:
         # =================================================================
         
         # Rule 1: Decline History - Agent previously declined this task
-        if task.declined_by and agent.id in task.declined_by:
+        # CRITICAL: Normalize both agent ID and declined_by list to strings for comparison
+        agent_id_str = str(agent.id)
+        declined_by_str = [str(d) for d in task.declined_by] if task.declined_by else []
+        
+        if declined_by_str and agent_id_str in declined_by_str:
+            logger.info(f"[FleetOptimizer] ⛔ BLOCKED: Agent {agent.name} ({agent_id_str}) previously declined task {task.id[:20]}...")
             return False, "agent_declined_task"
         
         # Rule 2: Cash Handling - All agents can handle cash BY DEFAULT
@@ -489,10 +510,10 @@ class CompatibilityChecker:
         agent_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in agent.tags]
         task_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in task.tags] if task.tags else []
         
-        # Check if agent has TEST/INTERNAL tag
-        agent_is_test = any(t in ['test', 'internal'] for t in agent_tags_lower)
-        # Check if task has TEST/INTERNAL tag
-        task_is_test = any(t in ['test', 'internal'] for t in task_tags_lower)
+        # Check if agent has TEST tag (INTERNAL is just a regular tag with no special rules)
+        agent_is_test = any(t == 'test' for t in agent_tags_lower)
+        # Check if task has TEST tag
+        task_is_test = any(t == 'test' for t in task_tags_lower)
         
         # Rule 4a: TEST agents can ONLY get TEST tasks
         if agent_is_test and not task_is_test:
@@ -503,9 +524,9 @@ class CompatibilityChecker:
             return False, "test_task_non_test_agent"
         
         # Rule 4c: If task has tags (excluding TEST), agent must have at least one matching tag
-        non_test_task_tags = [t for t in task_tags_lower if t not in ['test', 'internal']]
+        non_test_task_tags = [t for t in task_tags_lower if t != 'test']
         if non_test_task_tags:
-            non_test_agent_tags = [t for t in agent_tags_lower if t not in ['test', 'internal']]
+            non_test_agent_tags = [t for t in agent_tags_lower if t != 'test']
             if not any(tag in non_test_agent_tags for tag in non_test_task_tags):
                 return False, "tag_mismatch"
         
@@ -527,11 +548,11 @@ class CompatibilityChecker:
         
         # Rule 6: Max Distance - Agent must be within maxDistanceKm of pickup location
         # Uses MINIMUM of current and projected distance (opportunistic pickup + chaining)
-        # SKIP this rule if prefilter_distance=False (solver will handle distance with soft constraints)
+        # ALWAYS enforce max_distance_km as a HARD constraint (even in THOROUGH mode)
         # SKIP for Priority 1 agents on premium tasks (they bypass distance)
         bypass_distance = (agent.priority == 1 and task.is_premium_task)
         
-        if self.max_distance_km is not None and self.prefilter_distance and not bypass_distance:
+        if self.max_distance_km is not None and not bypass_distance:
             # Check cache first (uses MIN of current and projected)
             cache_key = (agent.id, task.id)
             if cache_key in self.distance_cache:
@@ -559,11 +580,89 @@ class CompatibilityChecker:
                 else:
                     return False, f"distance_exceeded_{distance:.1f}km"
         
+        # Rule 7: Delivery Direction Coherence - New task's delivery should be in same direction as existing tasks
+        # This prevents inefficient zig-zag routes where agent has to go north then south
+        if agent.current_tasks and len(agent.current_tasks) > 0:
+            direction_check = self._check_delivery_direction_coherence(agent, task)
+            if not direction_check[0]:
+                return direction_check
+        
         # Priority 1 agents get a special compatible reason for premium tasks
         if agent.priority == 1 and task.is_premium_task:
             return True, "compatible_priority1_premium"
         
         return True, "compatible"
+    
+    def _check_delivery_direction_coherence(self, agent: Agent, new_task: Task) -> Tuple[bool, str]:
+        """
+        Check if the new task's delivery is in a coherent direction with existing task deliveries.
+        
+        This prevents assigning tasks where:
+        - Agent is at Restaurant A
+        - Existing task delivery goes NORTH
+        - New task delivery goes SOUTH (opposite direction = inefficient)
+        
+        Returns:
+            (is_coherent, reason) tuple
+        """
+        if not agent.current_tasks:
+            return True, "no_existing_tasks"
+        
+        # Get the reference point - use the new task's pickup location as the center
+        # (since agent will be at pickup to collect both orders)
+        center_lat = new_task.restaurant_location.lat
+        center_lng = new_task.restaurant_location.lng
+        
+        # Calculate direction vector for new task's delivery (from pickup to delivery)
+        new_delivery_lat = new_task.delivery_location.lat
+        new_delivery_lng = new_task.delivery_location.lng
+        new_delta_lat = new_delivery_lat - center_lat
+        new_delta_lng = new_delivery_lng - center_lng
+        
+        # Check against each existing task's delivery direction
+        for existing_task in agent.current_tasks:
+            # Only check tasks from the SAME or NEARBY restaurant (within 0.5km)
+            # Tasks from different restaurants don't need direction coherence
+            pickup_distance = _haversine_km(
+                center_lat, center_lng,
+                existing_task.restaurant_location.lat, existing_task.restaurant_location.lng
+            )
+            if pickup_distance > 0.5:  # Different restaurant, skip
+                continue
+            
+            # Calculate direction vector for existing task's delivery
+            existing_delivery_lat = existing_task.delivery_location.lat
+            existing_delivery_lng = existing_task.delivery_location.lng
+            existing_delta_lat = existing_delivery_lat - center_lat
+            existing_delta_lng = existing_delivery_lng - center_lng
+            
+            # Calculate dot product to determine if directions are aligned
+            # dot > 0 means same direction, dot < 0 means opposite
+            dot_product = (new_delta_lat * existing_delta_lat) + (new_delta_lng * existing_delta_lng)
+            
+            # Calculate magnitudes for angle calculation
+            new_magnitude = (new_delta_lat**2 + new_delta_lng**2) ** 0.5
+            existing_magnitude = (existing_delta_lat**2 + existing_delta_lng**2) ** 0.5
+            
+            if new_magnitude < 0.001 or existing_magnitude < 0.001:
+                continue  # Skip if delivery is at same location as pickup
+            
+            # Calculate cosine of angle between directions
+            cos_angle = dot_product / (new_magnitude * existing_magnitude)
+            
+            # If cos_angle < -0.3 (angle > ~107 degrees), deliveries are in opposite directions
+            # This threshold allows some flexibility but rejects clearly opposite routes
+            if cos_angle < -0.3:
+                # Calculate actual distances for logging
+                new_dist = _haversine_km(center_lat, center_lng, new_delivery_lat, new_delivery_lng)
+                existing_dist = _haversine_km(center_lat, center_lng, existing_delivery_lat, existing_delivery_lng)
+                
+                logger.info(f"[FleetOptimizer] ⛔ DIRECTION BLOCK: {agent.name} has delivery going "
+                          f"{'N' if existing_delta_lat > 0 else 'S'} ({existing_dist:.1f}km), "
+                          f"new task goes {'N' if new_delta_lat > 0 else 'S'} ({new_dist:.1f}km) - OPPOSITE DIRECTION")
+                return False, f"opposite_delivery_direction"
+        
+        return True, "direction_coherent"
     
     def build_compatibility_matrix(self, 
                                    agents: List[Agent], 
@@ -585,6 +684,7 @@ class CompatibilityChecker:
             'filtered_by_distance': 0,
             'filtered_by_cash': 0,
             'filtered_by_declined': 0,
+            'filtered_by_direction': 0,
             'filtered_by_other': 0
         }
         
@@ -603,6 +703,8 @@ class CompatibilityChecker:
                     stats['filtered_by_cash'] += 1
                 elif reason == 'agent_declined_task':
                     stats['filtered_by_declined'] += 1
+                elif reason == 'opposite_delivery_direction':
+                    stats['filtered_by_direction'] += 1
                 else:
                     stats['filtered_by_other'] += 1
         
@@ -782,9 +884,9 @@ class FleetOptimizer:
         self.prefilter_distance = prefilter_distance
         
         # Store max distance for chain-aware filtering
-        # Only enforce distance penalty if prefilter_distance=True (FAST mode)
-        # In THOROUGH mode, let routing cost handle distance naturally
-        self.max_distance_km = getattr(compatibility_checker, 'max_distance_km', None) if prefilter_distance else None
+        # ALWAYS enforce max_distance_km as a hard constraint in ALL modes
+        # This prevents assigning far-away agents even in THOROUGH mode
+        self.max_distance_km = getattr(compatibility_checker, 'max_distance_km', None)
         
         # Store max lateness for post-solution validation
         self.max_lateness_minutes = getattr(compatibility_checker, 'max_lateness_minutes', DEFAULT_MAX_LATENESS_MINUTES)
@@ -982,6 +1084,20 @@ class FleetOptimizer:
         
         print(f"[FleetOptimizer] Pre-filtered {len(self.pre_filtered_tasks)} tasks, {len(self.routable_tasks)} tasks routable")
         
+        # DEBUG: Show Priority agents and their compatibility
+        p1_agents = [a for a in self.agents if a.priority == 1]
+        if p1_agents:
+            print(f"[FleetOptimizer] 🔍 Priority 1 agents detected: {[a.name for a in p1_agents]}")
+            for p1 in p1_agents:
+                print(f"[FleetOptimizer] 🔍 {p1.name}: priority={p1.priority} (type={type(p1.priority).__name__}), tags={p1.tags}")
+        else:
+            # Check if any agent has priority set at all
+            agents_with_priority = [(a.name, a.priority, type(a.priority).__name__) for a in self.agents if a.priority is not None]
+            if agents_with_priority:
+                print(f"[FleetOptimizer] ⚠️ Agents with priority (but not == 1): {agents_with_priority}")
+            else:
+                print(f"[FleetOptimizer] ⚠️ No agents have priority field set")
+        
         # Show why there's nothing to assign
         if len(self.routable_tasks) == 0 and len(self.unassigned_tasks) > 0:
             print(f"[FleetOptimizer] ⚠️ ALL {len(self.unassigned_tasks)} tasks were pre-filtered!")
@@ -1004,14 +1120,14 @@ class FleetOptimizer:
         
         # Build distance matrix for chain-aware enforcement
         # This ensures every hop in the route is within maxDistanceKm
-        # ONLY applies in FAST/proximity mode - in THOROUGH mode, routing cost handles distance
+        # max_distance_km is ALWAYS enforced in compatibility checks (both FAST and THOROUGH modes)
         max_distance_km = self.max_distance_km
         distance_matrix = None
         if max_distance_km is not None:
             print(f"[FleetOptimizer] Building distance matrix for chain-aware filtering (max {max_distance_km}km per hop)...")
             distance_matrix = self._build_distance_matrix(locations)
         else:
-            print(f"[FleetOptimizer] Distance enforcement DISABLED (THOROUGH mode) - routing cost handles distance")
+            print(f"[FleetOptimizer] No max_distance_km configured - distance not constrained")
         
         # Create routing model
         manager = pywrapcp.RoutingIndexManager(
@@ -1026,6 +1142,39 @@ class FleetOptimizer:
         # Progressive penalty: the further over maxDistanceKm, the heavier the penalty
         # Uses quadratic scaling so small overages are tolerable but large ones are punishing
         BASE_PENALTY_PER_KM = 600  # 10 min base penalty per km over
+        
+        # DEBUG: Log travel times for same-restaurant chains (pickup → multiple deliveries)
+        logger.info(f"[FleetOptimizer] 🕐 DEBUG: Checking travel times for chained deliveries:")
+        
+        # Find tasks from the same restaurant
+        pickup_to_tasks = {}
+        for task in self.routable_tasks:
+            pickup_key = (round(task.restaurant_location.lat, 4), round(task.restaurant_location.lng, 4))
+            if pickup_key not in pickup_to_tasks:
+                pickup_to_tasks[pickup_key] = []
+            pickup_to_tasks[pickup_key].append(task)
+        
+        # Log travel times for same-pickup chains
+        for pickup_loc, tasks in pickup_to_tasks.items():
+            if len(tasks) > 1:
+                logger.info(f"[FleetOptimizer]   Same-restaurant chain at {pickup_loc} ({len(tasks)} tasks):")
+                for task in tasks:
+                    pickup_idx = index_map['pickups'].get(task.id)
+                    delivery_idx = index_map['deliveries'].get(task.id)
+                    if pickup_idx is not None and delivery_idx is not None:
+                        travel_sec = time_matrix[pickup_idx][delivery_idx]
+                        travel_min = travel_sec / 60
+                        customer = task.meta.get('customer_name', task.id[:15])
+                        logger.info(f"[FleetOptimizer]     → {customer}: pickup[{pickup_idx}] to delivery[{delivery_idx}] = {travel_sec}s ({travel_min:.1f}min)")
+                        
+                        # Also log delivery-to-delivery times for ordering
+                        for other_task in tasks:
+                            if other_task.id != task.id:
+                                other_delivery_idx = index_map['deliveries'].get(other_task.id)
+                                if other_delivery_idx:
+                                    d2d_time = time_matrix[delivery_idx][other_delivery_idx]
+                                    other_customer = other_task.meta.get('customer_name', other_task.id[:15])
+                                    logger.info(f"[FleetOptimizer]       {customer} delivery → {other_customer} delivery = {d2d_time}s ({d2d_time/60:.1f}min)")
         
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -1142,13 +1291,37 @@ class FleetOptimizer:
                 continue
             
             # Get compatible vehicles (we know at least one exists because of pre-filtering)
-            allowed_vehicles = []
-            for agent_idx, agent in enumerate(self.agents):
-                is_compatible, _ = self.compatibility_matrix[agent.id][task.id]
-                if is_compatible:
-                    allowed_vehicles.append(agent_idx)
+            # For PREMIUM tasks: Priority 1 agents get FIRST DIBS (exclusive if any are available)
+            all_compatible_vehicles = []
+            priority1_compatible_vehicles = []
             
-            print(f"[FleetOptimizer] Task {task.id[:20]}... compatible with {len(allowed_vehicles)} agents: {[self.agents[i].name for i in allowed_vehicles[:3]]} (vehicle_indices: {allowed_vehicles})")
+            for agent_idx, agent in enumerate(self.agents):
+                is_compatible, reason = self.compatibility_matrix[agent.id][task.id]
+                if is_compatible:
+                    all_compatible_vehicles.append(agent_idx)
+                    # Track Priority 1 agents separately
+                    if agent.priority == 1:
+                        priority1_compatible_vehicles.append(agent_idx)
+                elif agent.priority == 1 and task.is_premium_task:
+                    # Debug: Why is P1 agent not compatible with a premium task?
+                    logger.warning(f"[FleetOptimizer] ⚠️ P1 agent {agent.name} NOT compatible with premium task {task.id[:20]}... Reason: {reason}")
+            
+            # PRIORITY ASSIGNMENT LOGIC:
+            # If task is premium AND there are eligible Priority 1 agents -> they get exclusive access
+            # Otherwise -> all compatible agents can take it
+            if task.is_premium_task and priority1_compatible_vehicles:
+                allowed_vehicles = priority1_compatible_vehicles
+                priority_note = f" ⭐ PRIORITY (P1 agents: {[self.agents[i].name for i in priority1_compatible_vehicles]})"
+                # Log this important event to persistent logs
+                logger.info(f"[FleetOptimizer] ⭐ PREMIUM TASK {task.id[:20]}... → Priority 1 agents get exclusive: {[self.agents[i].name for i in priority1_compatible_vehicles]}")
+            else:
+                allowed_vehicles = all_compatible_vehicles
+                priority_note = ""
+                if task.is_premium_task and not priority1_compatible_vehicles:
+                    priority_note = " (no P1 agents available - using regular agents)"
+                    logger.info(f"[FleetOptimizer] ⭐ PREMIUM TASK {task.id[:20]}... → No P1 agents available, using regular agents")
+            
+            print(f"[FleetOptimizer] Task {task.id[:20]}... compatible with {len(allowed_vehicles)} agents: {[self.agents[i].name for i in allowed_vehicles[:3]]} (vehicle_indices: {allowed_vehicles}){priority_note}")
             
             pickup_delivery_pairs.append((pickup_idx, delivery_idx))
             
@@ -1195,6 +1368,42 @@ class FleetOptimizer:
                 time_dimension.CumulVar(pickup_index) <= time_dimension.CumulVar(delivery_index)
             )
         
+        # ================================================================
+        # DELIVERY ORDER OPTIMIZATION
+        # ================================================================
+        # For chained tasks from the same pickup, compute optimal delivery order
+        # based on distance/travel time, not just time windows
+        
+        # Find same-pickup chains and sort by delivery distance from pickup
+        pickup_chains = {}
+        for task in self.routable_tasks:
+            pickup_idx = index_map['pickups'].get(task.id)
+            delivery_idx = index_map['deliveries'].get(task.id)
+            if pickup_idx is not None and delivery_idx is not None:
+                # Use pickup location as key (rounded to avoid floating point issues)
+                pickup_key = (round(task.restaurant_location.lat, 4), round(task.restaurant_location.lng, 4))
+                if pickup_key not in pickup_chains:
+                    pickup_chains[pickup_key] = []
+                # Store travel time from pickup to delivery
+                travel_time = time_matrix[pickup_idx][delivery_idx]
+                pickup_chains[pickup_key].append({
+                    'task': task,
+                    'delivery_idx': delivery_idx,
+                    'pickup_idx': pickup_idx,
+                    'travel_time': travel_time
+                })
+        
+        # Log optimal delivery orders for chains
+        for pickup_key, chain in pickup_chains.items():
+            if len(chain) > 1:
+                # Sort by travel time (closest delivery first)
+                chain_sorted = sorted(chain, key=lambda x: x['travel_time'])
+                logger.info(f"[FleetOptimizer] 🔗 CHAIN OPTIMIZATION: {len(chain)} deliveries from same pickup:")
+                for i, item in enumerate(chain_sorted):
+                    customer = item['task'].meta.get('customer_name', 'Unknown')[:20]
+                    travel_min = item['travel_time'] / 60
+                    logger.info(f"[FleetOptimizer]   {i+1}. {customer} ({travel_min:.1f}min from pickup)")
+        
         # Set solver parameters - optimized for speed
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = (
@@ -1230,7 +1439,7 @@ class FleetOptimizer:
         print(f"[FleetOptimizer] Solved in {solve_time:.2f}s")
         
         if solution:
-            return self._extract_solution(routing, manager, solution, index_map, time_dimension, solve_time)
+            return self._extract_solution(routing, manager, solution, index_map, time_dimension, solve_time, time_matrix)
         else:
             # Diagnose WHY no solution was found
             status = routing.status()
@@ -1265,7 +1474,7 @@ class FleetOptimizer:
             
             return self._empty_result(reason, solve_time)
     
-    def _extract_solution(self, routing, manager, solution, index_map, time_dimension, solve_time) -> Dict:
+    def _extract_solution(self, routing, manager, solution, index_map, time_dimension, solve_time, time_matrix) -> Dict:
         """Extract solution into structured format"""
         
         agent_routes = []
@@ -1304,12 +1513,18 @@ class FleetOptimizer:
             
             index = routing.Start(vehicle_idx)
             
+            prev_arrival_seconds = 0
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 time_var = time_dimension.CumulVar(index)
                 arrival_seconds = solution.Value(time_var)
                 arrival_time = self.current_time.timestamp() + arrival_seconds
                 arrival_dt = datetime.fromtimestamp(arrival_time, tz=timezone.utc)
+                
+                # DEBUG: Log travel time between stops
+                delta_seconds = arrival_seconds - prev_arrival_seconds
+                logger.info(f"[FleetOptimizer] 🚗 Route extraction: node={node}, arrival_seconds={arrival_seconds} (+{delta_seconds}s / {delta_seconds/60:.1f}min from prev), arrival_time={arrival_dt.strftime('%H:%M:%S')} UTC")
+                prev_arrival_seconds = arrival_seconds
                 
                 # Check what this node represents
                 task_info = index_map['task_at_index'].get(node)
@@ -1383,6 +1598,124 @@ class FleetOptimizer:
                         route_stops.append(stop)
                 
                 index = solution.Value(routing.NextVar(index))
+            
+            # DEBUG: Log the complete route with times and verify travel times
+            if route_stops and assigned_new_tasks:
+                logger.info(f"[FleetOptimizer] 📋 Route for {agent.name} ({len(route_stops)} stops):")
+                prev_arrival_dt = None
+                prev_location = None
+                prev_node_idx = None
+                
+                for i, stop in enumerate(route_stops):
+                    stop_type = stop.get('type', 'unknown')
+                    display = stop.get('display_name', stop.get('task_id', 'unknown')[:15])
+                    arrival = stop.get('arrival_time', 'N/A')
+                    location = stop.get('location')
+                    
+                    # Get the index for this stop
+                    task_id = stop.get('task_id')
+                    if 'pickup' in stop_type:
+                        node_idx = index_map['pickups'].get(task_id)
+                    elif 'delivery' in stop_type:
+                        node_idx = index_map['deliveries'].get(task_id)
+                    else:
+                        node_idx = None
+                    
+                    # Calculate actual vs expected travel time
+                    if prev_arrival_dt and arrival and prev_node_idx is not None and node_idx is not None:
+                        try:
+                            current_arrival = datetime.fromisoformat(arrival.replace('Z', '+00:00'))
+                            actual_delta = (current_arrival - prev_arrival_dt).total_seconds()
+                            expected_travel = time_matrix[prev_node_idx][node_idx]
+                            expected_with_service = expected_travel + DEFAULT_SERVICE_TIME_SECONDS
+                            
+                            if abs(actual_delta - expected_with_service) > 300:  # More than 5 min difference
+                                logger.warning(f"[FleetOptimizer] ⚠️ TRAVEL TIME MISMATCH: node {prev_node_idx}→{node_idx}")
+                                logger.warning(f"[FleetOptimizer]   Actual delta: {actual_delta}s ({actual_delta/60:.1f}min)")
+                                logger.warning(f"[FleetOptimizer]   Expected (OSRM + service): {expected_with_service}s ({expected_with_service/60:.1f}min)")
+                        except Exception as e:
+                            pass
+                    
+                    if 'late_seconds' in stop:
+                        logger.info(f"[FleetOptimizer]   {i+1}. {stop_type}: {display} @ {arrival} (wait: {stop.get('wait_seconds', 0)}s)")
+                    elif 'lateness_seconds' in stop:
+                        logger.info(f"[FleetOptimizer]   {i+1}. {stop_type}: {display} @ {arrival} (early: {stop.get('early_seconds', 0)}s)")
+                    else:
+                        logger.info(f"[FleetOptimizer]   {i+1}. {stop_type}: {display} @ {arrival}")
+                    
+                    # Update previous values
+                    if arrival:
+                        try:
+                            prev_arrival_dt = datetime.fromisoformat(arrival.replace('Z', '+00:00'))
+                        except:
+                            pass
+                    prev_location = location
+                    prev_node_idx = node_idx
+            
+            # ================================================================
+            # RECALCULATE ACTUAL ARRIVAL TIMES
+            # ================================================================
+            # The solver's cumulative times may include slack (waiting).
+            # Recalculate based on actual travel sequence and OSRM times.
+            
+            if route_stops:
+                recalc_time = self.current_time
+                prev_node_idx = index_map['agent_starts'].get(agent.id)
+                
+                for stop in route_stops:
+                    task_id = stop.get('task_id')
+                    stop_type = stop.get('type', '')
+                    
+                    # Get node index
+                    if 'pickup' in stop_type:
+                        node_idx = index_map['pickups'].get(task_id)
+                    elif 'delivery' in stop_type:
+                        node_idx = index_map['deliveries'].get(task_id)
+                    else:
+                        continue
+                    
+                    if node_idx is None or prev_node_idx is None:
+                        continue
+                    
+                    # Get travel time from OSRM
+                    travel_seconds = time_matrix[prev_node_idx][node_idx]
+                    service_seconds = DEFAULT_SERVICE_TIME_SECONDS
+                    
+                    # Calculate new arrival time
+                    recalc_time = recalc_time + timedelta(seconds=travel_seconds + service_seconds)
+                    
+                    # For pickups, we might need to wait for food to be ready
+                    if 'pickup' in stop_type:
+                        task = None
+                        for t in self.routable_tasks:
+                            if t.id == task_id:
+                                task = t
+                                break
+                        if task and task.pickup_before > recalc_time:
+                            # Need to wait for food
+                            wait_seconds = (task.pickup_before - recalc_time).total_seconds()
+                            stop['wait_for_food_seconds'] = int(wait_seconds)
+                            recalc_time = task.pickup_before
+                    
+                    # Store recalculated time
+                    original_arrival = stop.get('arrival_time', '')
+                    stop['recalculated_arrival_time'] = recalc_time.isoformat()
+                    
+                    # Update the main arrival_time with the recalculated value
+                    if original_arrival:
+                        try:
+                            orig_dt = datetime.fromisoformat(original_arrival.replace('Z', '+00:00'))
+                            diff = abs((recalc_time - orig_dt).total_seconds())
+                            if diff > 120:  # More than 2 min difference
+                                logger.warning(f"[FleetOptimizer] ⏱️ ARRIVAL CORRECTION: {stop.get('display_name', task_id[:15])}")
+                                logger.warning(f"[FleetOptimizer]   Solver said: {orig_dt.strftime('%H:%M:%S')} UTC")
+                                logger.warning(f"[FleetOptimizer]   Actual (recalc): {recalc_time.strftime('%H:%M:%S')} UTC (diff: {diff/60:.1f}min)")
+                                # Use recalculated time
+                                stop['arrival_time'] = recalc_time.isoformat()
+                        except Exception:
+                            pass
+                    
+                    prev_node_idx = node_idx
             
             # ================================================================
             # POST-SOLUTION LATENESS VALIDATION
@@ -1490,24 +1823,30 @@ class FleetOptimizer:
         for pre_filtered in getattr(self, 'pre_filtered_tasks', []):
             task = pre_filtered['task']
             
-            # Build detailed agent-level breakdown
+            # Build detailed agent-level breakdown with capacity info
             agent_details = []
             for agent in self.agents:
                 if task.id in self.compatibility_matrix.get(agent.id, {}):
                     compatible, reason = self.compatibility_matrix[agent.id][task.id]
+                    has_capacity = agent.available_capacity > 0
                     agent_details.append({
                         'agent_id': agent.id,
                         'agent_name': agent.name,
                         'compatible': compatible,
-                        'reason': reason
+                        'reason': reason,
+                        'available_capacity': agent.available_capacity,
+                        'can_be_assigned': compatible and has_capacity
                     })
             
             unassigned_tasks.append({
                 'task_id': task.id,
                 'reason': pre_filtered['reason'],
+                'reason_detail': f"No agents pass compatibility rules ({pre_filtered['reason']})",
                 'restaurant_name': task.meta.get('restaurant_name', ''),
                 'customer_name': task.meta.get('customer_name', ''),
-                'agents_considered': agent_details
+                'agents_considered': agent_details,
+                'compatible_agents': 0,
+                'compatible_with_capacity': 0
             })
         
         # Collect tasks rejected due to lateness
@@ -1520,17 +1859,28 @@ class FleetOptimizer:
         for task in getattr(self, 'routable_tasks', []):
             if task.id not in assigned_task_ids:
                 # Build detailed agent-level breakdown
+                # Include capacity info so dashboard can show WHY compatible agents can't be assigned
                 agent_details = []
                 compatible_agents = []
                 
                 for agent in self.agents:
                     if task.id in self.compatibility_matrix.get(agent.id, {}):
                         compatible, reason = self.compatibility_matrix[agent.id][task.id]
+                        has_capacity = agent.available_capacity > 0
+                        
+                        # Provide accurate reason for compatible agents
+                        if compatible and not has_capacity:
+                            display_reason = "at_max_capacity"
+                        else:
+                            display_reason = reason
+                        
                         agent_details.append({
                             'agent_id': agent.id,
                             'agent_name': agent.name,
                             'compatible': compatible,
-                            'reason': reason
+                            'reason': display_reason,
+                            'available_capacity': agent.available_capacity,
+                            'can_be_assigned': compatible and has_capacity
                         })
                         if compatible:
                             compatible_agents.append(agent.name)
@@ -1542,12 +1892,39 @@ class FleetOptimizer:
                     reason_detail = f"Assignment would cause delivery to be >{self.max_lateness_minutes}min late"
                 elif compatible_agents:
                     # Had compatible agents but solver couldn't fit it
-                    primary_reason = "no_feasible_route"
-                    reason_detail = f"Compatible with {', '.join(compatible_agents)} but no feasible time slot"
+                    # Check if ALL compatible agents are at capacity
+                    compatible_at_capacity = []
+                    compatible_with_space = []
+                    for a in self.agents:
+                        if a.name in compatible_agents:
+                            if a.available_capacity <= 0:
+                                compatible_at_capacity.append(a.name)
+                            else:
+                                compatible_with_space.append(a.name)
+                    
+                    if len(compatible_at_capacity) == len(compatible_agents):
+                        # ALL compatible agents are at max capacity
+                        primary_reason = "compatible_agents_at_max_capacity"
+                        reason_detail = f"Compatible with {len(compatible_agents)} agent(s) but ALL are at max_tasks limit"
+                    elif compatible_at_capacity and not compatible_with_space:
+                        # Same case, phrased differently
+                        primary_reason = "compatible_agents_at_max_capacity"
+                        reason_detail = f"Compatible agents ({', '.join(compatible_at_capacity)}) all at max_tasks limit"
+                    else:
+                        # Some compatible agents have space, but solver still couldn't fit
+                        primary_reason = "no_feasible_route"
+                        if compatible_with_space:
+                            reason_detail = f"Agents with space ({', '.join(compatible_with_space)}) but no feasible time slot"
+                        else:
+                            reason_detail = f"Compatible with {', '.join(compatible_agents)} but no feasible time slot"
                 else:
                     incompatible_reasons = [a['reason'] for a in agent_details if not a['compatible']]
                     primary_reason = max(set(incompatible_reasons), key=incompatible_reasons.count) if incompatible_reasons else "unknown"
                     reason_detail = primary_reason
+                
+                # Count compatible agents with/without capacity for dashboard
+                compatible_count = len(compatible_agents)
+                compatible_with_capacity = len([a for a in agent_details if a.get('can_be_assigned', False)])
                 
                 unassigned_tasks.append({
                     'task_id': task.id,
@@ -1555,7 +1932,9 @@ class FleetOptimizer:
                     'reason_detail': reason_detail,
                     'restaurant_name': task.meta.get('restaurant_name', ''),
                     'customer_name': task.meta.get('customer_name', ''),
-                    'agents_considered': agent_details
+                    'agents_considered': agent_details,
+                    'compatible_agents': compatible_count,
+                    'compatible_with_capacity': compatible_with_capacity
                 })
         
         # Get compatibility stats
@@ -1583,6 +1962,7 @@ class FleetOptimizer:
                 'filtered_by_distance': compat_stats.get('filtered_by_distance', 0),
                 'filtered_by_cash_rules': compat_stats.get('filtered_by_cash', 0),
                 'filtered_by_declined': compat_stats.get('filtered_by_declined', 0),
+                'filtered_by_direction': compat_stats.get('filtered_by_direction', 0),
                 'filtered_by_other': compat_stats.get('filtered_by_other', 0)
             },
             'agent_routes': agent_routes,
@@ -1592,32 +1972,70 @@ class FleetOptimizer:
     def _empty_result(self, reason: str, solve_time: float = 0) -> Dict:
         """Return empty result with reason"""
         # Build agent details for each unassigned task
+        # IMPORTANT: Add capacity info so dashboard knows WHY compatible agents can't be assigned
         unassigned_with_details = []
         for t in self.unassigned_tasks:
             agent_details = []
+            compatible_count = 0
+            compatible_with_capacity_count = 0
+            
             for agent in self.agents:
                 if hasattr(self, 'compatibility_matrix') and t.id in self.compatibility_matrix.get(agent.id, {}):
                     compatible, agent_reason = self.compatibility_matrix[agent.id][t.id]
+                    
+                    # Add capacity information for compatible agents
+                    has_capacity = agent.available_capacity > 0
+                    
+                    if compatible:
+                        compatible_count += 1
+                        if has_capacity:
+                            compatible_with_capacity_count += 1
+                            # Compatible AND has capacity - the ROUTING_FAIL is due to time constraints
+                            final_reason = "time_window_conflict"
+                        else:
+                            # Compatible but NO capacity - this is the real reason
+                            final_reason = "at_max_capacity"
+                    else:
+                        final_reason = agent_reason
+                    
                     agent_details.append({
                         'agent_id': agent.id,
                         'agent_name': agent.name,
                         'compatible': compatible,
-                        'reason': agent_reason
+                        'reason': final_reason,
+                        'available_capacity': agent.available_capacity,
+                        'can_be_assigned': compatible and has_capacity
                     })
                 else:
                     agent_details.append({
                         'agent_id': agent.id,
                         'agent_name': agent.name,
                         'compatible': False,
-                        'reason': reason
+                        'reason': reason,
+                        'available_capacity': agent.available_capacity,
+                        'can_be_assigned': False
                     })
+            
+            # Determine the real reason for unassignment
+            if compatible_count == 0:
+                task_reason = "no_compatible_agents"
+                reason_detail = "No agents pass compatibility rules"
+            elif compatible_with_capacity_count == 0:
+                task_reason = "compatible_agents_at_max_capacity"
+                reason_detail = f"All {compatible_count} compatible agent(s) at max_tasks limit"
+            else:
+                task_reason = f"infeasible_{reason}"
+                reason_detail = f"{compatible_with_capacity_count} compatible agent(s) with capacity but time windows cannot be met"
             
             unassigned_with_details.append({
                 'task_id': t.id, 
-                'reason': reason,
+                'reason': task_reason,
+                'reason_detail': reason_detail,
                 'restaurant_name': t.meta.get('restaurant_name', ''),
                 'customer_name': t.meta.get('customer_name', ''),
-                'agents_considered': agent_details
+                'agents_considered': agent_details,
+                'compatible_agents': compatible_count,
+                'compatible_with_capacity': compatible_with_capacity_count
             })
         
         return {
@@ -1654,7 +2072,7 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     """
     start_time = time.time()
     
-    mode = "PROXIMITY (fast pre-filter)" if prefilter_distance else "EVENT-BASED (solver handles distance)"
+    mode = "PROXIMITY (fast pre-filter)" if prefilter_distance else "EVENT-BASED (max_distance enforced)"
     print(f"[optimize_fleet] Mode: {mode}")
     
     # Parse agents

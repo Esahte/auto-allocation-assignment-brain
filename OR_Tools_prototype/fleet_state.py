@@ -68,7 +68,8 @@ def _parse_datetime(dt_str: str) -> datetime:
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Use explicit name 'fleet_state' to match app.py's file handler connection
+logger = logging.getLogger('fleet_state')
 
 
 class AgentStatus(Enum):
@@ -372,6 +373,10 @@ class FleetState:
         self._agents: Dict[str, AgentState] = {}
         self._tasks: Dict[str, TaskState] = {}  # All tasks (unassigned, in-progress)
         self._geofences: Dict[str, Any] = {}  # Geofence regions
+        self._preserved_declines: Dict[str, set] = {}  # Preserved declined_by data across syncs
+        self._preserved_tags: Dict[str, list] = {}  # Preserved tags data across syncs (esp. TEST tags)
+        self._preserved_assignments: Dict[str, str] = {}  # Preserved optimistic assignments (task_id -> agent_id)
+        self._dashboard_unassigned_tasks: set = set()  # Task IDs dashboard explicitly says are unassigned
         
         # Optimization tracking
         self._last_optimization_time: Dict[str, float] = {}  # agent_id -> timestamp
@@ -610,12 +615,19 @@ class FleetState:
             task_id = str(task_id) if task_id else ''
             agent_ids = [str(aid) for aid in agent_ids] if agent_ids else []
             latest_agent_id = str(latest_agent_id) if latest_agent_id else None
+            
+            # Log the raw and converted agent IDs - INFO level for persistent logging
+            logger.info(f"[FleetState] 📝 Recording decline for task {task_id[:20]}... | agents={agent_ids}, latest={latest_agent_id}")
+            
             if task_id in self._tasks:
                 task = self._tasks[task_id]
                 
                 # Add all declined agents
                 for agent_id in agent_ids:
                     task.declined_by.add(agent_id)
+                
+                # Log the updated declined_by set - INFO level for persistent logging
+                logger.info(f"[FleetState] 📝 Task {task_id[:20]}... declined_by now has {len(task.declined_by)} agents: {list(task.declined_by)}")
                 
                 # If the task was assigned to the agent who declined, remove the assignment
                 previous_agent_id = task.assigned_agent_id
@@ -794,6 +806,19 @@ class FleetState:
             if max_distance_km is not None:
                 max_distance_km = float(max_distance_km)
             
+            # Parse declined_by if dashboard sends it (convert to strings for consistency)
+            # Handle both formats: ["agent_id", ...] or [{"driver_id": "agent_id"}, ...]
+            incoming_declined_by = set()
+            raw_declined = task_data.get('declined_by', [])
+            if raw_declined:
+                for d in raw_declined:
+                    if isinstance(d, dict):
+                        driver_id = d.get('driver_id')
+                        if driver_id:
+                            incoming_declined_by.add(str(driver_id))
+                    else:
+                        incoming_declined_by.add(str(d))
+            
             if task_id in self._tasks:
                 # Update existing
                 task = self._tasks[task_id]
@@ -803,8 +828,24 @@ class FleetState:
                 task.delivery_location = Location(lat=delivery_loc[0], lng=delivery_loc[1])
                 task.pickup_before = pickup_before or task.pickup_before
                 task.delivery_before = delivery_before or task.delivery_before
-                task.assigned_agent_id = assigned_agent
-                task.status = status
+                
+                # CRITICAL: Don't let stale dashboard data (showing unassigned) override
+                # our local assignment. Only update assignment if:
+                # 1. Dashboard says it's assigned (takes precedence - dashboard is source of truth)
+                # 2. OR we didn't have a local assignment
+                if assigned_agent:
+                    # Dashboard says assigned - use dashboard's data
+                    task.assigned_agent_id = assigned_agent
+                    task.status = status
+                elif not old_assigned_agent:
+                    # We didn't have local assignment - use dashboard's data (unassigned)
+                    task.assigned_agent_id = assigned_agent
+                    task.status = status
+                else:
+                    # Dashboard says unassigned but we had local assignment - KEEP local!
+                    # This prevents stale sync data from re-assigning tasks
+                    logger.info(f"[FleetState] ⚡ Keeping local assignment for {task_id[:20]}... (dashboard stale)")
+                
                 task.pickup_completed = task_data.get('pickup_completed', False)
                 task.tags = tags if tags else task.tags
                 task.payment_method = payment_method
@@ -813,6 +854,14 @@ class FleetState:
                 task.max_distance_km = max_distance_km if max_distance_km is not None else task.max_distance_km
                 task.meta = task_data.get('_meta', task.meta)
                 task.last_updated = datetime.now(timezone.utc)
+                
+                # MERGE declined_by: Keep existing local declines AND add any from dashboard
+                # This ensures we never lose decline history regardless of source
+                if incoming_declined_by:
+                    old_count = len(task.declined_by)
+                    task.declined_by.update(incoming_declined_by)
+                    if len(task.declined_by) > old_count:
+                        logger.info(f"[FleetState] 📥 Merged {len(incoming_declined_by)} dashboard declines into task {task_id[:20]}... (now {len(task.declined_by)} total)")
                 
                 # ALWAYS remove this task from ALL agents first (global deduplication)
                 # This prevents the same task from being in multiple agents' lists
@@ -857,10 +906,13 @@ class FleetState:
                     delivery_fee=delivery_fee,
                     tips=tips,
                     max_distance_km=max_distance_km,
-                    meta=task_data.get('_meta', {})
+                    meta=task_data.get('_meta', {}),
+                    declined_by=incoming_declined_by  # Include any dashboard-provided declines
                 )
                 self._tasks[task_id] = task
-                logger.info(f"[FleetState] New task added: {task.restaurant_name} → {task.customer_name}")
+                # Log premium task info for debugging
+                premium_status = "⭐ PREMIUM" if task.is_premium_task else "regular"
+                logger.info(f"[FleetState] New task added: {task.restaurant_name} → {task.customer_name} | fee=${task.delivery_fee:.2f}, tips=${task.tips:.2f} [{premium_status}]")
             
             # If task is assigned, add to agent's current_tasks
             # First, remove from ALL agents to prevent duplicates (global deduplication)
@@ -1007,10 +1059,24 @@ class FleetState:
         if not agent.has_capacity:
             return triggers
         
+        # Skip agents with invalid location data
+        if (agent.current_location is None or 
+            agent.current_location.lat is None or 
+            agent.current_location.lng is None):
+            logger.warning(f"[FleetState] Skipping agent {agent.name} - invalid current_location")
+            return triggers
+        
         unassigned_tasks = self.get_unassigned_tasks()
         self._stats['proximity_checks'] += len(unassigned_tasks)
         
         for task in unassigned_tasks:
+            # Skip tasks with invalid location data
+            if (task.restaurant_location is None or 
+                task.restaurant_location.lat is None or 
+                task.restaurant_location.lng is None):
+                logger.warning(f"[FleetState] Skipping task {task.id[:20]}... - invalid restaurant_location")
+                continue
+            
             # Check current location
             current_distance = agent.current_location.distance_to(task.restaurant_location)
             
@@ -1028,6 +1094,11 @@ class FleetState:
             
             # Check projected location (for proactive chaining)
             if agent.current_tasks:  # Only if agent is busy
+                # Skip if projected location is invalid
+                if (agent.projected_location is None or 
+                    agent.projected_location.lat is None or 
+                    agent.projected_location.lng is None):
+                    continue
                 projected_distance = agent.projected_location.distance_to(task.restaurant_location)
                 
                 if projected_distance <= self.chain_lookahead_radius_km:
@@ -1071,10 +1142,10 @@ class FleetState:
         agent_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in agent.tags]
         task_tags_lower = [t.lower().replace('-', '_').replace(' ', '_') for t in task.tags] if task.tags else []
         
-        # Check if agent has TEST/INTERNAL tag
-        agent_is_test = any(t in ['test', 'internal'] for t in agent_tags_lower)
-        # Check if task has TEST/INTERNAL tag
-        task_is_test = any(t in ['test', 'internal'] for t in task_tags_lower)
+        # Check if agent has TEST tag (INTERNAL is just a regular tag with no special rules)
+        agent_is_test = any(t == 'test' for t in agent_tags_lower)
+        # Check if task has TEST tag
+        task_is_test = any(t == 'test' for t in task_tags_lower)
         
         # Rule: TEST agents can ONLY get TEST tasks
         if agent_is_test and not task_is_test:
@@ -1085,9 +1156,9 @@ class FleetState:
             return "test_task_non_test_agent"
         
         # Rule: If task has other tags (excluding TEST), agent must have at least one matching tag
-        non_test_task_tags = [t for t in task_tags_lower if t not in ['test', 'internal']]
+        non_test_task_tags = [t for t in task_tags_lower if t != 'test']
         if non_test_task_tags:
-            non_test_agent_tags = [t for t in agent_tags_lower if t not in ['test', 'internal']]
+            non_test_agent_tags = [t for t in agent_tags_lower if t != 'test']
             if not any(tag in non_test_agent_tags for tag in non_test_task_tags):
                 return "tag_mismatch"
         
@@ -1342,11 +1413,77 @@ class FleetState:
                 
                 agent.last_updated = datetime.now(timezone.utc)
             
+            # DEBUG: Log priority agents
+            priority_agents = [a for a in self._agents.values() if a.priority is not None]
+            if priority_agents:
+                for pa in priority_agents:
+                    logger.info(f"[FleetState] ⭐ Priority {pa.priority} agent: {pa.name}")
+            else:
+                # Check if first agent has priority field to diagnose
+                if agents_data:
+                    first_agent = agents_data[0]
+                    has_priority_field = 'priority' in first_agent
+                    logger.info(f"[FleetState] ⚠️ No Priority agents found. Dashboard sending 'priority' field: {has_priority_field}")
+            
+            # DEBUG: Log agents with non-default max_capacity (helps diagnose sync issues)
+            non_default_capacity = [(a.name, a.max_capacity) for a in self._agents.values() if a.max_capacity != 2]
+            if non_default_capacity:
+                logger.info(f"[FleetState] 📊 Agents with custom max_capacity: {non_default_capacity}")
+            else:
+                # Check what dashboard is sending
+                sample_capacities = [(d.get('name', d.get('id'))[:15], d.get('max_capacity', 'NOT_SENT')) for d in agents_data[:3]]
+                logger.info(f"[FleetState] ⚠️ All agents have default max_capacity=2. Sample from dashboard: {sample_capacities}")
+            
             logger.info(f"[FleetState] Synced {len(agents_data)} agents")
     
+    def set_dashboard_unassigned_tasks(self, task_ids: set):
+        """Mark task IDs as explicitly unassigned by dashboard.
+        
+        This prevents optimistic assignment restoration for these tasks.
+        If dashboard says a task is unassigned, we trust it - the agent
+        may have declined, the assignment may have failed, etc.
+        """
+        self._dashboard_unassigned_tasks = task_ids
+        if task_ids:
+            logger.info(f"[FleetState] 📋 Dashboard explicitly marked {len(task_ids)} task(s) as unassigned")
+    
     def clear_tasks(self):
-        """Clear all tasks (call before full sync)"""
+        """Clear all tasks (call before full sync)
+        
+        IMPORTANT: This preserves:
+        - declined_by history so agents who declined won't get reassigned
+        - tags so TEST tasks keep their TEST tag
+        - OPTIMISTIC ASSIGNMENTS so locally-assigned tasks aren't re-assigned
+          (dashboard may have stale data showing task as unassigned)
+        """
         with self._lock:
+            # CRITICAL: Preserve state data before clearing
+            preserved_declines = {}
+            preserved_tags = {}
+            preserved_assignments = {}  # NEW: Preserve optimistic assignments
+            
+            for task_id, task in self._tasks.items():
+                if task.declined_by:
+                    preserved_declines[task_id] = set(task.declined_by)
+                if task.tags:  # Preserve non-empty tags (especially TEST tags!)
+                    preserved_tags[task_id] = list(task.tags)
+                # Preserve assignments - if we locally marked a task as assigned,
+                # don't let stale dashboard data override it
+                if task.assigned_agent_id and task.status in [TaskStatus.ASSIGNED, TaskStatus.PICKUP_IN_PROGRESS, TaskStatus.DELIVERY_IN_PROGRESS]:
+                    preserved_assignments[task_id] = task.assigned_agent_id
+            
+            if preserved_declines:
+                logger.info(f"[FleetState] 💾 Preserving declined_by data for {len(preserved_declines)} task(s) across sync")
+            if preserved_tags:
+                logger.info(f"[FleetState] 💾 Preserving tags for {len(preserved_tags)} task(s) across sync")
+            if preserved_assignments:
+                logger.info(f"[FleetState] 💾 Preserving optimistic assignments for {len(preserved_assignments)} task(s) across sync")
+            
+            # Store for restoration after sync
+            self._preserved_declines = preserved_declines
+            self._preserved_tags = preserved_tags
+            self._preserved_assignments = preserved_assignments  # NEW
+            
             self._tasks.clear()
             # Also clear agent current_tasks
             for agent in self._agents.values():
@@ -1358,6 +1495,96 @@ class FleetState:
         with self._lock:
             for task_data in tasks_data:
                 self.add_task(task_data)
+            
+            # CRITICAL: Restore preserved declined_by data after sync
+            # This ensures agents who declined tasks won't get them reassigned
+            preserved_declines = getattr(self, '_preserved_declines', {})
+            restored_decline_count = 0
+            for task_id, declined_by in preserved_declines.items():
+                if task_id in self._tasks:
+                    task = self._tasks[task_id]
+                    # Merge preserved declines with any new declines
+                    task.declined_by.update(declined_by)
+                    restored_decline_count += 1
+                    logger.info(f"[FleetState] 🔄 Restored declined_by for task {task_id[:20]}...: {list(task.declined_by)}")
+            
+            if restored_decline_count > 0:
+                logger.info(f"[FleetState] ✅ Restored declined_by data for {restored_decline_count} task(s)")
+            
+            # CRITICAL: Restore preserved tags after sync (especially TEST tags!)
+            # This ensures TEST tasks keep their tags even if dashboard sends empty tags
+            preserved_tags = getattr(self, '_preserved_tags', {})
+            restored_tags_count = 0
+            for task_id, tags in preserved_tags.items():
+                if task_id in self._tasks:
+                    task = self._tasks[task_id]
+                    # If dashboard sent empty tags but we had tags before, restore them
+                    if not task.tags and tags:
+                        task.tags = tags
+                        restored_tags_count += 1
+                        logger.info(f"[FleetState] 🔄 Restored tags for task {task_id[:20]}...: {tags}")
+                    # If dashboard sent different tags, merge (keep both)
+                    elif task.tags and tags:
+                        # Merge tags (use set to avoid duplicates, then convert back to list)
+                        merged_tags = list(set(task.tags + tags))
+                        if set(merged_tags) != set(task.tags):
+                            task.tags = merged_tags
+                            restored_tags_count += 1
+                            logger.info(f"[FleetState] 🔄 Merged tags for task {task_id[:20]}...: {merged_tags}")
+            
+            if restored_tags_count > 0:
+                logger.info(f"[FleetState] ✅ Restored/merged tags for {restored_tags_count} task(s)")
+            
+            # CRITICAL: Restore preserved optimistic assignments after sync
+            # BUT: Do NOT restore for tasks that dashboard explicitly marked as unassigned!
+            # If dashboard says a task is unassigned, trust it (agent declined, assignment failed, etc.)
+            preserved_assignments = getattr(self, '_preserved_assignments', {})
+            dashboard_unassigned = getattr(self, '_dashboard_unassigned_tasks', set())
+            restored_assignment_count = 0
+            skipped_count = 0
+            for task_id, agent_id in preserved_assignments.items():
+                # CRITICAL: Skip if dashboard explicitly says this task is unassigned!
+                if task_id in dashboard_unassigned:
+                    skipped_count += 1
+                    logger.info(f"[FleetState] ⏭️ NOT restoring assignment for {task_id[:20]}... - dashboard says UNASSIGNED")
+                    continue
+                    
+                if task_id in self._tasks:
+                    task = self._tasks[task_id]
+                    # Only restore if dashboard shows task as unassigned but we had it assigned
+                    if not task.assigned_agent_id and agent_id:
+                        # Verify agent still exists
+                        if agent_id in self._agents:
+                            task.assigned_agent_id = agent_id
+                            task.status = TaskStatus.ASSIGNED
+                            # Re-add to agent's current_tasks
+                            agent = self._agents[agent_id]
+                            if not any(t.id == task_id for t in agent.current_tasks):
+                                agent.current_tasks.append(CurrentTask(
+                                    id=task_id,
+                                    job_type=task.job_type,
+                                    restaurant_location=task.restaurant_location,
+                                    delivery_location=task.delivery_location,
+                                    pickup_before=task.pickup_before,
+                                    delivery_before=task.delivery_before,
+                                    pickup_completed=task.pickup_completed,
+                                    meta=task.meta
+                                ))
+                            restored_assignment_count += 1
+                            logger.info(f"[FleetState] 🔄 Restored optimistic assignment for task {task_id[:20]}... → {agent.name}")
+            
+            if restored_assignment_count > 0:
+                logger.info(f"[FleetState] ✅ Restored optimistic assignments for {restored_assignment_count} task(s) (prevented re-assignment!)")
+            if skipped_count > 0:
+                logger.info(f"[FleetState] ⚠️ Skipped {skipped_count} optimistic assignment(s) - dashboard explicitly marked them as unassigned")
+            
+            # Clear the preserved data and dashboard unassigned set
+            # CRITICAL: Also clear preserved_assignments to prevent double-restoration
+            # when sync_tasks is called multiple times (once for unassigned, once for in-progress)
+            self._preserved_declines = {}
+            self._preserved_tags = {}
+            self._preserved_assignments = {}
+            self._dashboard_unassigned_tasks = set()
             
             # Recalculate all agent statuses based on current_tasks
             self._recalculate_agent_statuses()
@@ -1550,8 +1777,13 @@ class FleetState:
                 
                 # Get declined_by from task - convert to format optimizer expects
                 # Optimizer expects: [{"driver_id": "123"}, ...] not just ["123", ...]
-                declined_by_list = list(task.declined_by) if hasattr(task, 'declined_by') else []
+                # CRITICAL: Ensure all IDs are strings for consistent comparison
+                declined_by_list = [str(agent_id) for agent_id in task.declined_by] if hasattr(task, 'declined_by') else []
                 declined_by = [{'driver_id': agent_id} for agent_id in declined_by_list]
+                
+                # Log declined_by for tracking - INFO level for persistent logging
+                if declined_by_list:
+                    logger.info(f"[FleetState] 📤 Exporting task {task.id[:20]}... with {len(declined_by_list)} declines: {declined_by_list}")
                 
                 # Build _meta with payment_type in format optimizer expects
                 task_meta = dict(task.meta) if task.meta else {}

@@ -79,6 +79,13 @@ if [ -n "$DASHBOARD_URL" ]; then
 fi
 
 # Deploy to Cloud Run
+# Settings explanation:
+#   --timeout=3600: 60 minutes for long-lived WebSocket connections with the dashboard
+#   --memory=2Gi: Sufficient memory for route optimization calculations
+#   --cpu=2: Parallel processing for optimization
+#   --concurrency=80: Max concurrent requests per instance
+#   --min-instances=1: Prevents cold starts that cause WebSocket disconnections
+#   --max-instances=5: Limits scaling for cost control
 echo ""
 echo "🚀 Deploying to Cloud Run..."
 gcloud run deploy ${SERVICE_NAME} \
@@ -86,10 +93,12 @@ gcloud run deploy ${SERVICE_NAME} \
   --platform managed \
   --region ${REGION} \
   --allow-unauthenticated \
-  --memory 2Gi \
-  --cpu 2 \
-  --max-instances 10 \
-  --timeout 300 \
+  --timeout=3600 \
+  --memory=2Gi \
+  --cpu=2 \
+  --concurrency=80 \
+  --min-instances=1 \
+  --max-instances=5 \
   ${ENV_VARS}
 
 echo ""
