@@ -60,6 +60,51 @@ def log_event(message: str, level: str = 'info'):
     else:
         logger.info(message)
 
+def log_payload(event_name: str, data: dict, max_items: int = 5):
+    """
+    Log WebSocket event payload to persistent logs.
+    Truncates large arrays and long strings to keep logs readable.
+    """
+    import json
+    
+    def truncate_value(v, max_len=100):
+        """Truncate long strings"""
+        if isinstance(v, str) and len(v) > max_len:
+            return v[:max_len] + '...'
+        return v
+    
+    def summarize_payload(payload, depth=0):
+        """Create a summary of the payload, truncating large arrays"""
+        if depth > 2:  # Don't go too deep
+            return str(payload)[:100] + '...' if len(str(payload)) > 100 else payload
+            
+        if isinstance(payload, dict):
+            result = {}
+            for k, v in payload.items():
+                if isinstance(v, list):
+                    if len(v) > max_items:
+                        result[k] = f"[{len(v)} items: {summarize_payload(v[:2], depth+1)}...]"
+                    else:
+                        result[k] = [summarize_payload(item, depth+1) for item in v]
+                elif isinstance(v, dict):
+                    result[k] = summarize_payload(v, depth+1)
+                else:
+                    result[k] = truncate_value(v)
+            return result
+        elif isinstance(payload, list):
+            if len(payload) > max_items:
+                return [summarize_payload(item, depth+1) for item in payload[:max_items]] + [f'...+{len(payload)-max_items} more']
+            return [summarize_payload(item, depth+1) for item in payload]
+        else:
+            return truncate_value(payload)
+    
+    try:
+        summary = summarize_payload(data)
+        payload_str = json.dumps(summary, default=str, ensure_ascii=False)
+        logger.info(f"[Payload] {event_name}: {payload_str}")
+    except Exception as e:
+        logger.warning(f"[Payload] {event_name}: Could not serialize payload: {e}")
+
 print(f"[Logging] Logs saved to: {LOG_DIR}")
 print(f"[Logging] All logs: fleet_optimizer.log")
 print(f"[Logging] Important events: important_events.log")
@@ -69,6 +114,20 @@ try:
     from fleet_state import fleet_state, AgentStatus, TaskStatus
     FLEET_STATE_AVAILABLE = True
     print("[FleetState] Abstract Map loaded successfully")
+    
+    # Connect fleet_state logger to our file handlers for persistent logging
+    fleet_state_logger = logging.getLogger('fleet_state')
+    fleet_state_logger.setLevel(logging.DEBUG)  # Enable DEBUG level for decline tracking
+    fleet_state_logger.addHandler(file_handler)
+    fleet_state_logger.addHandler(important_handler)
+    
+    # Connect fleet_optimizer logger to file handlers as well
+    fleet_optimizer_logger = logging.getLogger('fleet_optimizer')
+    fleet_optimizer_logger.setLevel(logging.DEBUG)  # Enable DEBUG level for decline tracking
+    fleet_optimizer_logger.addHandler(file_handler)
+    fleet_optimizer_logger.addHandler(important_handler)
+    
+    print("[FleetState] Loggers connected to file handlers")
 except ImportError as e:
     FLEET_STATE_AVAILABLE = False
     fleet_state = None
@@ -165,6 +224,7 @@ _optimization_running = False
 _optimization_running_lock = threading.Lock()
 _events_queued_during_optimization = []  # List of event types that arrived during optimization
 _queued_dashboard_url = None  # Dashboard URL to use for queued optimization
+_queued_request_id = None  # Request ID for queued manual optimization
 
 def is_sync_in_progress() -> bool:
     """Check if a fleet sync is currently in progress."""
@@ -325,7 +385,7 @@ def process_fleet_optimization(data: dict, prefilter_distance: bool = True) -> d
         data: Request data with optional dashboard_url, agents_data, tasks_data
         prefilter_distance: Whether to pre-filter by distance before solver
             - True (default): FAST mode for proximity triggers
-            - False: THOROUGH mode for event-based/on-demand, solver handles distance
+            - False: THOROUGH mode for event-based/on-demand (max_distance_km still enforced)
     """
     import requests as req
     from concurrent.futures import ThreadPoolExecutor
@@ -383,7 +443,7 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
     Trigger fleet optimization and emit updated routes.
     Called automatically when relevant events occur.
     
-    Uses THOROUGH mode (prefilter_distance=False) - lets solver handle distance
+    Uses THOROUGH mode (prefilter_distance=False) - max_distance_km still enforced
     for comprehensive fleet-wide optimization.
     
     If optimization is already running, queues the event and re-runs after completion
@@ -403,13 +463,13 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
             # QUEUE the event instead of skipping - we'll re-run after current optimization
             _events_queued_during_optimization.append(trigger_event)
             _queued_dashboard_url = trigger_data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
-            print(f"[WebSocket] 📋 Queued {trigger_event} (will re-run after current optimization)")
+            log_event(f"[WebSocket] 📋 Queued {trigger_event} (will re-run after current optimization)")
             return
         _optimization_running = True
         _events_queued_during_optimization = []  # Clear queue when starting new optimization
     
     print(f"[WebSocket] Auto-triggering fleet optimization due to: {trigger_event}")
-    print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
+    print(f"[WebSocket] Mode: THOROUGH (max_distance_km enforced)")
     performance_stats["auto_optimizations"] += 1
     
     try:
@@ -417,10 +477,10 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         
         # Use dashboard_url from trigger_data, env var, or default
         default_dashboard_url = os.environ.get('DASHBOARD_URL', 'http://localhost:8000')
-        # EVENT-BASED: Use THOROUGH mode - solver handles distance constraints
+        # EVENT-BASED: Use THOROUGH mode - max_distance_km still enforced as hard constraint
         result = process_fleet_optimization({
             'dashboard_url': trigger_data.get('dashboard_url', default_dashboard_url)
-        }, prefilter_distance=False)  # <-- THOROUGH: solver handles distance
+        }, prefilter_distance=False)  # <-- THOROUGH: distance still enforced
         
         execution_time = time.time() - start_time
         
@@ -447,6 +507,17 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
         unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
         log_event(f"[WebSocket] Auto-optimization complete: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
         
+        # Log reasons for unassigned tasks
+        unassigned_tasks = result.get('unassigned_tasks', [])
+        if unassigned_tasks:
+            log_event(f"[WebSocket] 📋 {len(unassigned_tasks)} unassigned task(s) with reasons:")
+            for ut in unassigned_tasks:
+                task_id = ut.get('task_id', 'unknown')[:20]
+                reason = ut.get('reason', 'unknown')
+                reason_detail = ut.get('reason_detail', '')
+                restaurant = ut.get('restaurant_name', 'Unknown')
+                log_event(f"  • {restaurant} ({task_id}...): {reason} - {reason_detail}")
+        
     except Exception as e:
         log_event(f"[WebSocket] Auto-optimization failed: {e}", 'error')
         socketio.emit('fleet:routes_updated', {
@@ -464,30 +535,113 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
 
 
 def _run_queued_optimization_if_needed():
-    """Helper to check for queued events and run follow-up optimization."""
+    """
+    Helper to check for queued events and run follow-up optimization.
+    
+    IMPORTANT: This function KEEPS _optimization_running = True if there are queued events,
+    then runs the follow-up optimization directly (not in a Timer thread). This prevents
+    race conditions where new events could start optimizations between releasing the lock
+    and the Timer firing.
+    """
     global _optimization_running, _events_queued_during_optimization, _queued_dashboard_url
     
     queued_events = []
     dashboard_url = None
     
     with _optimization_running_lock:
-        _optimization_running = False
         if _events_queued_during_optimization:
+            # There are queued events - keep _optimization_running = True
+            # to prevent new optimizations from starting
             queued_events = _events_queued_during_optimization.copy()
             dashboard_url = _queued_dashboard_url
-        _events_queued_during_optimization = []
-        _queued_dashboard_url = None
+            _events_queued_during_optimization = []
+            _queued_dashboard_url = None
+            # DO NOT set _optimization_running = False yet!
+        else:
+            # No queued events - safe to release
+            _optimization_running = False
     
-    # If events were queued, re-run optimization with fresh state
+    # If events were queued, run follow-up optimization DIRECTLY (not in Timer)
+    # This ensures the lock is held until the follow-up completes
     if queued_events:
         merged_trigger = '+'.join(set(queued_events))  # e.g., "task:created+agent:online"
-        print(f"[WebSocket] ▶️ Re-running optimization for queued events: {merged_trigger}")
-        # Small delay to let state settle, then re-run
-        timer = threading.Timer(0.1, lambda: trigger_fleet_optimization(
-            f'merged:{merged_trigger}',
-            {'dashboard_url': dashboard_url}
-        ))
-        timer.start()
+        log_event(f"[WebSocket] ▶️ Re-running optimization for queued events: {merged_trigger}")
+        
+        # Small delay to let state settle (optimistic updates fully visible)
+        time.sleep(0.1)
+        
+        # Run directly - this will call process_fleet_optimization and then
+        # call _run_queued_optimization_if_needed again in its finally block
+        _run_follow_up_optimization(merged_trigger, dashboard_url)
+
+
+def _run_follow_up_optimization(trigger_event: str, dashboard_url: str):
+    """
+    Internal function to run a follow-up optimization for queued events.
+    
+    This function is called when _optimization_running is already True,
+    so it bypasses the lock check and runs the optimization directly.
+    """
+    global _optimization_running, _events_queued_during_optimization, _queued_dashboard_url
+    
+    log_event(f"[WebSocket] Follow-up optimization for: {trigger_event}")
+    performance_stats["auto_optimizations"] += 1
+    
+    try:
+        start_time = time.time()
+        
+        # Run optimization with THOROUGH mode
+        result = process_fleet_optimization({
+            'dashboard_url': dashboard_url
+        }, prefilter_distance=False)
+        
+        execution_time = time.time() - start_time
+        
+        result['trigger_type'] = 'event'
+        result['trigger_event'] = trigger_event
+        result['trigger_data'] = {'dashboard_url': dashboard_url}
+        result['total_execution_time_seconds'] = round(execution_time, 3)
+        
+        # OPTIMISTIC UPDATE: Mark tasks as assigned immediately
+        for route in result.get('agent_routes', []):
+            agent_id = route.get('driver_id')
+            agent_name = route.get('driver_name', 'Unknown')
+            new_tasks = route.get('assigned_new_tasks', [])
+            if new_tasks and agent_id and fleet_state:
+                for assigned_task_id in new_tasks:
+                    fleet_state.assign_task(assigned_task_id, str(agent_id), agent_name)
+        
+        # Emit updated routes
+        socketio.emit('fleet:routes_updated', result, namespace='/')
+        
+        assigned = result.get('metadata', {}).get('tasks_assigned', 0)
+        unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
+        log_event(f"[WebSocket] Follow-up optimization complete: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
+        
+        # Log reasons for unassigned tasks
+        unassigned_tasks = result.get('unassigned_tasks', [])
+        if unassigned_tasks:
+            log_event(f"[WebSocket] 📋 {len(unassigned_tasks)} unassigned task(s) with reasons:")
+            for ut in unassigned_tasks:
+                task_id = ut.get('task_id', 'unknown')[:20]
+                reason = ut.get('reason', 'unknown')
+                reason_detail = ut.get('reason_detail', '')
+                restaurant = ut.get('restaurant_name', 'Unknown')
+                log_event(f"  • {restaurant} ({task_id}...): {reason} - {reason_detail}")
+        
+    except Exception as e:
+        log_event(f"[WebSocket] Follow-up optimization failed: {e}", 'error')
+        socketio.emit('fleet:routes_updated', {
+            'trigger_type': 'event',
+            'trigger_event': trigger_event,
+            'error': str(e),
+            'success': False,
+            'agent_routes': [],
+            'unassigned_tasks': []
+        }, namespace='/')
+    finally:
+        # Check for more queued events (chain continues if needed)
+        _run_queued_optimization_if_needed()
 
 
 def trigger_incremental_optimization(
@@ -755,6 +909,18 @@ def handle_connect():
         ]
     })
 
+@socketio.on('ping')
+def handle_ping(data):
+    """
+    Respond to dashboard pings to keep Cloud Run connection alive.
+    Cloud Run disconnects idle WebSocket connections after 5 minutes.
+    """
+    emit('pong', {
+        'timestamp': data.get('timestamp'),
+        'sent_at': data.get('sent_at'),
+        'server_time': datetime.now().isoformat()
+    })
+
 @socketio.on('fleet:sync')
 def handle_fleet_sync(data):
     """
@@ -772,6 +938,7 @@ def handle_fleet_sync(data):
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     log_event(f"[WebSocket] fleet:sync received from dashboard")
+    log_payload('fleet:sync', data)
     
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         emit('fleet:sync_ack', {
@@ -797,6 +964,19 @@ def handle_fleet_sync(data):
         # Sync unassigned tasks
         unassigned_tasks = data.get('unassigned_tasks', [])
         if unassigned_tasks:
+            # DEBUG: Log premium fields for first task to verify dashboard is sending them
+            first_task = unassigned_tasks[0]
+            fee = first_task.get('delivery_fee', 'NOT_SENT')
+            tips = first_task.get('tips', 'NOT_SENT')
+            print(f"[DEBUG] First unassigned task fields: delivery_fee={fee}, tips={tips}")
+            if fee == 'NOT_SENT' or tips == 'NOT_SENT':
+                print(f"[DEBUG] ⚠️ Dashboard is NOT sending delivery_fee/tips! Keys present: {list(first_task.keys())}")
+            
+            # Mark these task IDs as explicitly unassigned by dashboard
+            # so we DON'T restore optimistic assignments for them
+            unassigned_task_ids = {t.get('id') for t in unassigned_tasks if t.get('id')}
+            fleet_state.set_dashboard_unassigned_tasks(unassigned_task_ids)
+            
             fleet_state.sync_tasks(unassigned_tasks)
             print(f"[FleetState] Synced {len(unassigned_tasks)} unassigned tasks")
         
@@ -824,9 +1004,10 @@ def handle_fleet_sync(data):
                 fleet_state.assignment_radius_km = max_dist
                 print(f"[FleetState] → max_distance_km = {max_dist}km")
             
-            if 'chain_lookahead_radius_km' in config:
-                fleet_state.chain_lookahead_radius_km = float(config['chain_lookahead_radius_km'])
-                print(f"[FleetState] → chain_lookahead_radius_km = {fleet_state.chain_lookahead_radius_km}km")
+            # Set chain_lookahead_radius_km to match max_distance_km (they should be the same)
+            if 'default_max_distance_km' in config:
+                fleet_state.chain_lookahead_radius_km = float(config['default_max_distance_km'])
+                print(f"[FleetState] → chain_lookahead_radius_km = {fleet_state.chain_lookahead_radius_km}km (synced with max_distance)")
             
             if 'max_lateness_minutes' in config:
                 fleet_state.max_lateness_minutes = int(config['max_lateness_minutes'])
@@ -939,6 +1120,7 @@ def handle_config_update(data):
             max_dist = float(config['default_max_distance_km'])
             fleet_state.max_distance_km = max_dist
             fleet_state.assignment_radius_km = max_dist  # Keep them in sync
+            fleet_state.chain_lookahead_radius_km = max_dist  # Keep chain lookahead in sync too
             changes.append(f"max_distance_km: {old_val} → {max_dist}")
         
         if 'max_lateness_minutes' in config:
@@ -966,10 +1148,8 @@ def handle_config_update(data):
                     agent.max_capacity = new_capacity
             changes.append(f"max_tasks_per_agent: {old_val} → {new_capacity}")
         
-        if 'chain_lookahead_radius_km' in config:
-            old_val = fleet_state.chain_lookahead_radius_km
-            fleet_state.chain_lookahead_radius_km = float(config['chain_lookahead_radius_km'])
-            changes.append(f"chain_lookahead_radius_km: {old_val} → {fleet_state.chain_lookahead_radius_km}")
+        # chain_lookahead_radius_km is now synced with max_distance_km automatically
+        # No need to update it separately in config updates
         
         # Log changes
         if changes:
@@ -1059,7 +1239,7 @@ def handle_fleet_optimize(data):
     Handle explicit fleet-wide optimization request.
     Returns optimized routes for ALL agents.
     
-    Uses THOROUGH mode (prefilter_distance=False) for comprehensive optimization.
+    Uses THOROUGH mode (prefilter_distance=False) - max_distance_km still enforced.
     """
     global _optimization_running
     client_id = request.sid
@@ -1069,18 +1249,24 @@ def handle_fleet_optimize(data):
         connected_clients[client_id]['events_received'] += 1
     
     request_id = data.get('request_id', str(uuid.uuid4()))
-    print(f"[WebSocket] fleet:optimize_request from {client_id}, request_id={request_id}")
+    log_payload('fleet:optimize_request', data)
+    log_event(f"[WebSocket] fleet:optimize_request from {client_id}, request_id={request_id}")
     
-    # Block if sync is in progress
+    # Block if sync is in progress - queue to run after sync
     if is_sync_in_progress():
-        print(f"[WebSocket] ⚠️ Sync in progress - deferring optimize request")
+        print(f"[WebSocket] ⚠️ Sync in progress - queuing manual optimize to run after sync")
+        queue_optimization_after_sync('fleet:optimize_request')
+        # Store the request data for when optimization runs
+        global _queued_dashboard_url, _queued_request_id
+        _queued_dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+        _queued_request_id = request_id
         emit('fleet:routes_updated', {
             'trigger_type': 'manual',
             'trigger_event': 'fleet:optimize_request',
             'request_id': request_id,
-            'error': 'Sync in progress - please wait and retry',
-            'success': False,
-            'sync_in_progress': True,
+            'message': 'Optimization queued - will run after sync completes',
+            'success': True,
+            'queued': True,
             'agent_routes': [],
             'unassigned_tasks': []
         })
@@ -1103,11 +1289,11 @@ def handle_fleet_optimize(data):
             return
         _optimization_running = True
     
-    print(f"[WebSocket] Mode: THOROUGH (solver handles distance)")
+    print(f"[WebSocket] Mode: THOROUGH (max_distance_km enforced)")
     
     try:
         start_time = time.time()
-        # ON-DEMAND: Use THOROUGH mode - solver handles distance constraints
+        # ON-DEMAND: Use THOROUGH mode - max_distance_km still enforced as hard constraint
         result = process_fleet_optimization(data, prefilter_distance=False)
         execution_time = time.time() - start_time
         
@@ -1130,10 +1316,21 @@ def handle_fleet_optimize(data):
         
         assigned = result.get('metadata', {}).get('tasks_assigned', 0)
         unassigned = result.get('metadata', {}).get('tasks_unassigned', 0)
-        print(f"[WebSocket] Sent fleet routes: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
+        log_event(f"[WebSocket] Manual optimize complete: {assigned} assigned, {unassigned} unassigned in {execution_time:.3f}s")
+        
+        # Log reasons for unassigned tasks (PERSISTENT LOG)
+        unassigned_tasks = result.get('unassigned_tasks', [])
+        if unassigned_tasks:
+            log_event(f"[WebSocket] 📋 {len(unassigned_tasks)} unassigned task(s) with reasons:")
+            for ut in unassigned_tasks:
+                task_id = ut.get('task_id', 'unknown')[:20]
+                reason = ut.get('reason', 'unknown')
+                reason_detail = ut.get('reason_detail', '')
+                restaurant = ut.get('restaurant_name', 'Unknown')
+                log_event(f"  • {restaurant} ({task_id}...): {reason} - {reason_detail}")
         
     except Exception as e:
-        print(f"[WebSocket] Error in fleet:optimize_request: {e}")
+        log_event(f"[WebSocket] Error in fleet:optimize_request: {e}", 'error')
         emit('fleet:routes_updated', {
             'trigger_type': 'manual',
             'trigger_event': 'fleet:optimize_request',
@@ -1164,7 +1361,15 @@ def handle_task_created(data):
     task_id = task_data.get('id', data.get('id', ''))
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    log_event(f"[WebSocket] task:created: {str(task_id)[:20]}...")
+    # Log payload and premium-related fields (these go to persistent logs)
+    log_payload('task:created', data)
+    delivery_fee = task_data.get('delivery_fee', 0)
+    tips = task_data.get('tips', 0)
+    is_premium = (float(delivery_fee) >= 18.0 or float(tips) >= 5.0)
+    premium_indicator = "⭐ PREMIUM" if is_premium else "regular"
+    log_event(f"[WebSocket] task:created: {str(task_id)[:20]}... | fee=${delivery_fee}, tips=${tips} [{premium_indicator}]")
+    if is_premium:
+        log_event(f"[WebSocket] ⭐ NEW PREMIUM TASK: {task_data.get('restaurant_name', 'Unknown')} | fee=${delivery_fee}, tips=${tips}")
     
     # Update fleet state
     triggered_optimization = False
@@ -1177,7 +1382,7 @@ def handle_task_created(data):
             return
         
         task = fleet_state.add_task(task_data)
-        print(f"[FleetState] Added task: {task.restaurant_name} → {task.customer_name}")
+        print(f"[FleetState] Added task: {task.restaurant_name} → {task.customer_name} | fee=${task.delivery_fee:.2f}, tips=${task.tips:.2f} [{premium_indicator}]")
         
         # PROACTIVE CHECK: Are any agents already near this task?
         eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
@@ -1187,8 +1392,29 @@ def handle_task_created(data):
         ]
         
         if nearby_eligible:
-            # Sort by distance to find best agent
-            nearby_eligible.sort(key=lambda x: x[1])
+            # PRIORITY ASSIGNMENT: For premium tasks, Priority 1 agents get first dibs
+            is_premium = task.is_premium_task
+            
+            if is_premium:
+                # For premium tasks: Check if ANY Priority 1 agent is available (not just nearby)
+                # If a P1 agent exists, skip proximity optimization and use full fleet optimization
+                all_p1_agents = [a for a in fleet_state.get_online_agents() if a.priority == 1 and a.has_capacity]
+                
+                if all_p1_agents:
+                    # Priority 1 agent(s) available! Skip proximity optimization for this premium task
+                    # Let the full fleet optimization handle it so P1 agents get exclusive access
+                    log_event(f"[FleetState] ⭐ PREMIUM TASK: {len(all_p1_agents)} Priority 1 agent(s) available ({[a.name for a in all_p1_agents]}) - skipping proximity, using full optimization")
+                    # Don't trigger proximity optimization - let event-based handle it
+                    nearby_eligible = []  # Clear to skip proximity
+                else:
+                    # No Priority 1 agents available - proceed with regular agents via proximity
+                    nearby_eligible.sort(key=lambda x: x[1])
+                    log_event(f"[FleetState] ⭐ PREMIUM TASK: No Priority 1 agents available - using proximity with regular agents")
+            else:
+                # For regular tasks: just sort by distance
+                nearby_eligible.sort(key=lambda x: x[1])
+        
+        if nearby_eligible:
             best_agent, best_dist, _ = nearby_eligible[0]
             
             # Determine trigger type based on agent's current tasks
@@ -1197,7 +1423,8 @@ def handle_task_created(data):
             else:
                 trigger_type = "current_location"  # Agent is idle and near
             
-            print(f"[FleetState] 🎯 NEW TASK: {best_agent.name} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
+            priority_indicator = " ⭐" if is_premium and best_agent.priority == 1 else ""
+            print(f"[FleetState] 🎯 NEW TASK: {best_agent.name}{priority_indicator} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
             
             # Check cooldown and trigger optimization
             if fleet_state.should_trigger_optimization(best_agent.id):
@@ -1251,6 +1478,7 @@ def handle_task_declined(data):
     latest_agent_name = latest_decline.get('agent_name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
+    log_payload('task:declined', data)
     log_event(f"[WebSocket] task:declined: {str(task_id)[:20]}... by {latest_agent_name} (total: {len(declined_by)} declines)")
     
     # Update fleet state - record the declines
@@ -1270,14 +1498,32 @@ def handle_task_declined(data):
             ]
             
             if nearby_eligible:
-                # Sort by distance to find best agent
-                nearby_eligible.sort(key=lambda x: x[1])
+                # PRIORITY ASSIGNMENT: For premium tasks, Priority 1 agents get first dibs
+                is_premium = task.is_premium_task
+                
+                if is_premium:
+                    # For premium tasks: Check if ANY Priority 1 agent is available (not just nearby)
+                    all_p1_agents = [a for a in fleet_state.get_online_agents() if a.priority == 1 and a.has_capacity]
+                    
+                    if all_p1_agents:
+                        # Priority 1 agent(s) available! Skip proximity optimization
+                        log_event(f"[FleetState] ⭐ PREMIUM TASK (declined): {len(all_p1_agents)} Priority 1 agent(s) available ({[a.name for a in all_p1_agents]}) - skipping proximity, using full optimization")
+                        nearby_eligible = []  # Clear to skip proximity
+                    else:
+                        # No Priority 1 agents available - proceed with regular agents
+                        nearby_eligible.sort(key=lambda x: x[1])
+                        log_event(f"[FleetState] ⭐ PREMIUM TASK (declined): No Priority 1 agents - using regular agents")
+                else:
+                    nearby_eligible.sort(key=lambda x: x[1])
+            
+            if nearby_eligible:
                 best_agent, best_dist, _ = nearby_eligible[0]
                 
                 # Determine trigger type
                 trigger_type = "projected_location" if best_agent.current_tasks else "current_location"
                 
-                print(f"[FleetState] 🔄 DECLINED: {best_agent.name} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
+                priority_indicator = " ⭐" if is_premium and best_agent.priority == 1 else ""
+                print(f"[FleetState] 🔄 DECLINED: {best_agent.name}{priority_indicator} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
                 
                 # Check cooldown and trigger optimization
                 if fleet_state.should_trigger_optimization(best_agent.id):
@@ -1336,11 +1582,13 @@ def handle_task_completed(data):
     job_type = data.get('job_type')  # 0=pickup, 1=delivery, None=assume delivery
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
+    log_payload('task:completed', data)
+    
     # Determine if this is a pickup or delivery completion
     is_pickup_completion = (job_type == 0 or job_type == '0')
     
     if is_pickup_completion:
-        print(f"[WebSocket] task:pickup_completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+        log_event(f"[WebSocket] task:pickup_completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
         
         # Just mark pickup as complete - DON'T remove task from agent
         if FLEET_STATE_AVAILABLE and fleet_state and task_id:
@@ -1487,6 +1735,8 @@ def handle_task_updated(data):
     task_id = data.get('id', '')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
+    log_payload('task:updated', data)
+    
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         emit('task:updated_ack', {
             'id': task_id,
@@ -1499,7 +1749,7 @@ def handle_task_updated(data):
     # Get existing task to compare what changed
     existing_task = fleet_state.get_task(task_id)
     if not existing_task:
-        print(f"[WebSocket] task:updated: {str(task_id)[:20]}... (task not found in fleet state)")
+        log_event(f"[WebSocket] task:updated: {str(task_id)[:20]}... (task not found in fleet state)")
         emit('task:updated_ack', {
             'id': task_id,
             'success': False,
@@ -1530,7 +1780,7 @@ def handle_task_updated(data):
                 old_agent = fleet_state.get_agent(str(old_assigned_agent))
                 if old_agent:
                     # Remove task from agent's current_tasks
-                    old_agent.current_tasks = [t for t in old_agent.current_tasks if t.task_id != task_id]
+                    old_agent.current_tasks = [t for t in old_agent.current_tasks if t.id != task_id]
                     # Recalculate agent status
                     if not old_agent.current_tasks:
                         old_agent.status = AgentStatus.IDLE
@@ -1548,7 +1798,7 @@ def handle_task_updated(data):
             if old_assigned_agent:
                 old_agent = fleet_state.get_agent(str(old_assigned_agent))
                 if old_agent:
-                    old_agent.current_tasks = [t for t in old_agent.current_tasks if t.task_id != task_id]
+                    old_agent.current_tasks = [t for t in old_agent.current_tasks if t.id != task_id]
                     if not old_agent.current_tasks:
                         old_agent.status = AgentStatus.IDLE
                     print(f"[FleetState] Task removed from {old_agent.name} (reassigning)")
@@ -1646,9 +1896,8 @@ def handle_task_updated(data):
         existing_task.restaurant_name = meta['restaurant_name']
         changes.append('restaurant_name')
     
-    if meta.get('customer_name') and existing_task.customer_name != meta['customer_name']:
-        existing_task.customer_name = meta['customer_name']
-        changes.append('customer_name')
+    # Note: customer_name is a read-only property derived from _meta, skip update
+    # The customer_name comes from _meta which we can update via update_task()
     
     # Update timestamp
     existing_task.last_updated = datetime.now(timezone.utc)
@@ -1716,6 +1965,8 @@ def handle_task_assigned(data):
     agent_name = data.get('agent_name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
+    log_payload('task:assigned', data)
+    
     # Update fleet state (returns None if already assigned to this agent)
     task = None
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
@@ -1779,6 +2030,8 @@ def handle_agent_online(data):
     """
     performance_stats["websocket_events"] += 1
     
+    log_payload('agent:online', data)
+    
     # Parse agent data (support both 'agent_id' and 'id' keys)
     agent_id = data.get('agent_id') or data.get('id')
     name = data.get('name', 'Unknown')
@@ -1792,7 +2045,7 @@ def handle_agent_online(data):
     # Build log string with key info
     priority_str = f" [Priority {priority}]" if priority else ""
     tags_str = f" tags={tags}" if tags else ""
-    print(f"[WebSocket] agent:online: {name} ({agent_id}){priority_str}{tags_str}")
+    log_event(f"[WebSocket] agent:online: {name} ({agent_id}){priority_str}{tags_str}")
     
     # Update fleet state with full agent profile
     if FLEET_STATE_AVAILABLE and fleet_state and agent_id:
@@ -1850,7 +2103,8 @@ def handle_agent_offline(data):
     name = data.get('name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] agent:offline: {name} ({agent_id})")
+    log_payload('agent:offline', data)
+    log_event(f"[WebSocket] agent:offline: {name} ({agent_id})")
     
     # Update fleet state
     if FLEET_STATE_AVAILABLE and fleet_state and agent_id:
@@ -2290,11 +2544,13 @@ def fleet_state_config():
         max_dist = float(data['max_distance_km'])
         fleet_state.max_distance_km = max_dist
         fleet_state.assignment_radius_km = max_dist  # Keep them in sync
+        fleet_state.chain_lookahead_radius_km = max_dist  # Keep chain lookahead in sync too
     if 'assignment_radius_km' in data:
         # Legacy support - also updates max_distance
         radius = float(data['assignment_radius_km'])
         fleet_state.assignment_radius_km = radius
         fleet_state.max_distance_km = radius
+        fleet_state.chain_lookahead_radius_km = radius  # Keep chain lookahead in sync too
     if 'max_lateness_minutes' in data:
         fleet_state.max_lateness_minutes = int(data['max_lateness_minutes'])
     if 'max_pickup_delay_minutes' in data:

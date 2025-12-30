@@ -1270,15 +1270,49 @@ class FleetOptimizer:
                     routing.SetAllowedVehiclesForIndex([agent_idx], delivery_index)
                     print(f"[FleetOptimizer]   Locked to agent {agent_idx} ({agent.name}): pickup->delivery")
                     
+                    # Add time windows for existing task - handle already-late gracefully
+                    raw_pickup_delta = (task.pickup_before - self.current_time).total_seconds()
+                    raw_delivery_delta = (task.delivery_before - self.current_time).total_seconds()
+                    
+                    if raw_pickup_delta < 0:
+                        # Pickup already late - allow pickup anytime in next 2 hours
+                        pickup_seconds = 0
+                        pickup_max = 7200  # 2 hours
+                        late_by = abs(raw_pickup_delta) / 60
+                        print(f"[FleetOptimizer]     ⚠️ Pickup already {late_by:.0f}min late - relaxing to 2hr window")
+                    else:
+                        pickup_seconds = int(raw_pickup_delta)
+                        pickup_max = pickup_seconds + self.max_pickup_delay_minutes * 60
+                    
+                    if raw_delivery_delta < 0:
+                        # Delivery already late - allow delivery anytime in next 2 hours
+                        delivery_max = 7200  # 2 hours
+                        late_by = abs(raw_delivery_delta) / 60
+                        print(f"[FleetOptimizer]     ⚠️ Delivery already {late_by:.0f}min late - relaxing to 2hr window")
+                    else:
+                        delivery_max = int(raw_delivery_delta) + self.max_lateness_minutes * 60
+                    
+                    time_dimension.CumulVar(pickup_index).SetMax(pickup_max)
+                    time_dimension.CumulVar(delivery_index).SetMax(delivery_max)
+                    
                 elif delivery_idx is not None:
                     # Delivery only (pickup completed)
                     delivery_index = manager.NodeToIndex(delivery_idx)
                     routing.SetAllowedVehiclesForIndex([agent_idx], delivery_index)
                     print(f"[FleetOptimizer]   Locked to agent {agent_idx} ({agent.name}): delivery only (pickup done)")
                     
-                    # Add time window for delivery - this is the real deadline
-                    deadline_seconds = self._time_to_seconds(task.delivery_before)
-                    time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # 30min grace
+                    # Add time window for delivery - handle already-late tasks gracefully
+                    # If deadline is in the past, give generous window to avoid ROUTING_FAIL
+                    raw_deadline_delta = (task.delivery_before - self.current_time).total_seconds()
+                    if raw_deadline_delta < 0:
+                        # Task is ALREADY LATE - give 2 hours from now to complete
+                        # This prevents late tasks from making entire solver fail
+                        late_by_minutes = abs(raw_deadline_delta) / 60
+                        deadline_seconds = 7200  # 2 hours from now
+                        print(f"[FleetOptimizer]     ⚠️ Task already {late_by_minutes:.0f}min late - relaxing constraint to 2hr window")
+                    else:
+                        deadline_seconds = int(raw_deadline_delta)
+                    time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # +30min grace
                 else:
                     print(f"[FleetOptimizer]   WARNING: No indices found for existing task!")
         
