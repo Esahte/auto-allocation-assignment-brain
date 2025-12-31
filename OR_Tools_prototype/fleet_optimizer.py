@@ -1430,13 +1430,17 @@ class FleetOptimizer:
             pickup_ready_time = self._time_to_seconds(task.pickup_before)
             delivery_deadline = self._time_to_seconds(task.delivery_before)
             
-            # Pickup: Allow arriving early (agent can wait for food)
-            # Don't set SetMin - it causes ROUTING_FAIL when combined with late existing tasks
-            # The agent will simply wait if they arrive before food is ready
-            # Allow late pickup with configurable grace period (food can wait for agent too)
+            # Pickup time window: [food_ready_time, food_ready_time + grace]
+            # SetMin ensures agent doesn't "leave" pickup before food is ready
+            # This is critical for accurate route timing - agent must WAIT for food
             max_pickup_delay = self.max_pickup_delay_minutes * 60  # Convert to seconds
-            # Give extra flexibility: pickup can happen from now until deadline + grace
+            
+            # If food is ready in the future, agent must wait until then
+            # If food is already ready (pickup_ready_time <= 0), agent can pick up immediately
+            pickup_min_time = max(0, pickup_ready_time)  # Can't be before "now" (time 0)
             pickup_max_time = pickup_ready_time + max_pickup_delay
+            
+            time_dimension.CumulVar(pickup_index).SetMin(pickup_min_time)
             time_dimension.CumulVar(pickup_index).SetMax(pickup_max_time)
             
             # Delivery: Use configurable max lateness as hard constraint
@@ -1445,7 +1449,7 @@ class FleetOptimizer:
             delivery_max_time = delivery_deadline + max_lateness_grace
             time_dimension.CumulVar(delivery_index).SetMax(delivery_max_time)
             
-            print(f"[FleetOptimizer] NEW TASK {task.id[:15]}... time windows: pickup=[0, {pickup_max_time}s/{pickup_max_time/60:.0f}min], delivery=[0, {delivery_max_time}s/{delivery_max_time/60:.0f}min]")
+            print(f"[FleetOptimizer] NEW TASK {task.id[:15]}... time windows: pickup=[{pickup_min_time}s/{pickup_min_time/60:.0f}min, {pickup_max_time}s/{pickup_max_time/60:.0f}min], delivery=[0, {delivery_max_time}s/{delivery_max_time/60:.0f}min]")
         
         # Add pickup-delivery constraints
         for pickup_idx, delivery_idx in pickup_delivery_pairs:
