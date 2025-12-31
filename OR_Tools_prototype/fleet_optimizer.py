@@ -1185,20 +1185,62 @@ class FleetOptimizer:
                                     other_customer = other_task.meta.get('customer_name', other_task.id[:15])
                                     logger.info(f"[FleetOptimizer]       {customer} delivery → {other_customer} delivery = {d2d_time}s ({d2d_time/60:.1f}min)")
         
+        # Build mapping of pickup → delivery for same-task pairs
+        # We should NOT penalize pickup→delivery of the same task - that's inherent to the order
+        same_task_deliveries = {}  # pickup_node → delivery_node
+        for task in self.routable_tasks:
+            pickup_idx = index_map['pickups'].get(task.id)
+            delivery_idx = index_map['deliveries'].get(task.id)
+            if pickup_idx is not None and delivery_idx is not None:
+                same_task_deliveries[pickup_idx] = delivery_idx
+        
+        # Build set of mandatory node indices (existing tasks + agent locations)
+        mandatory_nodes = set()
+        
+        # Existing task nodes are mandatory
+        for agent in self.agents:
+            for task in agent.current_tasks:
+                pickup_idx = index_map['pickups'].get(task.id)
+                delivery_idx = index_map['deliveries'].get(task.id)
+                if pickup_idx is not None:
+                    mandatory_nodes.add(pickup_idx)
+                if delivery_idx is not None:
+                    mandatory_nodes.add(delivery_idx)
+        
+        # Agent start/end locations are mandatory
+        for agent in self.agents:
+            start_idx = index_map['agent_starts'].get(agent.id)
+            end_idx = index_map['agent_ends'].get(agent.id)
+            if start_idx is not None:
+                mandatory_nodes.add(start_idx)
+            if end_idx is not None:
+                mandatory_nodes.add(end_idx)
+        
+        if mandatory_nodes:
+            print(f"[FleetOptimizer] Mandatory nodes (no distance penalty): {len(mandatory_nodes)} nodes from existing tasks/agents")
+        
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
             base_time = time_matrix[from_node][to_node] + DEFAULT_SERVICE_TIME_SECONDS
             
             # Chain-aware enforcement: progressive penalty for exceeding maxDistanceKm
+            # BUT skip penalties for:
+            #   1. Routes involving mandatory nodes (existing tasks, agent locations)
+            #   2. Same-task pickup→delivery (inherent to the order, can't change)
+            # Only penalize: delivery_A → pickup_B for different new tasks (multi-task chains)
             if distance_matrix is not None and max_distance_km is not None:
+                # Skip if either endpoint is mandatory
+                if from_node in mandatory_nodes or to_node in mandatory_nodes:
+                    return base_time
+                
+                # Skip if this is same-task pickup→delivery (inherent distance)
+                if same_task_deliveries.get(from_node) == to_node:
+                    return base_time
+                
+                # Apply penalty only for cross-task routes (delivery_A → pickup_B)
                 hop_distance_km = distance_matrix[from_node][to_node]
                 if hop_distance_km > max_distance_km:
-                    # Progressive (quadratic) penalty:
-                    # - 1km over: 1^2 * 600 = 10 min penalty
-                    # - 2km over: 2^2 * 600 = 40 min penalty  
-                    # - 3km over: 3^2 * 600 = 1.5 hour penalty
-                    # - 5km over: 5^2 * 600 = 4+ hour penalty (strongly discouraged)
                     excess_km = hop_distance_km - max_distance_km
                     penalty = int((excess_km ** 2) * BASE_PENALTY_PER_KM)
                     return base_time + penalty
