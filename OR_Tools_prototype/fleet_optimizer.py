@@ -464,7 +464,13 @@ class CompatibilityChecker:
             (is_compatible, reason) tuple
         """
         # =================================================================
-        # PRIORITY AGENT RULES (Check first)
+        # CAPACITY CHECK (Check FIRST - no point checking other rules if at capacity)
+        # =================================================================
+        if agent.available_capacity <= 0:
+            return False, "at_max_capacity"
+        
+        # =================================================================
+        # PRIORITY AGENT RULES (Check second)
         # =================================================================
         # Priority 1 agents ONLY get premium tasks (tips >= $5 OR delivery_fee >= $18)
         # They bypass distance constraints for qualifying tasks
@@ -681,6 +687,7 @@ class CompatibilityChecker:
         stats = {
             'total_pairs': 0,
             'compatible': 0,
+            'filtered_by_capacity': 0,
             'filtered_by_distance': 0,
             'filtered_by_cash': 0,
             'filtered_by_declined': 0,
@@ -697,6 +704,8 @@ class CompatibilityChecker:
                 
                 if is_compatible:
                     stats['compatible'] += 1
+                elif reason == 'at_max_capacity':
+                    stats['filtered_by_capacity'] += 1
                 elif 'distance_exceeded' in reason:
                     stats['filtered_by_distance'] += 1
                 elif reason in ['no_cash_tag', 'wallet_threshold_exceeded']:
@@ -1275,25 +1284,27 @@ class FleetOptimizer:
                     raw_delivery_delta = (task.delivery_before - self.current_time).total_seconds()
                     
                     if raw_pickup_delta < 0:
-                        # Pickup already late - allow pickup anytime in next 2 hours
+                        # Pickup already late - allow pickup anytime in next 3 hours
+                        # Generous window prevents late tasks from blocking new task assignments
                         pickup_seconds = 0
-                        pickup_max = 7200  # 2 hours
+                        pickup_max = 10800  # 3 hours
                         late_by = abs(raw_pickup_delta) / 60
-                        print(f"[FleetOptimizer]     ⚠️ Pickup already {late_by:.0f}min late - relaxing to 2hr window")
+                        print(f"[FleetOptimizer]     ⚠️ Pickup already {late_by:.0f}min late - relaxing to 3hr window")
                     else:
                         pickup_seconds = int(raw_pickup_delta)
                         pickup_max = pickup_seconds + self.max_pickup_delay_minutes * 60
                     
                     if raw_delivery_delta < 0:
-                        # Delivery already late - allow delivery anytime in next 2 hours
-                        delivery_max = 7200  # 2 hours
+                        # Delivery already late - allow delivery anytime in next 3 hours
+                        delivery_max = 10800  # 3 hours
                         late_by = abs(raw_delivery_delta) / 60
-                        print(f"[FleetOptimizer]     ⚠️ Delivery already {late_by:.0f}min late - relaxing to 2hr window")
+                        print(f"[FleetOptimizer]     ⚠️ Delivery already {late_by:.0f}min late - relaxing to 3hr window")
                     else:
                         delivery_max = int(raw_delivery_delta) + self.max_lateness_minutes * 60
                     
                     time_dimension.CumulVar(pickup_index).SetMax(pickup_max)
                     time_dimension.CumulVar(delivery_index).SetMax(delivery_max)
+                    print(f"[FleetOptimizer]     Time windows: pickup=[0, {pickup_max}s/{pickup_max/60:.0f}min], delivery=[0, {delivery_max}s/{delivery_max/60:.0f}min]")
                     
                 elif delivery_idx is not None:
                     # Delivery only (pickup completed)
@@ -1305,11 +1316,11 @@ class FleetOptimizer:
                     # If deadline is in the past, give generous window to avoid ROUTING_FAIL
                     raw_deadline_delta = (task.delivery_before - self.current_time).total_seconds()
                     if raw_deadline_delta < 0:
-                        # Task is ALREADY LATE - give 2 hours from now to complete
+                        # Task is ALREADY LATE - give 3 hours from now to complete
                         # This prevents late tasks from making entire solver fail
                         late_by_minutes = abs(raw_deadline_delta) / 60
-                        deadline_seconds = 7200  # 2 hours from now
-                        print(f"[FleetOptimizer]     ⚠️ Task already {late_by_minutes:.0f}min late - relaxing constraint to 2hr window")
+                        deadline_seconds = 10800  # 3 hours from now
+                        print(f"[FleetOptimizer]     ⚠️ Task already {late_by_minutes:.0f}min late - relaxing constraint to 3hr window")
                     else:
                         deadline_seconds = int(raw_deadline_delta)
                     time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # +30min grace
@@ -1377,17 +1388,22 @@ class FleetOptimizer:
             pickup_ready_time = self._time_to_seconds(task.pickup_before)
             delivery_deadline = self._time_to_seconds(task.delivery_before)
             
-            # Pickup: Don't arrive before food is ready (or you wait)
-            # Set minimum arrival time to when food is ready
-            time_dimension.CumulVar(pickup_index).SetMin(pickup_ready_time)
-            # Allow late pickup with configurable grace period (food can wait)
+            # Pickup: Allow arriving early (agent can wait for food)
+            # Don't set SetMin - it causes ROUTING_FAIL when combined with late existing tasks
+            # The agent will simply wait if they arrive before food is ready
+            # Allow late pickup with configurable grace period (food can wait for agent too)
             max_pickup_delay = self.max_pickup_delay_minutes * 60  # Convert to seconds
-            time_dimension.CumulVar(pickup_index).SetMax(pickup_ready_time + max_pickup_delay)
+            # Give extra flexibility: pickup can happen from now until deadline + grace
+            pickup_max_time = pickup_ready_time + max_pickup_delay
+            time_dimension.CumulVar(pickup_index).SetMax(pickup_max_time)
             
             # Delivery: Use configurable max lateness as hard constraint
             # This is the real deadline - prioritize this!
             max_lateness_grace = self.max_lateness_minutes * 60  # Convert to seconds
-            time_dimension.CumulVar(delivery_index).SetMax(delivery_deadline + max_lateness_grace)
+            delivery_max_time = delivery_deadline + max_lateness_grace
+            time_dimension.CumulVar(delivery_index).SetMax(delivery_max_time)
+            
+            print(f"[FleetOptimizer] NEW TASK {task.id[:15]}... time windows: pickup=[0, {pickup_max_time}s/{pickup_max_time/60:.0f}min], delivery=[0, {delivery_max_time}s/{delivery_max_time/60:.0f}min]")
         
         # Add pickup-delivery constraints
         for pickup_idx, delivery_idx in pickup_delivery_pairs:
@@ -1505,6 +1521,34 @@ class FleetOptimizer:
                 reason = f"infeasible_{status_name}"
                 print(f"[FleetOptimizer] No solution: {status_name} - {agents_with_space}/{len(self.agents)} agents have capacity")
                 print(f"[FleetOptimizer] Hint: Check time windows, distances, or constraint conflicts")
+                
+                # Debug: Show compatible agents for each unassigned task
+                for task in self.routable_tasks:
+                    compatible = []
+                    for i, agent in enumerate(self.agents):
+                        if i in task._compatible_vehicles if hasattr(task, '_compatible_vehicles') else []:
+                            compatible.append(f"{agent.name}(cap={agent.available_capacity})")
+                    print(f"[FleetOptimizer] DEBUG: Task {task.id[:15]}... compatible with: {compatible or 'unknown'}")
+                
+                # Debug: Show travel times from agent start to key locations
+                print(f"[FleetOptimizer] DEBUG: Travel time matrix (seconds):")
+                for agent in self.agents:
+                    start_idx = index_map['agent_starts'].get(agent.id)
+                    if start_idx is not None and start_idx < len(time_matrix):
+                        for task in self.routable_tasks:
+                            pickup_idx = index_map['pickups'].get(task.id)
+                            if pickup_idx is not None and pickup_idx < len(time_matrix[start_idx]):
+                                travel_time = time_matrix[start_idx][pickup_idx]
+                                print(f"[FleetOptimizer]   {agent.name} -> pickup {task.id[:10]}...: {travel_time}s ({travel_time/60:.1f}min)")
+                        # Show travel from existing task deliveries to new task pickups
+                        for existing_task in agent.current_tasks:
+                            existing_delivery_idx = index_map['deliveries'].get(existing_task.id)
+                            if existing_delivery_idx is not None:
+                                for new_task in self.routable_tasks:
+                                    new_pickup_idx = index_map['pickups'].get(new_task.id)
+                                    if new_pickup_idx is not None and existing_delivery_idx < len(time_matrix) and new_pickup_idx < len(time_matrix[existing_delivery_idx]):
+                                        travel_time = time_matrix[existing_delivery_idx][new_pickup_idx]
+                                        print(f"[FleetOptimizer]   {existing_task.id[:10]}... delivery -> {new_task.id[:10]}... pickup: {travel_time}s ({travel_time/60:.1f}min)")
             
             return self._empty_result(reason, solve_time)
     
@@ -1993,6 +2037,7 @@ class FleetOptimizer:
             'compatibility': {
                 'total_agent_task_pairs': compat_stats.get('total_pairs', 0),
                 'compatible_pairs': compat_stats.get('compatible', 0),
+                'filtered_by_capacity': compat_stats.get('filtered_by_capacity', 0),
                 'filtered_by_distance': compat_stats.get('filtered_by_distance', 0),
                 'filtered_by_cash_rules': compat_stats.get('filtered_by_cash', 0),
                 'filtered_by_declined': compat_stats.get('filtered_by_declined', 0),
@@ -2090,6 +2135,165 @@ class FleetOptimizer:
 # =============================================================================
 # MAIN OPTIMIZATION FUNCTION
 # =============================================================================
+
+def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True) -> Dict:
+    """
+    Wrapper around optimize_fleet that implements gradual agent elimination on ROUTING_FAIL.
+    
+    Strategy:
+    1. Try with all agents
+    2. If ROUTING_FAIL, identify agents with late existing tasks (problematic agents)
+    3. Remove most problematic agents in batches and retry
+    4. Keep eliminating until we get a solution
+    5. Ensures we still get multi-agent solutions when possible
+    
+    Args:
+        agents_data: Response from /api/test/or-tools/agents endpoint
+        tasks_data: Response from /api/test/or-tools/unassigned-tasks endpoint
+        prefilter_distance: Whether to pre-filter by distance
+    
+    Returns:
+        Optimization results with routes for each agent
+    """
+    from datetime import datetime, timezone
+    
+    original_agents = agents_data.get('agents', [])
+    
+    if len(original_agents) <= 1:
+        # Single agent - no point in elimination
+        return optimize_fleet(agents_data, tasks_data, prefilter_distance)
+    
+    # First attempt: Try with ALL agents
+    result = optimize_fleet(agents_data, tasks_data, prefilter_distance)
+    
+    # Check if we need to retry
+    if result.get('success', False):
+        return result  # Success! No retry needed
+    
+    # Check if it was ROUTING_FAIL
+    unassigned = result.get('unassigned_tasks', [])
+    is_routing_fail = any('ROUTING_FAIL' in str(ut.get('reason', '')) for ut in unassigned)
+    
+    if not is_routing_fail:
+        return result  # Different error, don't retry
+    
+    print(f"[FleetOptimizer] 🔄 ROUTING_FAIL detected - starting gradual agent elimination")
+    
+    # Analyze agents to find problematic ones (those with late existing tasks)
+    now = datetime.now(timezone.utc)
+    
+    def get_agent_lateness_score(agent_dict):
+        """Calculate how 'problematic' an agent is based on late tasks."""
+        current_tasks = agent_dict.get('current_tasks', [])
+        if not current_tasks:
+            return 0  # Idle agents are NOT problematic
+        
+        total_lateness = 0
+        for task in current_tasks:
+            delivery_before = task.get('delivery_before')
+            if delivery_before:
+                try:
+                    deadline = datetime.fromisoformat(delivery_before.replace('Z', '+00:00'))
+                    lateness_seconds = (now - deadline).total_seconds()
+                    if lateness_seconds > 0:
+                        total_lateness += lateness_seconds / 60  # Convert to minutes
+                except:
+                    pass
+        return total_lateness
+    
+    # Sort agents by lateness (most problematic first)
+    agents_with_scores = [(a, get_agent_lateness_score(a)) for a in original_agents]
+    agents_with_scores.sort(key=lambda x: x[1], reverse=True)  # Most late first
+    
+    # Identify problematic agents (those with any late tasks)
+    problematic_agents = [a for a, score in agents_with_scores if score > 0]
+    clean_agents = [a for a, score in agents_with_scores if score == 0]
+    
+    print(f"[FleetOptimizer] 📊 Agent analysis:")
+    print(f"[FleetOptimizer]   - {len(clean_agents)} clean agents (no late tasks)")
+    print(f"[FleetOptimizer]   - {len(problematic_agents)} problematic agents (have late tasks)")
+    
+    if not problematic_agents:
+        print(f"[FleetOptimizer] ⚠️ No problematic agents found - issue is elsewhere")
+        return result
+    
+    # Log the problematic agents
+    for agent, score in agents_with_scores[:5]:  # Show top 5
+        if score > 0:
+            print(f"[FleetOptimizer]   → {agent.get('name', 'Unknown')}: {score:.0f}min total lateness")
+    
+    # Gradual elimination: Remove problematic agents in batches
+    # Start by removing the MOST problematic ones
+    remaining_agents = original_agents.copy()
+    elimination_round = 0
+    
+    # Remove problematic agents in chunks (25% at a time, or at least 1)
+    chunk_size = max(1, len(problematic_agents) // 4)
+    
+    for i in range(0, len(problematic_agents), chunk_size):
+        elimination_round += 1
+        agents_to_remove = problematic_agents[i:i + chunk_size]
+        agent_ids_to_remove = {a.get('driver_id') or a.get('id') for a in agents_to_remove}
+        
+        # Filter out the problematic agents
+        remaining_agents = [a for a in remaining_agents 
+                          if (a.get('driver_id') or a.get('id')) not in agent_ids_to_remove]
+        
+        if not remaining_agents:
+            print(f"[FleetOptimizer] ❌ No agents remaining after elimination")
+            break
+        
+        removed_names = [a.get('name', 'Unknown') for a in agents_to_remove]
+        print(f"[FleetOptimizer] 🔄 Elimination round {elimination_round}: Removing {len(agents_to_remove)} agent(s): {removed_names}")
+        print(f"[FleetOptimizer]   Remaining: {len(remaining_agents)} agents")
+        
+        # Build new agents_data with remaining agents
+        retry_agents_data = agents_data.copy()
+        retry_agents_data['agents'] = remaining_agents
+        
+        # Retry optimization
+        retry_result = optimize_fleet(retry_agents_data, tasks_data, prefilter_distance)
+        
+        if retry_result.get('success', False):
+            assigned = retry_result.get('metadata', {}).get('tasks_assigned', 0)
+            print(f"[FleetOptimizer] ✅ SUCCESS after removing {elimination_round * chunk_size} problematic agent(s)!")
+            print(f"[FleetOptimizer]   Assigned {assigned} task(s) to {len(remaining_agents)} agent(s)")
+            
+            # Mark that this was a retry result
+            retry_result['elimination_rounds'] = elimination_round
+            retry_result['agents_eliminated'] = len(original_agents) - len(remaining_agents)
+            
+            return retry_result
+        
+        # Check if still ROUTING_FAIL
+        retry_unassigned = retry_result.get('unassigned_tasks', [])
+        still_routing_fail = any('ROUTING_FAIL' in str(ut.get('reason', '')) for ut in retry_unassigned)
+        
+        if not still_routing_fail:
+            print(f"[FleetOptimizer] ⚠️ Different error after elimination - stopping")
+            return retry_result
+    
+    # If we still failed after removing all problematic agents, 
+    # try with ONLY clean/idle agents
+    if clean_agents:
+        print(f"[FleetOptimizer] 🔄 Final attempt: Only {len(clean_agents)} clean agent(s)")
+        
+        final_agents_data = agents_data.copy()
+        final_agents_data['agents'] = clean_agents
+        
+        final_result = optimize_fleet(final_agents_data, tasks_data, prefilter_distance)
+        
+        if final_result.get('success', False):
+            assigned = final_result.get('metadata', {}).get('tasks_assigned', 0)
+            print(f"[FleetOptimizer] ✅ SUCCESS with clean agents only!")
+            print(f"[FleetOptimizer]   Assigned {assigned} task(s) to {len(clean_agents)} clean agent(s)")
+            final_result['elimination_rounds'] = 'all_problematic'
+            final_result['agents_eliminated'] = len(problematic_agents)
+            return final_result
+    
+    print(f"[FleetOptimizer] ❌ All elimination attempts failed")
+    return result  # Return original failure
+
 
 def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True) -> Dict:
     """

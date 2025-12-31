@@ -325,7 +325,7 @@ except ImportError:
 
 # Add import for fleet optimization
 try:
-    from fleet_optimizer import optimize_fleet
+    from fleet_optimizer import optimize_fleet, optimize_fleet_with_retry
     FLEET_AVAILABLE = True
 except ImportError:
     FLEET_AVAILABLE = False
@@ -428,7 +428,13 @@ def process_fleet_optimization(data: dict, prefilter_distance: bool = True) -> d
             agents_data = future_agents.result(timeout=30)
             tasks_data = future_tasks.result(timeout=30)
     
-    result = optimize_fleet(agents_data, tasks_data, prefilter_distance=prefilter_distance)
+    # Use retry version for THOROUGH mode (event-based) to handle ROUTING_FAIL gracefully
+    # PROXIMITY mode (prefilter_distance=True) uses regular optimize_fleet for speed
+    if prefilter_distance:
+        result = optimize_fleet(agents_data, tasks_data, prefilter_distance=True)
+    else:
+        # THOROUGH mode: Use gradual elimination on ROUTING_FAIL
+        result = optimize_fleet_with_retry(agents_data, tasks_data, prefilter_distance=False)
     
     performance_stats["fleet_optimizer_requests"] += 1
     performance_stats["total_requests"] += 1
@@ -517,6 +523,9 @@ def trigger_fleet_optimization(trigger_event: str, trigger_data: dict):
                 reason_detail = ut.get('reason_detail', '')
                 restaurant = ut.get('restaurant_name', 'Unknown')
                 log_event(f"  • {restaurant} ({task_id}...): {reason} - {reason_detail}")
+        
+        # NOTE: Gradual elimination is now handled inside optimize_fleet_with_retry
+        # No need for separate fallback logic here
         
     except Exception as e:
         log_event(f"[WebSocket] Auto-optimization failed: {e}", 'error')
