@@ -1374,6 +1374,16 @@ class FleetState:
     def sync_agents(self, agents_data: List[Dict[str, Any]]):
         """Sync all agents from dashboard data - replaces existing agents"""
         with self._lock:
+            # PRESERVE priority settings before clearing!
+            # Priority is set by agent:online event and should not be lost during fleet:sync
+            preserved_priorities = {
+                agent_id: agent.priority 
+                for agent_id, agent in self._agents.items() 
+                if agent.priority is not None
+            }
+            if preserved_priorities:
+                logger.info(f"[FleetState] 🔒 Preserving {len(preserved_priorities)} priority settings during sync")
+            
             # Clear existing agents (full sync replaces all)
             self._agents.clear()
             
@@ -1389,6 +1399,11 @@ class FleetState:
                     # Will be recalculated based on tasks
                     status = AgentStatus.IDLE
                 
+                # Priority: Use sync data if provided, otherwise restore preserved value
+                sync_priority = agent_data.get('priority')
+                preserved_priority = preserved_priorities.get(agent_id)
+                final_priority = sync_priority if sync_priority is not None else preserved_priority
+                
                 if agent_id in self._agents:
                     agent = self._agents[agent_id]
                     agent.current_location = Location(lat=location[0], lng=location[1])
@@ -1397,7 +1412,7 @@ class FleetState:
                     agent.tags = agent_data.get('tags', agent.tags)
                     agent.wallet_balance = float(agent_data.get('wallet_balance', agent.wallet_balance))
                     agent.max_capacity = int(agent_data.get('max_capacity', agent.max_capacity))
-                    agent.priority = agent_data.get('priority')  # None if not priority agent
+                    agent.priority = final_priority
                 else:
                     agent = AgentState(
                         id=agent_id,
@@ -1407,7 +1422,7 @@ class FleetState:
                         tags=agent_data.get('tags', []),
                         wallet_balance=float(agent_data.get('wallet_balance') or 0),
                         max_capacity=int(agent_data.get('max_capacity', 2)),
-                        priority=agent_data.get('priority')  # None if not priority agent
+                        priority=final_priority
                     )
                     self._agents[agent_id] = agent
                 
