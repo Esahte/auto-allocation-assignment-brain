@@ -601,12 +601,15 @@ class CompatibilityChecker:
     
     def _check_delivery_direction_coherence(self, agent: Agent, new_task: Task) -> Tuple[bool, str]:
         """
-        Check if the new task's delivery is in a coherent direction with existing task deliveries.
+        Check if the new task's delivery is in a coherent direction with agent's existing route.
         
-        This prevents assigning tasks where:
-        - Agent is at Restaurant A
-        - Existing task delivery goes NORTH
+        This prevents assigning tasks where the agent would have to zig-zag:
+        - Agent has existing delivery going NORTH
         - New task delivery goes SOUTH (opposite direction = inefficient)
+        
+        Uses agent's current location as reference point and compares:
+        1. Direction from agent to existing delivery locations
+        2. Direction from agent to new task's delivery
         
         Returns:
             (is_coherent, reason) tuple
@@ -614,44 +617,36 @@ class CompatibilityChecker:
         if not agent.current_tasks:
             return True, "no_existing_tasks"
         
-        # Get the reference point - use the new task's pickup location as the center
-        # (since agent will be at pickup to collect both orders)
-        center_lat = new_task.restaurant_location.lat
-        center_lng = new_task.restaurant_location.lng
+        # Use agent's current location as the reference point
+        # This gives us the overall route direction from where the agent is NOW
+        agent_lat = agent.current_location.lat
+        agent_lng = agent.current_location.lng
         
-        # Calculate direction vector for new task's delivery (from pickup to delivery)
+        # Calculate direction vector for new task's delivery (from agent to new delivery)
         new_delivery_lat = new_task.delivery_location.lat
         new_delivery_lng = new_task.delivery_location.lng
-        new_delta_lat = new_delivery_lat - center_lat
-        new_delta_lng = new_delivery_lng - center_lng
+        new_delta_lat = new_delivery_lat - agent_lat
+        new_delta_lng = new_delivery_lng - agent_lng
+        
+        new_magnitude = (new_delta_lat**2 + new_delta_lng**2) ** 0.5
+        if new_magnitude < 0.001:
+            return True, "delivery_at_agent_location"  # New delivery is where agent is
         
         # Check against each existing task's delivery direction
         for existing_task in agent.current_tasks:
-            # Only check tasks from the SAME or NEARBY restaurant (within 0.5km)
-            # Tasks from different restaurants don't need direction coherence
-            pickup_distance = _haversine_km(
-                center_lat, center_lng,
-                existing_task.restaurant_location.lat, existing_task.restaurant_location.lng
-            )
-            if pickup_distance > 0.5:  # Different restaurant, skip
-                continue
-            
-            # Calculate direction vector for existing task's delivery
+            # Calculate direction vector for existing task's delivery (from agent)
             existing_delivery_lat = existing_task.delivery_location.lat
             existing_delivery_lng = existing_task.delivery_location.lng
-            existing_delta_lat = existing_delivery_lat - center_lat
-            existing_delta_lng = existing_delivery_lng - center_lng
+            existing_delta_lat = existing_delivery_lat - agent_lat
+            existing_delta_lng = existing_delivery_lng - agent_lng
+            
+            existing_magnitude = (existing_delta_lat**2 + existing_delta_lng**2) ** 0.5
+            if existing_magnitude < 0.001:
+                continue  # Existing delivery is where agent is (about to deliver)
             
             # Calculate dot product to determine if directions are aligned
             # dot > 0 means same direction, dot < 0 means opposite
             dot_product = (new_delta_lat * existing_delta_lat) + (new_delta_lng * existing_delta_lng)
-            
-            # Calculate magnitudes for angle calculation
-            new_magnitude = (new_delta_lat**2 + new_delta_lng**2) ** 0.5
-            existing_magnitude = (existing_delta_lat**2 + existing_delta_lng**2) ** 0.5
-            
-            if new_magnitude < 0.001 or existing_magnitude < 0.001:
-                continue  # Skip if delivery is at same location as pickup
             
             # Calculate cosine of angle between directions
             cos_angle = dot_product / (new_magnitude * existing_magnitude)
@@ -660,15 +655,41 @@ class CompatibilityChecker:
             # This threshold allows some flexibility but rejects clearly opposite routes
             if cos_angle < -0.3:
                 # Calculate actual distances for logging
-                new_dist = _haversine_km(center_lat, center_lng, new_delivery_lat, new_delivery_lng)
-                existing_dist = _haversine_km(center_lat, center_lng, existing_delivery_lat, existing_delivery_lng)
+                new_dist = _haversine_km(agent_lat, agent_lng, new_delivery_lat, new_delivery_lng)
+                existing_dist = _haversine_km(agent_lat, agent_lng, existing_delivery_lat, existing_delivery_lng)
+                
+                # Determine cardinal directions for clearer logging
+                new_dir = self._get_cardinal_direction(new_delta_lat, new_delta_lng)
+                existing_dir = self._get_cardinal_direction(existing_delta_lat, existing_delta_lng)
                 
                 logger.info(f"[FleetOptimizer] ⛔ DIRECTION BLOCK: {agent.name} has delivery going "
-                          f"{'N' if existing_delta_lat > 0 else 'S'} ({existing_dist:.1f}km), "
-                          f"new task goes {'N' if new_delta_lat > 0 else 'S'} ({new_dist:.1f}km) - OPPOSITE DIRECTION")
+                          f"{existing_dir} ({existing_dist:.1f}km from agent), "
+                          f"new task goes {new_dir} ({new_dist:.1f}km) - OPPOSITE DIRECTION (cos={cos_angle:.2f})")
                 return False, f"opposite_delivery_direction"
         
         return True, "direction_coherent"
+    
+    def _get_cardinal_direction(self, delta_lat: float, delta_lng: float) -> str:
+        """Get cardinal direction string from lat/lng deltas."""
+        import math
+        angle = math.atan2(delta_lng, delta_lat) * 180 / math.pi  # Angle from north
+        
+        if -22.5 <= angle < 22.5:
+            return "N"
+        elif 22.5 <= angle < 67.5:
+            return "NE"
+        elif 67.5 <= angle < 112.5:
+            return "E"
+        elif 112.5 <= angle < 157.5:
+            return "SE"
+        elif angle >= 157.5 or angle < -157.5:
+            return "S"
+        elif -157.5 <= angle < -112.5:
+            return "SW"
+        elif -112.5 <= angle < -67.5:
+            return "W"
+        else:  # -67.5 <= angle < -22.5
+            return "NW"
     
     def build_compatibility_matrix(self, 
                                    agents: List[Agent], 
