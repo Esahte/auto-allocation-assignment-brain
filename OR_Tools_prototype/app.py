@@ -1435,23 +1435,20 @@ def handle_task_created(data):
             priority_indicator = " ⭐" if is_premium and best_agent.priority == 1 else ""
             print(f"[FleetState] 🎯 NEW TASK: {best_agent.name}{priority_indicator} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
             
-            # Check cooldown and trigger optimization
-            if fleet_state.should_trigger_optimization(best_agent.id):
-                fleet_state.record_optimization(best_agent.id)
-                triggered_optimization = True
-                
-                # Trigger incremental optimization
-                trigger_incremental_optimization(
-                    agent_id=best_agent.id,
-                    agent_name=best_agent.name,
-                    task_id=task_id,
-                    task_name=task.restaurant_name,
-                    distance_km=best_dist,
-                    trigger_type=trigger_type,
-                    dashboard_url=dashboard_url
-                )
-            else:
-                print(f"[FleetState] ⏳ {best_agent.name} on cooldown, skipping immediate optimization")
+            # Trigger optimization immediately (no cooldown)
+            fleet_state.record_optimization(best_agent.id)
+            triggered_optimization = True
+            
+            # Trigger incremental optimization
+            trigger_incremental_optimization(
+                agent_id=best_agent.id,
+                agent_name=best_agent.name,
+                task_id=task_id,
+                task_name=task.restaurant_name,
+                distance_km=best_dist,
+                trigger_type=trigger_type,
+                dashboard_url=dashboard_url
+            )
         else:
             print(f"[FleetState] 📋 No eligible agents near {task.restaurant_name} - waiting for proximity trigger")
     
@@ -1534,23 +1531,20 @@ def handle_task_declined(data):
                 priority_indicator = " ⭐" if is_premium and best_agent.priority == 1 else ""
                 print(f"[FleetState] 🔄 DECLINED: {best_agent.name}{priority_indicator} is {best_dist:.2f}km from {task.restaurant_name} ({trigger_type})")
                 
-                # Check cooldown and trigger optimization
-                if fleet_state.should_trigger_optimization(best_agent.id):
-                    fleet_state.record_optimization(best_agent.id)
-                    triggered_optimization = True
-                    
-                    # Trigger incremental optimization
-                    trigger_incremental_optimization(
-                        agent_id=best_agent.id,
-                        agent_name=best_agent.name,
-                        task_id=task_id,
-                        task_name=task.restaurant_name,
-                        distance_km=best_dist,
-                        trigger_type=trigger_type,
-                        dashboard_url=dashboard_url
-                    )
-                else:
-                    print(f"[FleetState] ⏳ {best_agent.name} on cooldown, skipping immediate optimization")
+                # Trigger optimization immediately (no cooldown)
+                fleet_state.record_optimization(best_agent.id)
+                triggered_optimization = True
+                
+                # Trigger incremental optimization
+                trigger_incremental_optimization(
+                    agent_id=best_agent.id,
+                    agent_name=best_agent.name,
+                    task_id=task_id,
+                    task_name=task.restaurant_name,
+                    distance_km=best_dist,
+                    trigger_type=trigger_type,
+                    dashboard_url=dashboard_url
+                )
             else:
                 print(f"[FleetState] 📋 No other eligible agents near {task.restaurant_name} - waiting for proximity trigger")
     
@@ -2245,29 +2239,20 @@ def handle_agent_location_update(data):
             best_trigger = min(eligible_triggers, key=lambda t: t.distance_km)
             print(f"[DEBUG] Best trigger: {name} → {best_trigger.task.restaurant_name} ({best_trigger.distance_km:.2f}km)")
             
-            # Check cooldown
-            can_trigger = fleet_state.should_trigger_optimization(agent_id)
-            print(f"[DEBUG] Cooldown check for {name}: {'PASSED' if can_trigger else 'ON COOLDOWN'}")
+            # Trigger optimization immediately (no cooldown)
+            print(f"[FleetState] 🎯 Proximity trigger: {name} is {best_trigger.distance_km:.2f}km from {best_trigger.task.restaurant_name}")
+            fleet_state.record_optimization(agent_id)
             
-            if can_trigger:
-                print(f"[FleetState] 🎯 Proximity trigger: {name} is {best_trigger.distance_km:.2f}km from {best_trigger.task.restaurant_name}")
-                fleet_state.record_optimization(agent_id)
-                
-                # Trigger incremental optimization for this agent
-                trigger_incremental_optimization(
-                    agent_id=agent_id,
-                    agent_name=name,
-                    task_id=best_trigger.task.id,
-                    task_name=best_trigger.task.restaurant_name,
-                    distance_km=best_trigger.distance_km,
-                    trigger_type=best_trigger.trigger_type,
-                    dashboard_url=data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
-                )
-            else:
-                # Throttled log for cooldown skips
-                _should_log = _should_log_location(agent_id)
-                if _should_log:
-                    print(f"[FleetState] ⏳ {name} near tasks but on cooldown")
+            # Trigger incremental optimization for this agent
+            trigger_incremental_optimization(
+                agent_id=agent_id,
+                agent_name=name,
+                task_id=best_trigger.task.id,
+                task_name=best_trigger.task.restaurant_name,
+                distance_km=best_trigger.distance_km,
+                trigger_type=best_trigger.trigger_type,
+                dashboard_url=data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+            )
         else:
             # No eligible triggers - throttled logging for regular updates
             if _should_log_location(agent_id):

@@ -1336,17 +1336,12 @@ class FleetState:
     def should_trigger_optimization(self, agent_id: str) -> bool:
         """
         Check if we should trigger optimization for this agent.
-        Implements cooldown to prevent over-optimization.
+        
+        COOLDOWN DISABLED: Agents constantly request tasks, so no need to throttle.
+        Always returns True to allow immediate optimization on proximity triggers.
         """
-        with self._lock:
-            now = time.time()
-            last_opt = self._last_optimization_time.get(agent_id, 0)
-            
-            if now - last_opt < self.optimization_cooldown_seconds:
-                self._stats['optimizations_skipped_cooldown'] += 1
-                return False
-            
-            return True
+        # Cooldown removed - always allow optimization
+        return True
     
     def record_optimization(self, agent_id: str):
         """Record that optimization was triggered for this agent"""
