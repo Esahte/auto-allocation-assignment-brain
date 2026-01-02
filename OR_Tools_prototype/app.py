@@ -226,6 +226,228 @@ _events_queued_during_optimization = []  # List of event types that arrived duri
 _queued_dashboard_url = None  # Dashboard URL to use for queued optimization
 _queued_request_id = None  # Request ID for queued manual optimization
 
+# =============================================================================
+# BROADCAST ASSIGNMENT SYSTEM
+# =============================================================================
+# Instead of assigning one task to one agent, broadcast offers to ALL eligible
+# agents. First to accept wins, others are notified task was taken.
+# =============================================================================
+
+# Track pending broadcast offers: {task_id: {'offered_to': [agent_ids], 'offered_at': timestamp}}
+_pending_broadcast_offers = {}
+_broadcast_lock = threading.Lock()
+
+# Configuration
+BROADCAST_MODE_ENABLED = True  # Set to True to enable broadcast assignment
+BROADCAST_OFFER_TIMEOUT_SECONDS = 120  # How long offers stay valid (2 minutes)
+BROADCAST_MAX_AGENTS = 10  # Max agents to broadcast to per task (0 = unlimited)
+
+
+def broadcast_task_offer(task_id: str, dashboard_url: str) -> dict:
+    """
+    Broadcast a task offer to ALL eligible agents within range.
+    
+    Returns dict with: {
+        'success': bool,
+        'offered_to': [agent_ids],
+        'task_id': task_id
+    }
+    """
+    global _pending_broadcast_offers
+    
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        return {'success': False, 'error': 'Fleet state not available', 'offered_to': []}
+    
+    task = fleet_state.get_task(task_id)
+    if not task:
+        return {'success': False, 'error': 'Task not found', 'offered_to': []}
+    
+    # Find all eligible agents
+    eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
+    
+    # Filter to only truly eligible (reason is None) and within assignment radius
+    radius = fleet_state.assignment_radius_km
+    eligible_list = [
+        (agent, dist) for agent, dist, reason in eligible_agents
+        if reason is None and dist <= radius and agent.has_capacity
+    ]
+    
+    if not eligible_list:
+        # Try expanded radius if no one nearby
+        expanded_radius = radius * 2  # Double the radius
+        eligible_list = [
+            (agent, dist) for agent, dist, reason in eligible_agents
+            if reason is None and dist <= expanded_radius and agent.has_capacity
+        ]
+        if eligible_list:
+            log_event(f"[Broadcast] 📡 Expanded radius to {expanded_radius:.1f}km for {task.restaurant_name}")
+    
+    if not eligible_list:
+        log_event(f"[Broadcast] ❌ No eligible agents for {task.restaurant_name}")
+        return {'success': False, 'error': 'No eligible agents', 'offered_to': []}
+    
+    # Limit number of agents if configured
+    if BROADCAST_MAX_AGENTS > 0:
+        eligible_list = eligible_list[:BROADCAST_MAX_AGENTS]
+    
+    # Extract agent info
+    offered_agents = []
+    for agent, dist in eligible_list:
+        offered_agents.append({
+            'id': agent.id,
+            'name': agent.name,
+            'distance_km': round(dist, 2)
+        })
+    
+    agent_ids = [a['id'] for a in offered_agents]
+    agent_names = [a['name'] for a in offered_agents]
+    
+    # Track pending offer
+    with _broadcast_lock:
+        _pending_broadcast_offers[task_id] = {
+            'offered_to': agent_ids,
+            'offered_at': time.time(),
+            'task_name': task.restaurant_name
+        }
+    
+    # Emit broadcast offer to dashboard (which routes to agents)
+    offer_payload = {
+        'event': 'task:offered',
+        'task_id': task_id,
+        'task': {
+            'id': task_id,
+            'restaurant_name': task.restaurant_name,
+            'customer_name': task.customer_name,
+            'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
+            'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
+            'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+            'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
+            'delivery_fee': task.delivery_fee,
+            'tips': task.tips,
+            'payment_type': task.payment_type,
+            'tags': task.tags
+        },
+        'offered_to': offered_agents,
+        'expires_at': (datetime.now(timezone.utc).timestamp() + BROADCAST_OFFER_TIMEOUT_SECONDS),
+        'dashboard_url': dashboard_url
+    }
+    
+    socketio.emit('task:offered', offer_payload)
+    
+    log_event(f"[Broadcast] 📡 OFFERED {task.restaurant_name} to {len(offered_agents)} agents: {agent_names}")
+    
+    return {
+        'success': True,
+        'task_id': task_id,
+        'offered_to': agent_ids,
+        'agent_names': agent_names
+    }
+
+
+def handle_task_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
+    """
+    Handle when an agent accepts a broadcast offer.
+    First to accept wins, others are notified.
+    
+    Returns dict with: {
+        'success': bool,
+        'assigned': bool (True if this agent got it),
+        'reason': str
+    }
+    """
+    global _pending_broadcast_offers
+    
+    with _broadcast_lock:
+        pending = _pending_broadcast_offers.get(task_id)
+        
+        if not pending:
+            # No pending offer - either expired, already taken, or wasn't broadcast
+            return {
+                'success': False,
+                'assigned': False,
+                'reason': 'no_pending_offer'
+            }
+        
+        # Check if this agent was offered the task
+        if agent_id not in pending['offered_to']:
+            return {
+                'success': False,
+                'assigned': False,
+                'reason': 'not_offered_to_this_agent'
+            }
+        
+        # Check expiry
+        offer_age = time.time() - pending['offered_at']
+        if offer_age > BROADCAST_OFFER_TIMEOUT_SECONDS:
+            del _pending_broadcast_offers[task_id]
+            return {
+                'success': False,
+                'assigned': False,
+                'reason': 'offer_expired'
+            }
+        
+        # SUCCESS! This agent wins
+        other_agents = [aid for aid in pending['offered_to'] if aid != agent_id]
+        task_name = pending.get('task_name', task_id[:20])
+        
+        # Remove from pending offers
+        del _pending_broadcast_offers[task_id]
+    
+    # Assign task to winner
+    if fleet_state:
+        fleet_state.assign_task(task_id, agent_id)
+    
+    # Emit assignment event
+    assignment_payload = {
+        'id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'assigned_at': datetime.now(timezone.utc).isoformat(),
+        'assignment_type': 'broadcast_accepted',
+        'dashboard_url': dashboard_url
+    }
+    socketio.emit('task:assigned', assignment_payload)
+    log_event(f"[Broadcast] ✅ ACCEPTED: {task_name} → {agent_name} (beat {len(other_agents)} other agents)")
+    
+    # Notify other agents that task was taken
+    if other_agents:
+        taken_payload = {
+            'event': 'task:taken',
+            'task_id': task_id,
+            'taken_by': {
+                'agent_id': agent_id,
+                'agent_name': agent_name
+            },
+            'notify_agents': other_agents,
+            'dashboard_url': dashboard_url
+        }
+        socketio.emit('task:taken', taken_payload)
+        log_event(f"[Broadcast] 📢 Notified {len(other_agents)} agents that {task_name} was taken")
+    
+    return {
+        'success': True,
+        'assigned': True,
+        'reason': 'first_to_accept'
+    }
+
+
+def cleanup_expired_offers():
+    """Remove expired broadcast offers (called periodically)."""
+    global _pending_broadcast_offers
+    
+    with _broadcast_lock:
+        now = time.time()
+        expired = [
+            task_id for task_id, offer in _pending_broadcast_offers.items()
+            if now - offer['offered_at'] > BROADCAST_OFFER_TIMEOUT_SECONDS
+        ]
+        
+        for task_id in expired:
+            task_name = _pending_broadcast_offers[task_id].get('task_name', task_id[:20])
+            del _pending_broadcast_offers[task_id]
+            log_event(f"[Broadcast] ⏰ Offer expired: {task_name} (no acceptance)")
+
+
 def is_sync_in_progress() -> bool:
     """Check if a fleet sync is currently in progress."""
     with _sync_lock:
@@ -1462,8 +1684,25 @@ def handle_task_created(data):
         'triggered_optimization': triggered_optimization
     })
     
-    # EVENT-BASED: Only trigger if proximity didn't already assign the task
-    # Check if task is still unassigned after proximity optimization
+    # =========================================================================
+    # BROADCAST MODE: Offer task to ALL eligible agents simultaneously
+    # =========================================================================
+    if BROADCAST_MODE_ENABLED:
+        task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
+        if task_after and task_after.status == TaskStatus.UNASSIGNED:
+            # Broadcast to all eligible agents - first to accept wins
+            broadcast_result = broadcast_task_offer(task_id, dashboard_url)
+            if broadcast_result['success']:
+                print(f"[FleetState] 📡 BROADCAST MODE: Offered {task.restaurant_name} to {len(broadcast_result['offered_to'])} agents")
+                return  # Don't trigger optimization - wait for acceptance
+            else:
+                print(f"[FleetState] 📡 Broadcast failed ({broadcast_result.get('error')}), falling back to optimization")
+        elif task_after:
+            print(f"[FleetState] ⏩ Skipping broadcast - task already {task_after.status.value}")
+            return
+    
+    # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
+    # Only trigger if proximity didn't already assign the task
     task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
     if task_after and task_after.status == TaskStatus.UNASSIGNED:
         trigger_fleet_optimization('task:created', {
@@ -1562,8 +1801,21 @@ def handle_task_declined(data):
         'triggered_optimization': True
     })
     
-    # EVENT-BASED: Only try to reassign if proximity didn't already assign it
+    # =========================================================================
+    # BROADCAST MODE: Re-offer task to remaining eligible agents
+    # =========================================================================
     task_after_proximity = fleet_state.get_task(str(task_id)) if (FLEET_STATE_AVAILABLE and fleet_state and task_id) else None
+    
+    if BROADCAST_MODE_ENABLED and task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
+        # Re-broadcast to remaining eligible agents (excludes those who declined)
+        broadcast_result = broadcast_task_offer(task_id, dashboard_url)
+        if broadcast_result['success']:
+            log_event(f"[Broadcast] 📡 RE-BROADCAST after decline: {task.restaurant_name if task else task_id[:20]} to {len(broadcast_result['offered_to'])} agents")
+            return  # Don't trigger optimization - wait for acceptance
+        else:
+            log_event(f"[Broadcast] 📡 Re-broadcast failed ({broadcast_result.get('error')}), falling back to optimization")
+    
+    # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
     if task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
         trigger_fleet_optimization('task:declined', {
             'id': task_id,
@@ -1572,6 +1824,92 @@ def handle_task_declined(data):
         })
     elif task_after_proximity:
         print(f"[FleetState] ℹ️ Task {str(task_id)[:20]}... already assigned by proximity, skipping event-based optimization.")
+
+
+@socketio.on('task:accepted')
+def handle_task_accepted(data):
+    """
+    Agent accepts a broadcast task offer → First to accept wins.
+    
+    Payload: { 
+        task_id: str,
+        agent_id: str, 
+        agent_name: str,
+        dashboard_url: str 
+    }
+    
+    This is the NEW broadcast acceptance flow:
+    1. Task was broadcast to multiple agents via task:offered
+    2. Agent clicks "Accept" on their app
+    3. Dashboard sends task:accepted
+    4. First accept wins, others get task:taken notification
+    """
+    performance_stats["websocket_events"] += 1
+    task_id = data.get('task_id') or data.get('id', '')
+    agent_id = data.get('agent_id', '')
+    agent_name = data.get('agent_name', 'Unknown')
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    log_payload('task:accepted', data)
+    log_event(f"[WebSocket] task:accepted: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+    
+    # Handle the acceptance
+    result = handle_task_acceptance(task_id, agent_id, agent_name, dashboard_url)
+    
+    if result['success'] and result['assigned']:
+        # Successfully assigned!
+        emit('task:accepted_ack', {
+            'task_id': task_id,
+            'agent_id': agent_id,
+            'assigned': True,
+            'message': 'Task assigned to you!'
+        })
+    elif result['reason'] == 'no_pending_offer':
+        # Task wasn't broadcast or already taken
+        # Try to handle as a regular acceptance (fallback for non-broadcast tasks)
+        log_event(f"[Broadcast] ⚠️ No pending broadcast for {task_id[:20]}... - handling as direct acceptance")
+        
+        # Check if task exists and is unassigned
+        if fleet_state:
+            task = fleet_state.get_task(task_id)
+            if task and task.status == TaskStatus.UNASSIGNED:
+                # Direct assignment
+                fleet_state.assign_task(task_id, agent_id)
+                
+                assignment_payload = {
+                    'id': task_id,
+                    'agent_id': agent_id,
+                    'agent_name': agent_name,
+                    'assigned_at': datetime.now(timezone.utc).isoformat(),
+                    'assignment_type': 'direct_accepted',
+                    'dashboard_url': dashboard_url
+                }
+                socketio.emit('task:assigned', assignment_payload)
+                log_event(f"[Broadcast] ✅ DIRECT ACCEPT: {task.restaurant_name} → {agent_name}")
+                
+                emit('task:accepted_ack', {
+                    'task_id': task_id,
+                    'agent_id': agent_id,
+                    'assigned': True,
+                    'message': 'Task assigned to you!'
+                })
+            else:
+                emit('task:accepted_ack', {
+                    'task_id': task_id,
+                    'agent_id': agent_id,
+                    'assigned': False,
+                    'reason': 'task_not_available'
+                })
+    else:
+        # Failed - task was taken by someone else or offer expired
+        emit('task:accepted_ack', {
+            'task_id': task_id,
+            'agent_id': agent_id,
+            'assigned': False,
+            'reason': result['reason'],
+            'message': 'Task already taken by another agent' if result['reason'] == 'offer_expired' else result['reason']
+        })
+
 
 @socketio.on('task:completed')
 def handle_task_completed(data):
