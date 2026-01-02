@@ -1332,6 +1332,13 @@ class FleetOptimizer:
                         pickup_max = 10800  # 3 hours
                         late_by = abs(raw_pickup_delta) / 60
                         print(f"[FleetOptimizer]     ⚠️ Pickup already {late_by:.0f}min late - relaxing to 3hr window")
+                        
+                        # ESCALATING LATENESS PENALTY for pickup (food waiting at restaurant)
+                        base_penalty = 30  # Lower than delivery since food can wait a bit
+                        escalation_per_minute = 3
+                        pickup_lateness_penalty = int(base_penalty + (late_by * escalation_per_minute))
+                        time_dimension.SetCumulVarSoftUpperBound(pickup_index, 0, pickup_lateness_penalty)
+                        print(f"[FleetOptimizer]     📊 PICKUP LATENESS PENALTY: {pickup_lateness_penalty}/sec")
                     else:
                         pickup_seconds = int(raw_pickup_delta)
                         pickup_max = pickup_seconds + self.max_pickup_delay_minutes * 60
@@ -1341,6 +1348,13 @@ class FleetOptimizer:
                         delivery_max = 10800  # 3 hours
                         late_by = abs(raw_delivery_delta) / 60
                         print(f"[FleetOptimizer]     ⚠️ Delivery already {late_by:.0f}min late - relaxing to 3hr window")
+                        
+                        # ESCALATING LATENESS PENALTY for delivery
+                        base_penalty = 50
+                        escalation_per_minute = 5
+                        lateness_penalty = int(base_penalty + (late_by * escalation_per_minute))
+                        time_dimension.SetCumulVarSoftUpperBound(delivery_index, 0, lateness_penalty)
+                        print(f"[FleetOptimizer]     📊 DELIVERY LATENESS PENALTY: {lateness_penalty}/sec")
                     else:
                         delivery_max = int(raw_delivery_delta) + self.max_lateness_minutes * 60
                     
@@ -1362,10 +1376,24 @@ class FleetOptimizer:
                         # This prevents late tasks from making entire solver fail
                         late_by_minutes = abs(raw_deadline_delta) / 60
                         deadline_seconds = 10800  # 3 hours from now
-                        print(f"[FleetOptimizer]     ⚠️ Task already {late_by_minutes:.0f}min late - relaxing constraint to 3hr window")
+                        print(f"[FleetOptimizer]     ⚠️ Task already {late_by_minutes:.0f}min late - relaxing to 3hr window")
+                        
+                        # ESCALATING LATENESS PENALTY:
+                        # The more late a task already is, the more expensive it is to delay further
+                        # This prioritizes delivering late tasks BEFORE picking up new ones
+                        # Formula: base_penalty + (minutes_late * escalation_factor) per second of additional delay
+                        base_penalty = 50  # Base cost per second of delay
+                        escalation_per_minute = 5  # Additional penalty per minute already late
+                        lateness_penalty = int(base_penalty + (late_by_minutes * escalation_per_minute))
+                        
+                        # Soft upper bound: Ideally deliver ASAP (time 0), but allow up to 3 hours with penalty
+                        # Penalty = lateness_penalty * (arrival_time - 0) for each second past "now"
+                        time_dimension.SetCumulVarSoftUpperBound(delivery_index, 0, lateness_penalty)
+                        time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds)  # Hard limit at 3hr
+                        print(f"[FleetOptimizer]     📊 LATENESS PENALTY: {lateness_penalty}/sec (base:{base_penalty} + {late_by_minutes:.0f}min*{escalation_per_minute})")
                     else:
                         deadline_seconds = int(raw_deadline_delta)
-                    time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # +30min grace
+                        time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # +30min grace
                 else:
                     print(f"[FleetOptimizer]   WARNING: No indices found for existing task!")
         
