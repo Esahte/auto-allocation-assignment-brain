@@ -474,8 +474,9 @@ class FleetState:
                     agent.name = name
                 if location:
                     agent.current_location = Location(lat=location[0], lng=location[1])
-                if priority is not None:
-                    agent.priority = priority
+                # Priority: agent:online is SOURCE OF TRUTH - always update (even to None)
+                # This allows dashboard to explicitly remove priority by sending undefined/null
+                agent.priority = priority
                 if max_capacity is not None:
                     agent.max_capacity = max_capacity
                 if tags is not None:
@@ -522,11 +523,15 @@ class FleetState:
         max_capacity: Optional[int] = None,
         tags: Optional[List[str]] = None,
         priority: Optional[int] = None,
-        wallet_balance: Optional[float] = None
+        wallet_balance: Optional[float] = None,
+        priority_explicitly_set: bool = False
     ) -> Optional[AgentState]:
         """
         Update agent profile settings (not location).
-        Only updates fields that are provided (not None).
+        Only updates fields that are provided (not None), except priority.
+        
+        Args:
+            priority_explicitly_set: If True, update priority even if None (source of truth behavior)
         """
         with self._lock:
             if agent_id not in self._agents:
@@ -540,7 +545,11 @@ class FleetState:
                 agent.max_capacity = max_capacity
             if tags is not None:
                 agent.tags = tags
-            if priority is not None:
+            # Priority: agent:update is SOURCE OF TRUTH when explicitly_set
+            # This allows dashboard to explicitly remove priority by sending undefined/null
+            if priority_explicitly_set:
+                agent.priority = priority
+            elif priority is not None:
                 agent.priority = priority
             if wallet_balance is not None:
                 agent.wallet_balance = wallet_balance

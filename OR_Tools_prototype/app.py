@@ -2179,11 +2179,13 @@ def handle_agent_update(data):
             max_capacity=int(max_capacity) if max_capacity is not None else None,
             tags=tags,
             priority=priority,
-            wallet_balance=float(wallet_balance) if wallet_balance is not None else None
+            wallet_balance=float(wallet_balance) if wallet_balance is not None else None,
+            priority_explicitly_set=True  # agent:update is SOURCE OF TRUTH for priority
         )
         if agent:
             updated = True
-            print(f"[FleetState] ✓ Updated {agent.name}: capacity={agent.max_capacity}, tags={agent.tags}")
+            priority_str = f", priority={agent.priority}" if agent.priority else ""
+            print(f"[FleetState] ✓ Updated {agent.name}: capacity={agent.max_capacity}, tags={agent.tags}{priority_str}")
         else:
             print(f"[FleetState] ⚠️ Agent {agent_id} not found in fleet state")
     
