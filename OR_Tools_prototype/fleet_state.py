@@ -1232,7 +1232,100 @@ class FleetState:
         if max_dist is not None and distance > max_dist:
             return f"too_far ({distance:.1f}km > {max_dist}km)"
         
+        # 8. Direction Coherence - New task delivery should be in same direction as existing tasks
+        # Prevents inefficient zig-zag routes
+        if agent.current_tasks:
+            direction_result = self._check_delivery_direction_coherence(agent, task)
+            if direction_result:
+                return direction_result
+        
         return None  # Eligible!
+    
+    def _check_delivery_direction_coherence(self, agent: 'AgentState', task: 'TaskState') -> Optional[str]:
+        """
+        Check if the new task's delivery is in a coherent direction with agent's existing route.
+        
+        This prevents assigning tasks where the agent would have to zig-zag:
+        - Agent has existing delivery going NORTH
+        - New task delivery goes SOUTH (opposite direction = inefficient)
+        
+        Returns None if coherent, or reason string if not.
+        """
+        import math
+        
+        if not agent.current_tasks:
+            return None  # No existing tasks, any direction is fine
+        
+        # Use agent's current location as the reference point
+        agent_lat = agent.lat if agent.lat else 0
+        agent_lng = agent.lng if agent.lng else 0
+        
+        if agent_lat == 0 and agent_lng == 0:
+            return None  # No location data, can't check direction
+        
+        # Calculate direction vector for new task's delivery (from agent to new delivery)
+        new_delivery_lat = task.delivery_location.lat
+        new_delivery_lng = task.delivery_location.lng
+        new_delta_lat = new_delivery_lat - agent_lat
+        new_delta_lng = new_delivery_lng - agent_lng
+        
+        new_magnitude = (new_delta_lat**2 + new_delta_lng**2) ** 0.5
+        if new_magnitude < 0.001:
+            return None  # New delivery is where agent is
+        
+        # Check against each existing task's delivery direction
+        for existing_task in agent.current_tasks:
+            existing_task_obj = self._tasks.get(existing_task)
+            if not existing_task_obj:
+                continue
+            
+            # Calculate direction vector for existing task's delivery (from agent)
+            existing_delivery_lat = existing_task_obj.delivery_location.lat
+            existing_delivery_lng = existing_task_obj.delivery_location.lng
+            existing_delta_lat = existing_delivery_lat - agent_lat
+            existing_delta_lng = existing_delivery_lng - agent_lng
+            
+            existing_magnitude = (existing_delta_lat**2 + existing_delta_lng**2) ** 0.5
+            if existing_magnitude < 0.001:
+                continue  # Existing delivery is where agent is (about to deliver)
+            
+            # Calculate dot product to determine if directions are aligned
+            # dot > 0 means same direction, dot < 0 means opposite
+            dot_product = (new_delta_lat * existing_delta_lat) + (new_delta_lng * existing_delta_lng)
+            
+            # Calculate cosine of angle between directions
+            cos_angle = dot_product / (new_magnitude * existing_magnitude)
+            
+            # If cos_angle < -0.3 (angle > ~107 degrees), deliveries are in opposite directions
+            if cos_angle < -0.3:
+                # Determine cardinal directions for clearer reason
+                new_dir = self._get_cardinal_direction(new_delta_lat, new_delta_lng)
+                existing_dir = self._get_cardinal_direction(existing_delta_lat, existing_delta_lng)
+                return f"opposite_direction ({existing_dir}→{new_dir})"
+        
+        return None  # Direction is coherent
+    
+    def _get_cardinal_direction(self, delta_lat: float, delta_lng: float) -> str:
+        """Get cardinal direction string from lat/lng deltas."""
+        import math
+        angle = math.atan2(delta_lng, delta_lat) * 180 / math.pi  # Angle from north
+        
+        if -22.5 <= angle < 22.5:
+            return "N"
+        elif 22.5 <= angle < 67.5:
+            return "NE"
+        elif 67.5 <= angle < 112.5:
+            return "E"
+        elif 112.5 <= angle < 157.5:
+            return "SE"
+        elif angle >= 157.5 or angle < -157.5:
+            return "S"
+        elif -157.5 <= angle < -112.5:
+            return "SW"
+        elif -112.5 <= angle < -67.5:
+            return "W"
+        else:  # -67.5 <= angle < -22.5
+            return "NW"
     
     def _point_in_polygon(self, lat: float, lng: float, polygon: List[List[float]]) -> bool:
         """

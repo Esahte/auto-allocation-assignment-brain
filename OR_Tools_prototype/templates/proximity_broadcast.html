@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proximity Broadcast Debug</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --border: #30363d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+            --accent-purple: #a371f7;
+        }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        
+        .status-badge.connected { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+        .status-badge.disconnected { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
+        .status-badge.enabled { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
+        .status-badge.disabled { background: rgba(139, 148, 158, 0.2); color: var(--text-secondary); }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+        
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+        }
+        
+        .stat-card .value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            font-family: 'IBM Plex Mono', monospace;
+        }
+        
+        .stat-card .label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+        
+        .stat-card.blue .value { color: var(--accent-blue); }
+        .stat-card.green .value { color: var(--accent-green); }
+        .stat-card.orange .value { color: var(--accent-orange); }
+        .stat-card.purple .value { color: var(--accent-purple); }
+        
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        
+        @media (max-width: 1000px) {
+            .main-grid { grid-template-columns: 1fr; }
+        }
+        
+        .panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .panel-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-tertiary);
+        }
+        
+        .panel-header h2 {
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+        
+        .panel-content {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .broadcast-item {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .broadcast-item:last-child { border-bottom: none; }
+        
+        .broadcast-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .broadcast-task {
+            font-weight: 500;
+            color: var(--accent-orange);
+        }
+        
+        .broadcast-time {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            font-family: 'IBM Plex Mono', monospace;
+        }
+        
+        .broadcast-meta {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        
+        .agents-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        
+        .agent-chip {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            background: rgba(88, 166, 255, 0.15);
+            color: var(--accent-blue);
+        }
+        
+        .agent-chip.winner {
+            background: rgba(63, 185, 80, 0.2);
+            color: var(--accent-green);
+        }
+        
+        .log-entry {
+            padding: 8px 16px;
+            border-bottom: 1px solid var(--border);
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.8rem;
+            display: flex;
+            gap: 12px;
+        }
+        
+        .log-entry:last-child { border-bottom: none; }
+        
+        .log-time { color: var(--text-secondary); flex-shrink: 0; }
+        .log-message { word-break: break-word; }
+        
+        .log-entry.broadcast .log-message { color: var(--accent-purple); }
+        .log-entry.success .log-message { color: var(--accent-green); }
+        .log-entry.warning .log-message { color: var(--accent-orange); }
+        .log-entry.error .log-message { color: var(--accent-red); }
+        
+        .config-panel {
+            grid-column: 1 / -1;
+            margin-top: 20px;
+        }
+        
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            padding: 16px;
+        }
+        
+        .config-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .config-item label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+        
+        .config-item input, .config-item select {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.85rem;
+        }
+        
+        .config-item input:focus, .config-item select:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            font-family: 'Inter', sans-serif;
+            font-weight: 500;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        
+        .btn:hover { opacity: 0.8; }
+        
+        .btn-primary {
+            background: var(--accent-blue);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+        
+        .empty-state {
+            padding: 40px;
+            text-align: center;
+            color: var(--text-secondary);
+        }
+        
+        .timer-display {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.85rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(210, 153, 34, 0.2);
+            color: var(--accent-orange);
+        }
+        
+        .radius-display {
+            font-size: 0.75rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(163, 113, 247, 0.2);
+            color: var(--accent-purple);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>
+            📡 Proximity Broadcast Debug
+        </h1>
+        <div style="display: flex; gap: 12px; align-items: center;">
+            <span class="status-badge" id="modeBadge">LOADING</span>
+            <span class="status-badge" id="connectionBadge">Connecting...</span>
+        </div>
+    </div>
+    
+    <div class="stats-grid">
+        <div class="stat-card blue">
+            <div class="value" id="activebroadcasts">0</div>
+            <div class="label">Active Broadcasts</div>
+        </div>
+        <div class="stat-card green">
+            <div class="value" id="totalAgents">0</div>
+            <div class="label">Feasible Agents</div>
+        </div>
+        <div class="stat-card orange">
+            <div class="value" id="timeout">120</div>
+            <div class="label">Timeout (s)</div>
+        </div>
+        <div class="stat-card purple">
+            <div class="value" id="defaultRadius">3.0</div>
+            <div class="label">Default Radius (km)</div>
+        </div>
+    </div>
+    
+    <div class="main-grid">
+        <div class="panel">
+            <div class="panel-header">
+                <h2>📋 Active Proximity Broadcasts</h2>
+                <span id="broadcastCount" style="color: var(--text-secondary); font-size: 0.8rem;"></span>
+            </div>
+            <div class="panel-content" id="broadcastList">
+                <div class="empty-state">Waiting for proximity triggers...</div>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <div class="panel-header">
+                <h2>📝 Event Log</h2>
+                <button class="btn btn-secondary" onclick="clearLog()" style="padding: 4px 8px; font-size: 0.75rem;">Clear</button>
+            </div>
+            <div class="panel-content" id="logContent">
+                <div class="log-entry">
+                    <span class="log-time">--:--:--</span>
+                    <span class="log-message">Connecting to server...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="panel config-panel">
+        <div class="panel-header">
+            <h2>⚙️ Proximity Broadcast Settings</h2>
+        </div>
+        <div class="config-grid">
+            <div class="config-item">
+                <label>Mode</label>
+                <select id="modeSelect">
+                    <option value="true">Broadcast (Multi-Agent)</option>
+                    <option value="false">Auto-Assign (Single Agent)</option>
+                </select>
+            </div>
+            <div class="config-item">
+                <label>Task Timeout (seconds)</label>
+                <input type="number" id="timeoutInput" value="120" min="30" max="600" step="10">
+            </div>
+            <div class="config-item">
+                <label>Default Radius (km)</label>
+                <input type="number" id="radiusInput" value="3.0" min="0.5" max="10" step="0.5">
+            </div>
+            <div class="config-item" style="justify-content: flex-end;">
+                <button class="btn btn-primary" onclick="applySettings()">Apply Settings</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
+        
+        let activeBroadcasts = new Map();  // task_id -> broadcast data
+        let logEntries = [];
+        const MAX_LOG = 50;
+        
+        // Settings
+        let broadcastEnabled = true;
+        let taskTimeout = 120;
+        let defaultRadius = 3.0;
+        
+        socket.on('connect', () => {
+            document.getElementById('connectionBadge').textContent = 'Connected';
+            document.getElementById('connectionBadge').className = 'status-badge connected';
+            addLog('system', 'Connected to OR-Tools server');
+        });
+        
+        socket.on('disconnect', () => {
+            document.getElementById('connectionBadge').textContent = 'Disconnected';
+            document.getElementById('connectionBadge').className = 'status-badge disconnected';
+            addLog('error', 'Disconnected from server');
+        });
+        
+        // Listen for proximity broadcasts
+        socket.on('task:proximity', (data) => {
+            const task = data.task || {};
+            const agents = data.feasible_agents || [];
+            
+            activeBroadcasts.set(task.id, {
+                task_id: task.id,
+                task_name: task.restaurant_name,
+                customer: task.customer_name,
+                pickup_before: task.times?.pickup_before,
+                delivery_before: task.times?.delivery_before,
+                payment: task.payment?.total || 0,
+                is_premium: task.is_premium,
+                agents: agents,
+                competition: data.competition || agents.length,
+                first_offered_at: data.first_offered_at,
+                timeout_seconds: data.timeout_seconds || taskTimeout,
+                search_radius_km: data.search_radius_km || defaultRadius,
+                triggered_by: data.triggered_by,
+                timestamp: data.timestamp
+            });
+            
+            addLog('broadcast', `📡 ${task.restaurant_name} → ${agents.length} agents (radius: ${data.search_radius_km}km)`);
+            updateUI();
+        });
+        
+        // Task assigned - remove from active broadcasts
+        socket.on('task:assigned', (data) => {
+            if (activeBroadcasts.has(data.id)) {
+                const broadcast = activeBroadcasts.get(data.id);
+                activeBroadcasts.delete(data.id);
+                addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name}`);
+                updateUI();
+            }
+        });
+        
+        // Settings acknowledgment
+        socket.on('proximity:settings_ack', (data) => {
+            broadcastEnabled = data.proximity_broadcast_enabled;
+            taskTimeout = data.proximity_task_timeout_seconds;
+            defaultRadius = data.proximity_default_radius_km || 3.0;
+            updateSettingsUI();
+            addLog('system', `Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, timeout=${taskTimeout}s, radius=${defaultRadius}km`);
+        });
+        
+        // Timeout result
+        socket.on('proximity:timeout_result', (data) => {
+            if (data.success) {
+                addLog('warning', `⏰ Task ${data.task_id.substring(0, 15)}... timeout - re-broadcast to ${data.broadcast_count} agents`);
+            } else {
+                addLog('error', `⏰ Task timeout failed: ${data.error}`);
+            }
+        });
+        
+        // Expand result
+        socket.on('proximity:expand_result', (data) => {
+            if (data.success) {
+                addLog('broadcast', `📏 Radius expanded to ${data.new_radius_km}km - ${data.broadcast_count} agents`);
+            } else {
+                addLog('error', `📏 Expand failed: ${data.error}`);
+            }
+        });
+        
+        function updateUI() {
+            // Update stats
+            document.getElementById('activebroadcasts').textContent = activeBroadcasts.size;
+            
+            let totalAgents = 0;
+            activeBroadcasts.forEach(b => totalAgents += b.agents.length);
+            document.getElementById('totalAgents').textContent = totalAgents;
+            
+            document.getElementById('broadcastCount').textContent = activeBroadcasts.size > 0 
+                ? `${activeBroadcasts.size} task(s)` : '';
+            
+            // Render broadcasts
+            const list = document.getElementById('broadcastList');
+            if (activeBroadcasts.size === 0) {
+                list.innerHTML = '<div class="empty-state">No active broadcasts</div>';
+                return;
+            }
+            
+            const now = Date.now() / 1000;
+            let html = '';
+            
+            activeBroadcasts.forEach((b, taskId) => {
+                const elapsed = now - b.first_offered_at;
+                const remaining = Math.max(0, b.timeout_seconds - elapsed);
+                
+                html += `
+                    <div class="broadcast-item">
+                        <div class="broadcast-header">
+                            <span class="broadcast-task">${b.task_name} → ${b.customer}</span>
+                            <span class="timer-display">${Math.floor(remaining)}s</span>
+                        </div>
+                        <div class="broadcast-meta">
+                            ${b.is_premium ? '⭐ PREMIUM | ' : ''}
+                            $${b.payment.toFixed(2)} | 
+                            <span class="radius-display">${b.search_radius_km}km</span> |
+                            Triggered by: ${b.triggered_by}
+                        </div>
+                        <div class="agents-list">
+                            ${b.agents.map(a => `
+                                <span class="agent-chip">${a.agent_name} (${a.distance_km}km)</span>
+                            `).join('')}
+                        </div>
+                        <div style="margin-top: 8px; display: flex; gap: 8px;">
+                            <button class="btn btn-secondary" onclick="triggerTimeout('${taskId}')" style="padding: 4px 8px; font-size: 0.7rem;">
+                                Timeout
+                            </button>
+                            <button class="btn btn-secondary" onclick="expandRadius('${taskId}', ${b.search_radius_km + 2})" style="padding: 4px 8px; font-size: 0.7rem;">
+                                Expand +2km
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            list.innerHTML = html;
+        }
+        
+        function updateSettingsUI() {
+            document.getElementById('modeBadge').textContent = broadcastEnabled ? 'BROADCAST' : 'AUTO-ASSIGN';
+            document.getElementById('modeBadge').className = 'status-badge ' + (broadcastEnabled ? 'enabled' : 'disabled');
+            document.getElementById('modeSelect').value = broadcastEnabled.toString();
+            document.getElementById('timeoutInput').value = taskTimeout;
+            document.getElementById('radiusInput').value = defaultRadius;
+            document.getElementById('timeout').textContent = taskTimeout;
+            document.getElementById('defaultRadius').textContent = defaultRadius.toFixed(1);
+        }
+        
+        function applySettings() {
+            socket.emit('proximity:settings', {
+                proximity_broadcast_enabled: document.getElementById('modeSelect').value === 'true',
+                proximity_task_timeout_seconds: parseInt(document.getElementById('timeoutInput').value),
+                proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value),
+                dashboard_url: window.location.origin
+            });
+        }
+        
+        function triggerTimeout(taskId) {
+            socket.emit('proximity:timeout', {
+                task_id: taskId,
+                dashboard_url: window.location.origin
+            });
+        }
+        
+        function expandRadius(taskId, newRadius) {
+            socket.emit('proximity:expand_radius', {
+                task_id: taskId,
+                new_radius_km: newRadius,
+                dashboard_url: window.location.origin
+            });
+        }
+        
+        function addLog(type, message) {
+            const time = new Date().toLocaleTimeString();
+            logEntries.unshift({ time, type, message });
+            if (logEntries.length > MAX_LOG) logEntries = logEntries.slice(0, MAX_LOG);
+            renderLog();
+        }
+        
+        function renderLog() {
+            const content = document.getElementById('logContent');
+            content.innerHTML = logEntries.map(e => `
+                <div class="log-entry ${e.type}">
+                    <span class="log-time">${e.time}</span>
+                    <span class="log-message">${e.message}</span>
+                </div>
+            `).join('');
+        }
+        
+        function clearLog() {
+            logEntries = [];
+            renderLog();
+        }
+        
+        // Update timers every second
+        setInterval(updateUI, 1000);
+        
+        // Initial UI
+        updateSettingsUI();
+    </script>
+</body>
+</html>
+

@@ -237,102 +237,222 @@ _queued_request_id = None  # Request ID for queued manual optimization
 # Tasks have countdown timers - if not accepted, marketplace re-broadcasts.
 # =============================================================================
 
-_marketplace_lock = threading.Lock()
-_last_marketplace_broadcast = 0  # Timestamp of last broadcast (for debouncing)
-_task_offer_times = {}  # Track when each task was last broadcast: {task_id: timestamp}
+# Proximity Broadcast mode tracking
+_proximity_lock = threading.Lock()
+_last_proximity_broadcast = {}  # Track last broadcast per task: {task_id: timestamp}
+_task_offer_times = {}  # Track when each task was first offered: {task_id: timestamp}
+_task_expanded_radius = {}  # Track expanded radius per task: {task_id: radius_km}
 
 # Configuration (can be updated via dashboard settings)
-MARKETPLACE_MODE_ENABLED = True  # Toggle between marketplace and fleet optimization
-MARKETPLACE_DEBOUNCE_MS = 500  # Debounce rapid updates (500ms)
-MARKETPLACE_TASK_TIMEOUT_SECONDS = 120  # How long before task re-broadcasts (default 2 min)
+PROXIMITY_BROADCAST_ENABLED = True  # Toggle between broadcast (multi-agent) and auto-assign (single agent)
+PROXIMITY_DEBOUNCE_MS = 1000  # Debounce rapid broadcasts for same task (1 second)
+PROXIMITY_TASK_TIMEOUT_SECONDS = 120  # How long before task re-broadcasts (default 2 min)
+PROXIMITY_DEFAULT_RADIUS_KM = 3.0  # Default search radius
+PROXIMITY_MAX_RADIUS_KM = 10.0  # Maximum expanded radius
 
 
-def build_marketplace_state(dashboard_url: str) -> dict:
+def trigger_proximity_broadcast(
+    task_id: str,
+    triggered_by_agent: str,
+    dashboard_url: str,
+    radius_km: float = None
+) -> dict:
     """
-    Build the full marketplace state: all unassigned tasks with their eligible agents.
+    Run solver for a SINGLE task with all nearby agents in BROADCAST mode.
+    
+    Instead of assigning to one agent, this:
+    1. Finds all agents near the task (using both current and projected locations)
+    2. Runs the solver to verify time feasibility for each agent
+    3. Broadcasts task:proximity to all FEASIBLE agents
+    
+    Args:
+        task_id: The task to broadcast
+        triggered_by_agent: Name of agent who triggered proximity (for logging)
+        dashboard_url: Dashboard URL for callbacks
+        radius_km: Search radius (uses expanded radius if set, else default)
     
     Returns: {
-        'tasks': [
-            {
-                'id': task_id,
-                'restaurant_name': ...,
-                'customer_name': ...,
-                'locations': {...},
-                'times': {...},
-                'payment': {...},
-                'eligible_agents': [
-                    {'agent_id': ..., 'agent_name': ..., 'distance_km': ...}
-                ],
-                'competition': 3  # Number of agents who can see this task
-            }
-        ],
-        'agents': [
-            {
-                'agent_id': ...,
-                'agent_name': ...,
-                'available_tasks': [task_ids they're eligible for],
-                'current_tasks': count
-            }
-        ],
-        'timestamp': ...
+        'success': bool,
+        'task_id': str,
+        'feasible_agents': [...],
+        'infeasible_agents': [...],
+        'broadcast_count': int
     }
     """
-    global _task_offer_times
+    global _task_offer_times, _last_proximity_broadcast
     
     if not FLEET_STATE_AVAILABLE or not fleet_state:
-        return {'tasks': [], 'agents': [], 'timestamp': time.time(), 'error': 'Fleet state not available'}
+        return {'success': False, 'error': 'Fleet state not available'}
     
-    # Get all unassigned tasks
-    unassigned_tasks = fleet_state.get_unassigned_tasks()
+    task = fleet_state.get_task(task_id)
+    if not task:
+        return {'success': False, 'error': 'Task not found'}
     
-    # Get all available agents (online + has capacity)
-    available_agents = fleet_state.get_available_agents()
+    if task.status != TaskStatus.UNASSIGNED:
+        return {'success': False, 'error': 'Task already assigned'}
     
-    # Track first_offered_at for new tasks, clean up completed/assigned tasks
+    # Debounce per-task broadcasts
     now = time.time()
-    unassigned_ids = {t.id for t in unassigned_tasks}
+    with _proximity_lock:
+        last_broadcast = _last_proximity_broadcast.get(task_id, 0)
+        if (now - last_broadcast) * 1000 < PROXIMITY_DEBOUNCE_MS:
+            return {'success': True, 'debounced': True}
+        _last_proximity_broadcast[task_id] = now
     
-    with _marketplace_lock:
-        # Remove tracking for tasks no longer unassigned
-        for task_id in list(_task_offer_times.keys()):
-            if task_id not in unassigned_ids:
-                del _task_offer_times[task_id]
-        
-        # Track new tasks
-        for task in unassigned_tasks:
-            if task.id not in _task_offer_times:
-                _task_offer_times[task.id] = now
+    # Determine search radius
+    search_radius = radius_km or _task_expanded_radius.get(task_id, PROXIMITY_DEFAULT_RADIUS_KM)
     
-    # Build task eligibility matrix
-    tasks_data = []
+    # Find all nearby agents (eligible or not)
+    all_agents = fleet_state.get_all_agents()
+    nearby_agents = []
     
-    for task in unassigned_tasks:
-        # Find eligible agents for this task
-        eligible = fleet_state.find_eligible_agents_for_task(task.id)
+    for agent in all_agents:
+        if not agent.is_online or not agent.has_capacity:
+            continue
         
-        # Separate eligible from ineligible
-        eligible_agents_data = []
-        ineligibility_reasons = {}  # Collect reasons why agents aren't eligible
+        # Check both current and projected locations
+        current_dist = agent.current_location.distance_to(task.restaurant_location)
+        projected_dist = agent.projected_location.distance_to(task.restaurant_location)
+        min_dist = min(current_dist, projected_dist)
         
-        for agent, dist, reason in eligible:
-            if reason is None and agent.has_capacity:
-                # Truly eligible
-                eligible_agents_data.append({
+        if min_dist <= search_radius:
+            # Check business rule eligibility
+            eligibility = fleet_state._check_eligibility(agent, task)
+            nearby_agents.append({
+                'agent': agent,
+                'distance_km': min_dist,
+                'eligibility_reason': eligibility
+            })
+    
+    if not nearby_agents:
+        log_event(f"[ProximityBroadcast] ⚠️ No nearby agents for {task.restaurant_name} within {search_radius}km")
+        return {'success': False, 'error': 'No nearby agents', 'radius_km': search_radius}
+    
+    # Filter to only eligible agents
+    eligible_agents = [a for a in nearby_agents if a['eligibility_reason'] is None]
+    ineligible_agents = [a for a in nearby_agents if a['eligibility_reason'] is not None]
+    
+    if not eligible_agents:
+        reasons = {a['eligibility_reason'] for a in ineligible_agents}
+        log_event(f"[ProximityBroadcast] ⚠️ No eligible agents for {task.restaurant_name}. Reasons: {reasons}")
+        return {'success': False, 'error': 'No eligible agents', 'reasons': list(reasons)}
+    
+    # Run solver for single task with eligible agents to verify time feasibility
+    feasible_agents = []
+    infeasible_agents = []
+    
+    for agent_info in eligible_agents:
+        agent = agent_info['agent']
+        
+        # Build single-agent data for solver
+        current_tasks = []
+        for ct in agent.current_tasks:
+            current_tasks.append({
+                'id': ct.id,
+                'job_type': ct.job_type,
+                'restaurant_location': [ct.restaurant_location.lat, ct.restaurant_location.lng],
+                'delivery_location': [ct.delivery_location.lat, ct.delivery_location.lng],
+                'pickup_before': ct.pickup_before.isoformat() if ct.pickup_before else None,
+                'delivery_before': ct.delivery_before.isoformat() if ct.delivery_before else None,
+                'assigned_driver': agent.id,
+                'pickup_completed': ct.pickup_completed,
+                '_meta': ct.meta
+            })
+        
+        agents_data = {
+            'agents': [{
+                'driver_id': agent.id,
+                'name': agent.name,
+                'current_location': [agent.current_location.lat, agent.current_location.lng],
+                'current_tasks': current_tasks,
+                'wallet_balance': agent.wallet_balance,
+                '_meta': {
+                    'max_tasks': agent.max_capacity,
+                    'available_capacity': agent.available_capacity,
+                    'tags': agent.tags,
+                    'priority': agent.priority
+                }
+            }],
+            'geofence_data': [],
+            'settings_used': {
+                'walletNoCashThreshold': fleet_state.wallet_threshold,
+                'maxDistanceKm': search_radius  # Use current search radius
+            }
+        }
+        
+        # Get just this one task
+        task_export = {
+            'tasks': [{
+                'id': task.id,
+                'order_id': task.order_id,
+                'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
+                'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
+                'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+                'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
+                'payment_type': task.payment_type,
+                'tags': task.tags,
+                '_meta': {
+                    'restaurant_name': task.restaurant_name,
+                    'customer_name': task.customer_name,
+                    'delivery_fee': task.delivery_fee,
+                    'tips': task.tips
+                }
+            }]
+        }
+        
+        try:
+            # Run solver for this agent + this task
+            result = optimize_fleet(agents_data, task_export, prefilter_distance=False)
+            
+            if result.get('success') and result.get('metadata', {}).get('tasks_assigned', 0) > 0:
+                # Solver says this agent can complete the task on time
+                route = result.get('agent_routes', [{}])[0]
+                eta_info = route.get('stops', [])
+                
+                feasible_agents.append({
                     'agent_id': agent.id,
                     'agent_name': agent.name,
-                    'distance_km': round(dist, 2)
+                    'distance_km': round(agent_info['distance_km'], 2),
+                    'location': [agent.lat, agent.lng] if agent.lat and agent.lng else None,
+                    'current_task_count': len(agent.current_tasks),
+                    'available_capacity': agent.available_capacity,
+                    'priority': agent.priority,
+                    'solver_verified': True,
+                    'eta_stops': eta_info
                 })
             else:
-                # Not eligible - track reason
-                actual_reason = reason if reason else 'at_max_capacity'
-                if actual_reason not in ineligibility_reasons:
-                    ineligibility_reasons[actual_reason] = 0
-                ineligibility_reasons[actual_reason] += 1
-        
-        # Get first_offered_at timestamp (when this task first entered marketplace)
-        first_offered_at = _task_offer_times.get(task.id, now)
-        
-        task_data = {
+                # Solver says not feasible
+                reason = result.get('error', 'time_window_infeasible')
+                infeasible_agents.append({
+                    'agent_id': agent.id,
+                    'agent_name': agent.name,
+                    'reason': reason
+                })
+        except Exception as e:
+            infeasible_agents.append({
+                'agent_id': agent.id,
+                'agent_name': agent.name,
+                'reason': f'solver_error: {str(e)}'
+            })
+    
+    if not feasible_agents:
+        log_event(f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} (solver rejected all)")
+        return {
+            'success': False, 
+            'error': 'No feasible agents (time windows)', 
+            'infeasible': infeasible_agents
+        }
+    
+    # Track first_offered_at for timer
+    with _proximity_lock:
+        if task_id not in _task_offer_times:
+            _task_offer_times[task_id] = now
+        first_offered_at = _task_offer_times[task_id]
+    
+    # Build and emit task:proximity payload
+    proximity_payload = {
+        'event': 'task:proximity',
+        'task': {
             'id': task.id,
             'restaurant_name': task.restaurant_name,
             'customer_name': task.customer_name,
@@ -352,358 +472,120 @@ def build_marketplace_state(dashboard_url: str) -> dict:
                 'total': (task.delivery_fee or 0) + (task.tips or 0)
             },
             'tags': task.tags,
-            'is_premium': 'premium' in (task.tags or []),
-            'eligible_agents': eligible_agents_data,
-            'competition': len(eligible_agents_data),
-            'first_offered_at': first_offered_at,  # Unix timestamp when task first entered marketplace
-            'timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS  # For dashboard to calculate remaining time
-        }
-        
-        # Add ineligibility info for tasks with no eligible agents
-        if len(eligible_agents_data) == 0:
-            task_data['no_eligible_agents'] = True
-            task_data['ineligibility_reasons'] = ineligibility_reasons
-            # Primary reason (most common)
-            if ineligibility_reasons:
-                task_data['primary_reason'] = max(ineligibility_reasons, key=ineligibility_reasons.get)
-        
-        tasks_data.append(task_data)
-    
-    # Build agents array with route info (similar to fleet:routes_updated)
-    agents_data = []
-    all_agents = fleet_state.get_all_agents()
-    
-    for agent in all_agents:
-        if not agent.is_online:
-            continue
-            
-        # Get agent's current tasks (assigned but not completed)
-        agent_tasks = fleet_state.get_agent_tasks(agent.id)
-        current_task_ids = [t.id for t in agent_tasks]
-        
-        # Find which unassigned tasks this agent is eligible for
-        available_task_ids = []
-        for task_data in tasks_data:
-            if any(ea['agent_id'] == agent.id for ea in task_data.get('eligible_agents', [])):
-                available_task_ids.append(task_data['id'])
-        
-        # Build route info for current tasks
-        route_stops = []
-        for task in agent_tasks:
-            # Add pickup if not completed
-            if task.status == TaskStatus.ASSIGNED:
-                route_stops.append({
-                    'type': 'pickup',
-                    'task_id': task.id,
-                    'location': [task.restaurant_location.lat, task.restaurant_location.lng],
-                    'name': task.restaurant_name,
-                    'time_window': task.pickup_before.isoformat() if task.pickup_before else None
-                })
-            # Add delivery
-            route_stops.append({
-                'type': 'delivery',
-                'task_id': task.id,
-                'location': [task.delivery_location.lat, task.delivery_location.lng],
-                'name': task.customer_name,
-                'time_window': task.delivery_before.isoformat() if task.delivery_before else None
-            })
-        
-        agent_data = {
-            'agent_id': agent.id,
-            'agent_name': agent.name,
-            'location': [agent.lat, agent.lng] if agent.lat and agent.lng else None,
-            'is_online': agent.is_online,
-            'current_tasks': current_task_ids,
-            'current_task_count': len(current_task_ids),
-            'max_capacity': agent.max_capacity,
-            'available_capacity': agent.available_capacity,
-            'has_capacity': agent.has_capacity,
-            'available_tasks': available_task_ids,
-            'available_task_count': len(available_task_ids),
-            'priority': agent.priority,
-            'route': route_stops
-        }
-        agents_data.append(agent_data)
-    
-    return {
-        'tasks': tasks_data,
-        'agents': agents_data,
-        'total_unassigned': len(tasks_data),
-        'total_available_agents': len([a for a in agents_data if a['has_capacity']]),
-        'timestamp': time.time(),
-        'dashboard_url': dashboard_url
-    }
-
-
-def broadcast_marketplace(dashboard_url: str, trigger_reason: str = "update") -> dict:
-    """
-    Broadcast the full marketplace state to all connected clients.
-    Debounced to prevent flooding during rapid updates.
-    
-    Returns: {'success': bool, 'tasks_count': int, 'agents_count': int}
-    """
-    global _last_marketplace_broadcast
-    
-    with _marketplace_lock:
-        now = time.time() * 1000  # ms
-        time_since_last = now - (_last_marketplace_broadcast * 1000)
-        
-        if time_since_last < MARKETPLACE_DEBOUNCE_MS:
-            # Skip - too soon after last broadcast
-            return {'success': True, 'debounced': True}
-        
-        _last_marketplace_broadcast = time.time()
-    
-    # Build marketplace state
-    marketplace = build_marketplace_state(dashboard_url)
-    
-    # Add trigger reason for debugging
-    marketplace['trigger'] = trigger_reason
-    
-    # Emit to all connected clients
-    socketio.emit('marketplace:update', marketplace)
-    
-    task_count = len(marketplace.get('tasks', []))
-    agent_count = len(marketplace.get('agents', []))
-    
-    if task_count > 0:
-        log_event(f"[Marketplace] 📡 BROADCAST: {task_count} tasks → {agent_count} agents (trigger: {trigger_reason})")
-    
-    return {
-        'success': True,
-        'tasks_count': task_count,
-        'agents_count': agent_count,
-        'debounced': False
-    }
-
-
-def broadcast_task_proximity(task_id: str, triggered_by_agent: str, dashboard_url: str) -> dict:
-    """
-    Broadcast a SINGLE task to its eligible agents when proximity is triggered.
-    
-    This is more targeted than full marketplace - creates urgency:
-    "You're near this task - grab it before someone else does!"
-    
-    Returns: {'success': bool, 'task': {...}, 'eligible_count': int}
-    """
-    if not FLEET_STATE_AVAILABLE or not fleet_state:
-        return {'success': False, 'error': 'Fleet state not available'}
-    
-    task = fleet_state.get_task(task_id)
-    if not task:
-        return {'success': False, 'error': 'Task not found'}
-    
-    if task.status != TaskStatus.UNASSIGNED:
-        return {'success': False, 'error': 'Task already assigned'}
-    
-    # Find eligible agents for this task
-    eligible = fleet_state.find_eligible_agents_for_task(task_id)
-    
-    eligible_agents_data = []
-    ineligibility_reasons = {}
-    
-    for agent, dist, reason in eligible:
-        if reason is None and agent.has_capacity:
-            # Build route info for this agent's current tasks
-            agent_tasks = fleet_state.get_agent_tasks(agent.id)
-            route_stops = []
-            for agent_task in agent_tasks:
-                # Add pickup if not completed
-                if agent_task.status == TaskStatus.ASSIGNED:
-                    route_stops.append({
-                        'type': 'pickup',
-                        'task_id': agent_task.id,
-                        'location': [agent_task.restaurant_location.lat, agent_task.restaurant_location.lng],
-                        'name': agent_task.restaurant_name,
-                        'time_window': agent_task.pickup_before.isoformat() if agent_task.pickup_before else None
-                    })
-                # Add delivery
-                route_stops.append({
-                    'type': 'delivery',
-                    'task_id': agent_task.id,
-                    'location': [agent_task.delivery_location.lat, agent_task.delivery_location.lng],
-                    'name': agent_task.customer_name,
-                    'time_window': agent_task.delivery_before.isoformat() if agent_task.delivery_before else None
-                })
-            
-            eligible_agents_data.append({
-                'agent_id': agent.id,
-                'agent_name': agent.name,
-                'distance_km': round(dist, 2),
-                'location': [agent.lat, agent.lng] if agent.lat and agent.lng else None,
-                'current_task_count': len(agent_tasks),
-                'available_capacity': agent.available_capacity,
-                'priority': agent.priority,
-                'route': route_stops
-            })
-        else:
-            actual_reason = reason if reason else 'at_max_capacity'
-            if actual_reason not in ineligibility_reasons:
-                ineligibility_reasons[actual_reason] = 0
-            ineligibility_reasons[actual_reason] += 1
-    
-    if not eligible_agents_data:
-        return {'success': False, 'error': 'No eligible agents', 'reasons': ineligibility_reasons}
-    
-    # Get/set first_offered_at for this task
-    now = time.time()
-    with _marketplace_lock:
-        if task_id not in _task_offer_times:
-            _task_offer_times[task_id] = now
-        first_offered_at = _task_offer_times[task_id]
-    
-    # Build single-task payload
-    task_data = {
-        'id': task.id,
-        'restaurant_name': task.restaurant_name,
-        'customer_name': task.customer_name,
-        'locations': {
-            'restaurant': [task.restaurant_location.lat, task.restaurant_location.lng],
-            'delivery': [task.delivery_location.lat, task.delivery_location.lng]
+            'is_premium': 'premium' in (task.tags or [])
         },
-        'times': {
-            'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
-            'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
-            'created_at': task.created_at.isoformat() if task.created_at else None
-        },
-        'payment': {
-            'delivery_fee': task.delivery_fee,
-            'tips': task.tips,
-            'type': task.payment_type,
-            'total': (task.delivery_fee or 0) + (task.tips or 0)
-        },
-        'tags': task.tags,
-        'is_premium': 'premium' in (task.tags or []),
-        'eligible_agents': eligible_agents_data,
-        'competition': len(eligible_agents_data),
+        'feasible_agents': feasible_agents,
+        'competition': len(feasible_agents),
         'first_offered_at': first_offered_at,
-        'timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
-    }
-    
-    # Emit targeted broadcast
-    proximity_payload = {
-        'event': 'task:proximity',
-        'task': task_data,
+        'timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
+        'search_radius_km': search_radius,
         'triggered_by': triggered_by_agent,
-        'timestamp': time.time(),
-        'timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS,
+        'timestamp': now,
         'dashboard_url': dashboard_url
     }
     
     socketio.emit('task:proximity', proximity_payload)
     
-    agent_names = [a['agent_name'] for a in eligible_agents_data]
-    log_event(f"[Marketplace] 📍 PROXIMITY: {task.restaurant_name} → {len(eligible_agents_data)} agents: {agent_names}")
+    agent_names = [a['agent_name'] for a in feasible_agents]
+    log_event(f"[ProximityBroadcast] 📡 {task.restaurant_name} → {len(feasible_agents)} agents: {agent_names} (radius: {search_radius}km)")
     
     return {
         'success': True,
         'task_id': task_id,
         'task_name': task.restaurant_name,
-        'eligible_count': len(eligible_agents_data),
-        'eligible_agents': [a['agent_id'] for a in eligible_agents_data]
+        'feasible_agents': feasible_agents,
+        'infeasible_agents': infeasible_agents,
+        'broadcast_count': len(feasible_agents),
+        'radius_km': search_radius
     }
 
 
-def check_marketplace_timeouts(dashboard_url: str) -> int:
+def update_proximity_broadcast_settings(settings: dict):
     """
-    Check for tasks that have timed out (not accepted within MARKETPLACE_TASK_TIMEOUT_SECONDS).
-    If any tasks have timed out, trigger a marketplace re-broadcast.
-    
-    Returns: Number of timed-out tasks found
-    """
-    global _task_offer_times
-    
-    if not FLEET_STATE_AVAILABLE or not fleet_state:
-        return 0
-    
-    now = time.time()
-    timed_out_tasks = []
-    
-    with _marketplace_lock:
-        # Get all unassigned tasks
-        unassigned_tasks = fleet_state.get_unassigned_tasks()
-        unassigned_ids = {t.id for t in unassigned_tasks}
-        
-        # Check each tracked task
-        for task_id, offer_time in list(_task_offer_times.items()):
-            # Remove if task is no longer unassigned (was accepted)
-            if task_id not in unassigned_ids:
-                del _task_offer_times[task_id]
-                continue
-            
-            # Check if timed out
-            age = now - offer_time
-            if age >= MARKETPLACE_TASK_TIMEOUT_SECONDS:
-                timed_out_tasks.append(task_id)
-                # Reset timer for this task
-                _task_offer_times[task_id] = now
-        
-        # Track any new unassigned tasks
-        for task in unassigned_tasks:
-            if task.id not in _task_offer_times:
-                _task_offer_times[task.id] = now
-    
-    if timed_out_tasks:
-        log_event(f"[Marketplace] ⏰ {len(timed_out_tasks)} task(s) timed out - re-broadcasting")
-        broadcast_marketplace(dashboard_url, trigger_reason=f"timeout:{len(timed_out_tasks)}_tasks")
-    
-    return len(timed_out_tasks)
-
-
-def update_marketplace_settings(settings: dict):
-    """
-    Update marketplace settings from dashboard.
+    Update proximity broadcast settings from dashboard.
     Called during fleet:sync or config update.
     """
-    global MARKETPLACE_MODE_ENABLED, MARKETPLACE_TASK_TIMEOUT_SECONDS
+    global PROXIMITY_BROADCAST_ENABLED, PROXIMITY_TASK_TIMEOUT_SECONDS, PROXIMITY_DEFAULT_RADIUS_KM
     
-    if 'marketplace_mode_enabled' in settings:
-        MARKETPLACE_MODE_ENABLED = bool(settings['marketplace_mode_enabled'])
-        log_event(f"[Marketplace] Mode {'ENABLED' if MARKETPLACE_MODE_ENABLED else 'DISABLED'}")
+    if 'proximity_broadcast_enabled' in settings:
+        PROXIMITY_BROADCAST_ENABLED = bool(settings['proximity_broadcast_enabled'])
+        log_event(f"[ProximityBroadcast] Mode {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'}")
     
-    if 'marketplace_task_timeout_seconds' in settings:
-        MARKETPLACE_TASK_TIMEOUT_SECONDS = int(settings['marketplace_task_timeout_seconds'])
-        log_event(f"[Marketplace] Task timeout set to {MARKETPLACE_TASK_TIMEOUT_SECONDS}s")
+    if 'proximity_task_timeout_seconds' in settings:
+        PROXIMITY_TASK_TIMEOUT_SECONDS = int(settings['proximity_task_timeout_seconds'])
+        log_event(f"[ProximityBroadcast] Task timeout set to {PROXIMITY_TASK_TIMEOUT_SECONDS}s")
+    
+    if 'proximity_default_radius_km' in settings:
+        PROXIMITY_DEFAULT_RADIUS_KM = float(settings['proximity_default_radius_km'])
+        log_event(f"[ProximityBroadcast] Default radius set to {PROXIMITY_DEFAULT_RADIUS_KM}km")
 
 
-def handle_marketplace_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
+def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -> dict:
     """
-    Handle when an agent accepts a task from the marketplace.
+    Expand the search radius for a task and re-run proximity broadcast.
+    Called when dashboard timer expires or manually expanded.
     
-    This is called from the existing task:accepted handler when marketplace mode is enabled.
-    Dashboard has already handled the Tookan assignment - we just update our state and re-broadcast.
+    Args:
+        task_id: Task to expand radius for
+        new_radius_km: New search radius
+        dashboard_url: For callbacks
     
-    Returns: {
-        'success': bool,
-        'task_removed': bool
-    }
+    Returns: Result of trigger_proximity_broadcast with expanded radius
     """
-    global _task_offer_times
+    global _task_expanded_radius, _task_offer_times
     
+    # Cap at max radius
+    new_radius_km = min(new_radius_km, PROXIMITY_MAX_RADIUS_KM)
+    
+    # Store expanded radius
+    with _proximity_lock:
+        old_radius = _task_expanded_radius.get(task_id, PROXIMITY_DEFAULT_RADIUS_KM)
+        _task_expanded_radius[task_id] = new_radius_km
+        
+        # Reset timer for this task
+        _task_offer_times[task_id] = time.time()
+    
+    log_event(f"[ProximityBroadcast] 📏 Expanded radius for task {task_id}: {old_radius}km → {new_radius_km}km")
+    
+    # Re-run broadcast with expanded radius
+    return trigger_proximity_broadcast(
+        task_id=task_id,
+        triggered_by_agent="radius_expansion",
+        dashboard_url=dashboard_url,
+        radius_km=new_radius_km
+    )
+
+
+def clean_task_tracking(task_id: str):
+    """Clean up tracking data when a task is assigned/completed."""
+    global _task_offer_times, _task_expanded_radius, _last_proximity_broadcast
+    
+    with _proximity_lock:
+        _task_offer_times.pop(task_id, None)
+        _task_expanded_radius.pop(task_id, None)
+        _last_proximity_broadcast.pop(task_id, None)
+
+
+def handle_proximity_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
+    """
+    Handle when an agent accepts a task from proximity broadcast.
+    Dashboard has already handled the Tookan assignment - we just clean up tracking.
+    
+    Returns: {'success': bool}
+    """
     if not FLEET_STATE_AVAILABLE or not fleet_state:
-        return {'success': False, 'task_removed': False}
+        return {'success': False}
     
     task = fleet_state.get_task(task_id)
     if not task:
-        return {'success': False, 'task_removed': False}
+        return {'success': False}
     
-    # Remove from timeout tracking
-    with _marketplace_lock:
-        if task_id in _task_offer_times:
-            del _task_offer_times[task_id]
+    # Clean up tracking for this task
+    clean_task_tracking(task_id)
     
-    log_event(f"[Marketplace] ✅ Task accepted: {task.restaurant_name} → {agent_name}")
+    log_event(f"[ProximityBroadcast] ✅ Task accepted: {task.restaurant_name} → {agent_name}")
     
-    # Re-broadcast marketplace (task will be removed, agent capacity reduced)
-    broadcast_marketplace(dashboard_url, trigger_reason=f"task_accepted:{task.restaurant_name[:20]}")
-    
-    return {'success': True, 'task_removed': True}
-
-
-# Legacy single-task broadcast (keeping for backwards compatibility)
-def broadcast_task_offer(task_id: str, dashboard_url: str) -> dict:
-    """Legacy: Broadcast a single task. Now triggers full marketplace update."""
-    return broadcast_marketplace(dashboard_url, trigger_reason=f"new_task:{task_id[:20]}")
+    return {'success': True}
 
 
 def is_sync_in_progress() -> bool:
@@ -1522,10 +1404,10 @@ def handle_fleet_sync(data):
             if 'wallet_threshold' in config:
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
             
-            # Marketplace settings
-            if 'marketplace_mode_enabled' in config or 'marketplace_task_timeout_seconds' in config:
-                update_marketplace_settings(config)
-                print(f"[FleetState] → marketplace_mode = {'ENABLED' if MARKETPLACE_MODE_ENABLED else 'DISABLED'}, timeout = {MARKETPLACE_TASK_TIMEOUT_SECONDS}s")
+            # Proximity broadcast settings
+            if 'proximity_broadcast_enabled' in config or 'proximity_task_timeout_seconds' in config:
+                update_proximity_broadcast_settings(config)
+                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'}, timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s")
             
             print(f"[FleetState] Applied config: max_dist={fleet_state.max_distance_km}km, chain_lookahead={fleet_state.chain_lookahead_radius_km}km, capacity={fleet_state.default_max_capacity}, wallet={fleet_state.wallet_threshold}")
         
@@ -1547,8 +1429,8 @@ def handle_fleet_sync(data):
                 'wallet_threshold': fleet_state.wallet_threshold,
                 'max_tasks_per_agent': fleet_state.default_max_capacity,
                 'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
-                'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
-                'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
+                'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
+                'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS
             },
             'fleet_stats': stats
         })
@@ -1951,23 +1833,25 @@ def handle_task_created(data):
     })
     
     # =========================================================================
-    # MARKETPLACE MODE: Broadcast all tasks to all eligible agents
+    # PROXIMITY BROADCAST MODE: Task will be broadcast when agents are nearby
     # =========================================================================
-    if MARKETPLACE_MODE_ENABLED:
+    if PROXIMITY_BROADCAST_ENABLED:
         task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
         if task_after and task_after.status == TaskStatus.UNASSIGNED:
-            # Broadcast full marketplace state - agents see all available tasks
-            broadcast_result = broadcast_marketplace(dashboard_url, trigger_reason=f"task_created:{task.restaurant_name[:20]}")
-            if broadcast_result['success'] and not broadcast_result.get('debounced'):
-                print(f"[Marketplace] 📡 Updated marketplace: {broadcast_result['tasks_count']} tasks available")
-                return  # Don't trigger optimization - agents will claim from marketplace
-            elif broadcast_result.get('debounced'):
-                print(f"[Marketplace] 📡 Marketplace update debounced")
-                return
-            else:
-                print(f"[Marketplace] 📡 Marketplace broadcast failed, falling back to optimization")
+            # In proximity mode, tasks are broadcast when agents get near them
+            # Emit a simple notification that a new task is available
+            socketio.emit('task:available', {
+                'id': task_id,
+                'restaurant_name': task.restaurant_name,
+                'customer_name': task.customer_name,
+                'location': [task.restaurant_location.lat, task.restaurant_location.lng] if task.restaurant_location else None,
+                'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+                'message': 'Task awaiting proximity trigger'
+            })
+            print(f"[ProximityBroadcast] 📋 New task available: {task.restaurant_name} - awaiting proximity trigger")
+            return  # Don't trigger fleet optimization - proximity will handle it
         elif task_after:
-            print(f"[FleetState] ⏩ Skipping broadcast - task already {task_after.status.value}")
+            print(f"[FleetState] ⏩ Skipping - task already {task_after.status.value}")
             return
     
     # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
@@ -2071,20 +1955,22 @@ def handle_task_declined(data):
     })
     
     # =========================================================================
-    # BROADCAST MODE: Re-offer task to remaining eligible agents
+    # PROXIMITY BROADCAST MODE: Re-run broadcast for this task (agent removed from eligible)
     # =========================================================================
     task_after_proximity = fleet_state.get_task(str(task_id)) if (FLEET_STATE_AVAILABLE and fleet_state and task_id) else None
     
-    if MARKETPLACE_MODE_ENABLED and task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
-        # Broadcast updated marketplace (declined agent removed from eligibility)
-        broadcast_result = broadcast_marketplace(dashboard_url, trigger_reason=f"task_declined:{task.restaurant_name if task else task_id[:20]}")
-        if broadcast_result['success'] and not broadcast_result.get('debounced'):
-            log_event(f"[Marketplace] 📡 Updated marketplace after decline: {broadcast_result['tasks_count']} tasks")
-            return  # Don't trigger optimization - agents will claim from marketplace
-        elif broadcast_result.get('debounced'):
-            return  # Debounced, skip
+    if PROXIMITY_BROADCAST_ENABLED and task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
+        # Re-broadcast this specific task (declined agent is now ineligible)
+        result = trigger_proximity_broadcast(
+            task_id=task_id,
+            triggered_by_agent=f"declined_by_{agent_name}",
+            dashboard_url=dashboard_url
+        )
+        if result.get('success'):
+            log_event(f"[ProximityBroadcast] 📡 Re-broadcast after decline: {result.get('broadcast_count', 0)} agents")
+            return
         else:
-            log_event(f"[Marketplace] 📡 Marketplace update failed, falling back to optimization")
+            log_event(f"[ProximityBroadcast] ⚠️ Re-broadcast failed: {result.get('error')}, falling back to optimization")
     
     # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
     if task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
@@ -2097,95 +1983,109 @@ def handle_task_declined(data):
         print(f"[FleetState] ℹ️ Task {str(task_id)[:20]}... already assigned by proximity, skipping event-based optimization.")
 
 
-@socketio.on('marketplace:request')
-def handle_marketplace_request(data):
+@socketio.on('proximity:timeout')
+def handle_proximity_timeout(data):
     """
-    Client requests current marketplace state (e.g., on connect or refresh).
-    
-    Payload: { dashboard_url: str }
-    """
-    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
-    
-    log_event(f"[Marketplace] 📋 Client requested marketplace state")
-    
-    # Build and send current marketplace state to this client only
-    marketplace = build_marketplace_state(dashboard_url)
-    marketplace['trigger'] = 'client_request'
-    marketplace['settings'] = {
-        'mode_enabled': MARKETPLACE_MODE_ENABLED,
-        'task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
-    }
-    
-    emit('marketplace:update', marketplace)
-
-
-@socketio.on('marketplace:timeout')
-def handle_marketplace_timeout(data):
-    """
-    Dashboard timer expired for one or more tasks - trigger re-broadcast.
-    
-    This is called by the dashboard when its countdown timer expires for tasks
-    that weren't accepted within the allotted time.
+    Dashboard timer expired for a task - re-run proximity solver.
     
     Payload: { 
-        task_ids: [str],  # Specific tasks that timed out (required)
+        task_id: str,  # Task that timed out
         dashboard_url: str 
     }
-    
-    IMPORTANT: Only the timed-out tasks get their first_offered_at reset.
-    Other tasks keep their existing timers.
     """
     global _task_offer_times
     
     performance_stats["websocket_events"] += 1
-    task_ids = data.get('task_ids', [])
+    task_id = data.get('task_id')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    if not task_ids:
-        log_event(f"[Marketplace] ⏰ Dashboard timeout with no task_ids - ignoring")
+    if not task_id:
+        log_event(f"[ProximityBroadcast] ⏰ Timeout with no task_id - ignoring")
         return
     
-    # Reset ONLY the timed-out tasks' timestamps
+    # Reset timer for this task
     now = time.time()
-    with _marketplace_lock:
-        for task_id in task_ids:
-            if task_id in _task_offer_times:
-                _task_offer_times[task_id] = now
-                log_event(f"[Marketplace] ⏰ Reset timer for task {task_id}")
+    with _proximity_lock:
+        _task_offer_times[task_id] = now
     
-    log_event(f"[Marketplace] ⏰ {len(task_ids)} task(s) timed out - re-broadcasting (other timers preserved)")
+    log_event(f"[ProximityBroadcast] ⏰ Task {task_id} timed out - re-running solver")
     
-    # Re-broadcast the marketplace (timed-out tasks have new first_offered_at, others unchanged)
-    broadcast_marketplace(dashboard_url, trigger_reason=f"dashboard_timeout:{len(task_ids)}_tasks")
+    # Re-run proximity broadcast (solver verifies feasibility)
+    result = trigger_proximity_broadcast(
+        task_id=task_id,
+        triggered_by_agent="timeout",
+        dashboard_url=dashboard_url
+    )
+    
+    # Emit result
+    emit('proximity:timeout_result', {
+        'task_id': task_id,
+        'success': result.get('success', False),
+        'broadcast_count': result.get('broadcast_count', 0),
+        'error': result.get('error')
+    })
 
 
-@socketio.on('marketplace:settings')
-def handle_marketplace_settings(data):
+@socketio.on('proximity:expand_radius')
+def handle_proximity_expand_radius(data):
     """
-    Dashboard updates marketplace settings.
+    Dashboard requests expanded search radius for a task.
+    Called when task has no feasible agents at current radius.
     
     Payload: {
-        marketplace_mode_enabled: bool,
-        marketplace_task_timeout_seconds: int,
+        task_id: str,
+        new_radius_km: float,  # Requested new radius
         dashboard_url: str
     }
     """
     performance_stats["websocket_events"] += 1
+    task_id = data.get('task_id')
+    new_radius_km = data.get('new_radius_km', PROXIMITY_DEFAULT_RADIUS_KM + 2.0)
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
+    if not task_id:
+        emit('proximity:expand_result', {'success': False, 'error': 'No task_id provided'})
+        return
+    
+    log_event(f"[ProximityBroadcast] 📏 Expanding radius for task {task_id} to {new_radius_km}km")
+    
+    # Expand radius and re-run solver
+    result = expand_task_radius(task_id, new_radius_km, dashboard_url)
+    
+    emit('proximity:expand_result', {
+        'task_id': task_id,
+        'new_radius_km': result.get('radius_km', new_radius_km),
+        'success': result.get('success', False),
+        'broadcast_count': result.get('broadcast_count', 0),
+        'error': result.get('error')
+    })
+
+
+@socketio.on('proximity:settings')
+def handle_proximity_settings(data):
+    """
+    Dashboard updates proximity broadcast settings.
+    
+    Payload: {
+        proximity_broadcast_enabled: bool,
+        proximity_task_timeout_seconds: int,
+        proximity_default_radius_km: float,
+        dashboard_url: str
+    }
+    """
+    performance_stats["websocket_events"] += 1
+    
     # Update settings
-    update_marketplace_settings(data)
+    update_proximity_broadcast_settings(data)
     
     # Emit acknowledgment with current settings
-    emit('marketplace:settings_ack', {
-        'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
-        'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS,
+    emit('proximity:settings_ack', {
+        'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
+        'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
+        'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
+        'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM,
         'received_at': datetime.now().isoformat()
     })
-    
-    # If marketplace mode was just enabled, broadcast current state
-    if data.get('marketplace_mode_enabled'):
-        broadcast_marketplace(dashboard_url, trigger_reason="mode_enabled")
 
 
 @socketio.on('task:completed')
@@ -2252,13 +2152,12 @@ def handle_task_completed(data):
             'task_removed': True
         })
         
-        # MARKETPLACE: Agent now has capacity - broadcast updated marketplace
-        if MARKETPLACE_MODE_ENABLED:
+        # PROXIMITY BROADCAST: Agent now has capacity - proximity will trigger when they're near tasks
+        if PROXIMITY_BROADCAST_ENABLED:
             unassigned_tasks = fleet_state.get_unassigned_tasks()
             if len(unassigned_tasks) > 0:
-                broadcast_marketplace(dashboard_url, trigger_reason=f"task_completed:{agent_name}")
-                print(f"[Marketplace] {agent_name} completed task, broadcasting {len(unassigned_tasks)} available tasks")
-            return  # Skip legacy optimization in marketplace mode
+                print(f"[ProximityBroadcast] {agent_name} completed task, {len(unassigned_tasks)} unassigned tasks - awaiting proximity trigger")
+            return  # Skip legacy optimization - proximity handles assignments
         
         # LEGACY: EVENT-BASED optimization (only if marketplace mode disabled)
         # Note: Proximity triggers may also fire from agent:location_update - debouncing handles dedup
@@ -2609,9 +2508,9 @@ def handle_task_assigned(data):
         log_event(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
         print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
         
-        # MARKETPLACE: Broadcast updated marketplace (task removed, agent capacity reduced)
-        if MARKETPLACE_MODE_ENABLED:
-            broadcast_marketplace(dashboard_url, trigger_reason=f"task_assigned:{task.restaurant_name[:20]}")
+        # PROXIMITY BROADCAST: Clean up tracking for this task
+        if PROXIMITY_BROADCAST_ENABLED:
+            clean_task_tracking(task_id)
     
     emit('task:assigned_ack', {
         'id': task_id,
@@ -2644,9 +2543,9 @@ def handle_task_accepted(data):
         if task:
             print(f"[FleetState] Task {task.restaurant_name} accepted by {agent_name}")
             
-            # MARKETPLACE MODE: Update marketplace after acceptance
-            if MARKETPLACE_MODE_ENABLED:
-                handle_marketplace_acceptance(task_id, str(agent_id), agent_name, dashboard_url)
+            # PROXIMITY BROADCAST: Clean up tracking after acceptance
+            if PROXIMITY_BROADCAST_ENABLED:
+                handle_proximity_acceptance(task_id, str(agent_id), agent_name, dashboard_url)
     
     emit('task:accepted_ack', {
         'id': task_id,
@@ -2728,11 +2627,10 @@ def handle_agent_online(data):
         'triggered_optimization': has_unassigned
     })
     
-    # MARKETPLACE: New agent online - broadcast updated marketplace to them
-    if MARKETPLACE_MODE_ENABLED and has_unassigned:
-        broadcast_marketplace(dashboard_url, trigger_reason=f"agent_online:{name}")
-        print(f"[Marketplace] 📡 Sent marketplace to newly online agent: {name}")
-        return  # Skip legacy optimization in marketplace mode
+    # PROXIMITY BROADCAST: Agent online - they'll get tasks when near them (proximity triggers)
+    if PROXIMITY_BROADCAST_ENABLED and has_unassigned:
+        print(f"[ProximityBroadcast] 📋 {name} online, {fleet_state.get_unassigned_task_count()} tasks - awaiting proximity trigger")
+        return  # Skip legacy optimization - proximity handles assignments
     
     # LEGACY: EVENT-BASED optimization (only if marketplace mode disabled)
     if has_unassigned:
@@ -2888,12 +2786,12 @@ def handle_agent_location_update(data):
             
             print(f"[DEBUG] Best trigger: {name} → {best_trigger.task.restaurant_name} ({best_trigger.distance_km:.2f}km)")
             
-            # MARKETPLACE MODE: Broadcast THIS TASK to its eligible agents
-            if MARKETPLACE_MODE_ENABLED:
-                print(f"[Marketplace] 📍 Proximity: {name} is {best_trigger.distance_km:.2f}km from {best_trigger.task.restaurant_name}")
+            # PROXIMITY BROADCAST MODE: Run solver and broadcast to all feasible agents
+            if PROXIMITY_BROADCAST_ENABLED:
+                print(f"[ProximityBroadcast] 📍 {name} is {best_trigger.distance_km:.2f}km from {best_trigger.task.restaurant_name}")
                 
-                # Broadcast just this task to eligible agents (targeted, not full marketplace)
-                broadcast_task_proximity(
+                # Run solver for this task and broadcast to all feasible agents
+                trigger_proximity_broadcast(
                     task_id=best_trigger.task.id,
                     triggered_by_agent=name,
                     dashboard_url=dashboard_url
@@ -3190,9 +3088,11 @@ def fleet_state_config():
             'max_tasks_per_agent': fleet_state.default_max_capacity,  # Agent capacity limit
             'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
             'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds,
-            # Marketplace settings
-            'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
-            'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
+            # Proximity broadcast settings
+            'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
+            'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
+            'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
+            'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM
         }), 200
     
     # POST - update config
@@ -3223,9 +3123,9 @@ def fleet_state_config():
     if 'optimization_cooldown_seconds' in data:
         fleet_state.optimization_cooldown_seconds = float(data['optimization_cooldown_seconds'])
     
-    # Marketplace settings
-    if 'marketplace_mode_enabled' in data or 'marketplace_task_timeout_seconds' in data:
-        update_marketplace_settings(data)
+    # Proximity broadcast settings
+    if 'proximity_broadcast_enabled' in data or 'proximity_task_timeout_seconds' in data:
+        update_proximity_broadcast_settings(data)
     
     return jsonify({
         'message': 'Configuration updated',
@@ -3236,8 +3136,10 @@ def fleet_state_config():
         'max_tasks_per_agent': fleet_state.default_max_capacity,
         'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
         'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds,
-        'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
-        'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
+        'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
+        'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
+        'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
+        'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM
     }), 200
 
 
@@ -3282,10 +3184,10 @@ def fleet_map():
     return render_template('fleet_map.html')
 
 
-@app.route('/marketplace')
-def marketplace():
-    """Serve the marketplace debug UI."""
-    return render_template('marketplace.html')
+@app.route('/proximity')
+def proximity_debug():
+    """Serve the proximity broadcast debug UI."""
+    return render_template('proximity_broadcast.html')
 
 
 if __name__ == '__main__':
