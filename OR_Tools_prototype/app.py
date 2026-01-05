@@ -227,225 +227,284 @@ _queued_dashboard_url = None  # Dashboard URL to use for queued optimization
 _queued_request_id = None  # Request ID for queued manual optimization
 
 # =============================================================================
-# BROADCAST ASSIGNMENT SYSTEM
+# MARKETPLACE BROADCAST SYSTEM
 # =============================================================================
-# Instead of assigning one task to one agent, broadcast offers to ALL eligible
-# agents. First to accept wins, others are notified task was taken.
+# Fleet-wide task marketplace: ALL unassigned tasks are broadcast to ALL 
+# eligible agents simultaneously. Each agent sees all tasks they can take.
+# First to accept wins (Tookan handles the race condition).
+#
+# Mode can be toggled from dashboard via fleet:sync settings.
+# Tasks have countdown timers - if not accepted, marketplace re-broadcasts.
 # =============================================================================
 
-# Track pending broadcast offers: {task_id: {'offered_to': [agent_ids], 'offered_at': timestamp}}
-_pending_broadcast_offers = {}
-_broadcast_lock = threading.Lock()
+_marketplace_lock = threading.Lock()
+_last_marketplace_broadcast = 0  # Timestamp of last broadcast (for debouncing)
+_task_offer_times = {}  # Track when each task was last broadcast: {task_id: timestamp}
 
-# Configuration
-BROADCAST_MODE_ENABLED = True  # Set to True to enable broadcast assignment
-BROADCAST_OFFER_TIMEOUT_SECONDS = 120  # How long offers stay valid (2 minutes)
-BROADCAST_MAX_AGENTS = 10  # Max agents to broadcast to per task (0 = unlimited)
+# Configuration (can be updated via dashboard settings)
+MARKETPLACE_MODE_ENABLED = True  # Toggle between marketplace and fleet optimization
+MARKETPLACE_DEBOUNCE_MS = 500  # Debounce rapid updates (500ms)
+MARKETPLACE_TASK_TIMEOUT_SECONDS = 120  # How long before task re-broadcasts (default 2 min)
 
 
-def broadcast_task_offer(task_id: str, dashboard_url: str) -> dict:
+def build_marketplace_state(dashboard_url: str) -> dict:
     """
-    Broadcast a task offer to ALL eligible agents within range.
+    Build the full marketplace state: all unassigned tasks with their eligible agents.
     
-    Returns dict with: {
-        'success': bool,
-        'offered_to': [agent_ids],
-        'task_id': task_id
+    Returns: {
+        'tasks': [
+            {
+                'id': task_id,
+                'restaurant_name': ...,
+                'customer_name': ...,
+                'locations': {...},
+                'times': {...},
+                'payment': {...},
+                'eligible_agents': [
+                    {'agent_id': ..., 'agent_name': ..., 'distance_km': ...}
+                ],
+                'competition': 3  # Number of agents who can see this task
+            }
+        ],
+        'agents': [
+            {
+                'agent_id': ...,
+                'agent_name': ...,
+                'available_tasks': [task_ids they're eligible for],
+                'current_tasks': count
+            }
+        ],
+        'timestamp': ...
     }
     """
-    global _pending_broadcast_offers
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        return {'tasks': [], 'agents': [], 'timestamp': time.time(), 'error': 'Fleet state not available'}
+    
+    # Get all unassigned tasks
+    unassigned_tasks = fleet_state.get_unassigned_tasks()
+    
+    # Get all available agents (online + has capacity)
+    available_agents = fleet_state.get_available_agents()
+    
+    # Build task eligibility matrix
+    tasks_data = []
+    agent_task_map = {}  # agent_id -> list of eligible task_ids
+    
+    for task in unassigned_tasks:
+        # Find eligible agents for this task
+        eligible = fleet_state.find_eligible_agents_for_task(task.id)
+        
+        # Filter to truly eligible (no reason = compatible)
+        eligible_list = [
+            (agent, dist, reason) for agent, dist, reason in eligible
+            if reason is None and agent.has_capacity
+        ]
+        
+        eligible_agents_data = []
+        for agent, dist, _ in eligible_list:
+            eligible_agents_data.append({
+                'agent_id': agent.id,
+                'agent_name': agent.name,
+                'distance_km': round(dist, 2)
+            })
+            
+            # Track which tasks each agent can see
+            if agent.id not in agent_task_map:
+                agent_task_map[agent.id] = []
+            agent_task_map[agent.id].append(task.id)
+        
+        task_data = {
+            'id': task.id,
+            'restaurant_name': task.restaurant_name,
+            'customer_name': task.customer_name,
+            'locations': {
+                'restaurant': [task.restaurant_location.lat, task.restaurant_location.lng],
+                'delivery': [task.delivery_location.lat, task.delivery_location.lng]
+            },
+            'times': {
+                'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+                'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
+                'created_at': task.created_at.isoformat() if task.created_at else None
+            },
+            'payment': {
+                'delivery_fee': task.delivery_fee,
+                'tips': task.tips,
+                'type': task.payment_type,
+                'total': (task.delivery_fee or 0) + (task.tips or 0)
+            },
+            'tags': task.tags,
+            'is_premium': 'premium' in (task.tags or []),
+            'eligible_agents': eligible_agents_data,
+            'competition': len(eligible_agents_data)  # How many agents see this
+        }
+        tasks_data.append(task_data)
+    
+    # Build agent view
+    agents_data = []
+    for agent in available_agents:
+        agent_data = {
+            'agent_id': agent.id,
+            'agent_name': agent.name,
+            'location': [agent.location.lat, agent.location.lng] if agent.location else None,
+            'available_tasks': agent_task_map.get(agent.id, []),
+            'task_count': len(agent_task_map.get(agent.id, [])),
+            'current_tasks': len(agent.task_ids),
+            'capacity_remaining': agent.available_capacity
+        }
+        agents_data.append(agent_data)
+    
+    return {
+        'tasks': tasks_data,
+        'agents': agents_data,
+        'total_unassigned': len(tasks_data),
+        'total_available_agents': len(agents_data),
+        'timestamp': time.time(),
+        'dashboard_url': dashboard_url
+    }
+
+
+def broadcast_marketplace(dashboard_url: str, trigger_reason: str = "update") -> dict:
+    """
+    Broadcast the full marketplace state to all connected clients.
+    Debounced to prevent flooding during rapid updates.
+    
+    Returns: {'success': bool, 'tasks_count': int, 'agents_count': int}
+    """
+    global _last_marketplace_broadcast
+    
+    with _marketplace_lock:
+        now = time.time() * 1000  # ms
+        time_since_last = now - (_last_marketplace_broadcast * 1000)
+        
+        if time_since_last < MARKETPLACE_DEBOUNCE_MS:
+            # Skip - too soon after last broadcast
+            return {'success': True, 'debounced': True}
+        
+        _last_marketplace_broadcast = time.time()
+    
+    # Build marketplace state
+    marketplace = build_marketplace_state(dashboard_url)
+    
+    # Add trigger reason for debugging
+    marketplace['trigger'] = trigger_reason
+    
+    # Emit to all connected clients
+    socketio.emit('marketplace:update', marketplace)
+    
+    task_count = len(marketplace.get('tasks', []))
+    agent_count = len(marketplace.get('agents', []))
+    
+    if task_count > 0:
+        log_event(f"[Marketplace] 📡 BROADCAST: {task_count} tasks → {agent_count} agents (trigger: {trigger_reason})")
+    
+    return {
+        'success': True,
+        'tasks_count': task_count,
+        'agents_count': agent_count,
+        'debounced': False
+    }
+
+
+def check_marketplace_timeouts(dashboard_url: str) -> int:
+    """
+    Check for tasks that have timed out (not accepted within MARKETPLACE_TASK_TIMEOUT_SECONDS).
+    If any tasks have timed out, trigger a marketplace re-broadcast.
+    
+    Returns: Number of timed-out tasks found
+    """
+    global _task_offer_times
     
     if not FLEET_STATE_AVAILABLE or not fleet_state:
-        return {'success': False, 'error': 'Fleet state not available', 'offered_to': []}
+        return 0
+    
+    now = time.time()
+    timed_out_tasks = []
+    
+    with _marketplace_lock:
+        # Get all unassigned tasks
+        unassigned_tasks = fleet_state.get_unassigned_tasks()
+        unassigned_ids = {t.id for t in unassigned_tasks}
+        
+        # Check each tracked task
+        for task_id, offer_time in list(_task_offer_times.items()):
+            # Remove if task is no longer unassigned (was accepted)
+            if task_id not in unassigned_ids:
+                del _task_offer_times[task_id]
+                continue
+            
+            # Check if timed out
+            age = now - offer_time
+            if age >= MARKETPLACE_TASK_TIMEOUT_SECONDS:
+                timed_out_tasks.append(task_id)
+                # Reset timer for this task
+                _task_offer_times[task_id] = now
+        
+        # Track any new unassigned tasks
+        for task in unassigned_tasks:
+            if task.id not in _task_offer_times:
+                _task_offer_times[task.id] = now
+    
+    if timed_out_tasks:
+        log_event(f"[Marketplace] ⏰ {len(timed_out_tasks)} task(s) timed out - re-broadcasting")
+        broadcast_marketplace(dashboard_url, trigger_reason=f"timeout:{len(timed_out_tasks)}_tasks")
+    
+    return len(timed_out_tasks)
+
+
+def update_marketplace_settings(settings: dict):
+    """
+    Update marketplace settings from dashboard.
+    Called during fleet:sync or config update.
+    """
+    global MARKETPLACE_MODE_ENABLED, MARKETPLACE_TASK_TIMEOUT_SECONDS
+    
+    if 'marketplace_mode_enabled' in settings:
+        MARKETPLACE_MODE_ENABLED = bool(settings['marketplace_mode_enabled'])
+        log_event(f"[Marketplace] Mode {'ENABLED' if MARKETPLACE_MODE_ENABLED else 'DISABLED'}")
+    
+    if 'marketplace_task_timeout_seconds' in settings:
+        MARKETPLACE_TASK_TIMEOUT_SECONDS = int(settings['marketplace_task_timeout_seconds'])
+        log_event(f"[Marketplace] Task timeout set to {MARKETPLACE_TASK_TIMEOUT_SECONDS}s")
+
+
+def handle_marketplace_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
+    """
+    Handle when an agent accepts a task from the marketplace.
+    
+    This is called from the existing task:accepted handler when marketplace mode is enabled.
+    Dashboard has already handled the Tookan assignment - we just update our state and re-broadcast.
+    
+    Returns: {
+        'success': bool,
+        'task_removed': bool
+    }
+    """
+    global _task_offer_times
+    
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        return {'success': False, 'task_removed': False}
     
     task = fleet_state.get_task(task_id)
     if not task:
-        return {'success': False, 'error': 'Task not found', 'offered_to': []}
+        return {'success': False, 'task_removed': False}
     
-    # Find all eligible agents
-    eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
+    # Remove from timeout tracking
+    with _marketplace_lock:
+        if task_id in _task_offer_times:
+            del _task_offer_times[task_id]
     
-    # Filter to only truly eligible (reason is None) and within assignment radius
-    radius = fleet_state.assignment_radius_km
-    eligible_list = [
-        (agent, dist) for agent, dist, reason in eligible_agents
-        if reason is None and dist <= radius and agent.has_capacity
-    ]
+    log_event(f"[Marketplace] ✅ Task accepted: {task.restaurant_name} → {agent_name}")
     
-    if not eligible_list:
-        # Try expanded radius if no one nearby
-        expanded_radius = radius * 2  # Double the radius
-        eligible_list = [
-            (agent, dist) for agent, dist, reason in eligible_agents
-            if reason is None and dist <= expanded_radius and agent.has_capacity
-        ]
-        if eligible_list:
-            log_event(f"[Broadcast] 📡 Expanded radius to {expanded_radius:.1f}km for {task.restaurant_name}")
+    # Re-broadcast marketplace (task will be removed, agent capacity reduced)
+    broadcast_marketplace(dashboard_url, trigger_reason=f"task_accepted:{task.restaurant_name[:20]}")
     
-    if not eligible_list:
-        log_event(f"[Broadcast] ❌ No eligible agents for {task.restaurant_name}")
-        return {'success': False, 'error': 'No eligible agents', 'offered_to': []}
-    
-    # Limit number of agents if configured
-    if BROADCAST_MAX_AGENTS > 0:
-        eligible_list = eligible_list[:BROADCAST_MAX_AGENTS]
-    
-    # Extract agent info
-    offered_agents = []
-    for agent, dist in eligible_list:
-        offered_agents.append({
-            'id': agent.id,
-            'name': agent.name,
-            'distance_km': round(dist, 2)
-        })
-    
-    agent_ids = [a['id'] for a in offered_agents]
-    agent_names = [a['name'] for a in offered_agents]
-    
-    # Track pending offer
-    with _broadcast_lock:
-        _pending_broadcast_offers[task_id] = {
-            'offered_to': agent_ids,
-            'offered_at': time.time(),
-            'task_name': task.restaurant_name
-        }
-    
-    # Emit broadcast offer to dashboard (which routes to agents)
-    offer_payload = {
-        'event': 'task:offered',
-        'task_id': task_id,
-        'task': {
-            'id': task_id,
-            'restaurant_name': task.restaurant_name,
-            'customer_name': task.customer_name,
-            'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
-            'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
-            'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
-            'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
-            'delivery_fee': task.delivery_fee,
-            'tips': task.tips,
-            'payment_type': task.payment_type,
-            'tags': task.tags
-        },
-        'offered_to': offered_agents,
-        'expires_at': (datetime.now(timezone.utc).timestamp() + BROADCAST_OFFER_TIMEOUT_SECONDS),
-        'dashboard_url': dashboard_url
-    }
-    
-    socketio.emit('task:offered', offer_payload)
-    
-    log_event(f"[Broadcast] 📡 OFFERED {task.restaurant_name} to {len(offered_agents)} agents: {agent_names}")
-    
-    return {
-        'success': True,
-        'task_id': task_id,
-        'offered_to': agent_ids,
-        'agent_names': agent_names
-    }
+    return {'success': True, 'task_removed': True}
 
 
-def handle_task_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
-    """
-    Handle when an agent accepts a broadcast offer.
-    First to accept wins, others are notified.
-    
-    Returns dict with: {
-        'success': bool,
-        'assigned': bool (True if this agent got it),
-        'reason': str
-    }
-    """
-    global _pending_broadcast_offers
-    
-    with _broadcast_lock:
-        pending = _pending_broadcast_offers.get(task_id)
-        
-        if not pending:
-            # No pending offer - either expired, already taken, or wasn't broadcast
-            return {
-                'success': False,
-                'assigned': False,
-                'reason': 'no_pending_offer'
-            }
-        
-        # Check if this agent was offered the task
-        if agent_id not in pending['offered_to']:
-            return {
-                'success': False,
-                'assigned': False,
-                'reason': 'not_offered_to_this_agent'
-            }
-        
-        # Check expiry
-        offer_age = time.time() - pending['offered_at']
-        if offer_age > BROADCAST_OFFER_TIMEOUT_SECONDS:
-            del _pending_broadcast_offers[task_id]
-            return {
-                'success': False,
-                'assigned': False,
-                'reason': 'offer_expired'
-            }
-        
-        # SUCCESS! This agent wins
-        other_agents = [aid for aid in pending['offered_to'] if aid != agent_id]
-        task_name = pending.get('task_name', task_id[:20])
-        
-        # Remove from pending offers
-        del _pending_broadcast_offers[task_id]
-    
-    # Assign task to winner
-    if fleet_state:
-        fleet_state.assign_task(task_id, agent_id)
-    
-    # Emit assignment event
-    assignment_payload = {
-        'id': task_id,
-        'agent_id': agent_id,
-        'agent_name': agent_name,
-        'assigned_at': datetime.now(timezone.utc).isoformat(),
-        'assignment_type': 'broadcast_accepted',
-        'dashboard_url': dashboard_url
-    }
-    socketio.emit('task:assigned', assignment_payload)
-    log_event(f"[Broadcast] ✅ ACCEPTED: {task_name} → {agent_name} (beat {len(other_agents)} other agents)")
-    
-    # Notify other agents that task was taken
-    if other_agents:
-        taken_payload = {
-            'event': 'task:taken',
-            'task_id': task_id,
-            'taken_by': {
-                'agent_id': agent_id,
-                'agent_name': agent_name
-            },
-            'notify_agents': other_agents,
-            'dashboard_url': dashboard_url
-        }
-        socketio.emit('task:taken', taken_payload)
-        log_event(f"[Broadcast] 📢 Notified {len(other_agents)} agents that {task_name} was taken")
-    
-    return {
-        'success': True,
-        'assigned': True,
-        'reason': 'first_to_accept'
-    }
-
-
-def cleanup_expired_offers():
-    """Remove expired broadcast offers (called periodically)."""
-    global _pending_broadcast_offers
-    
-    with _broadcast_lock:
-        now = time.time()
-        expired = [
-            task_id for task_id, offer in _pending_broadcast_offers.items()
-            if now - offer['offered_at'] > BROADCAST_OFFER_TIMEOUT_SECONDS
-        ]
-        
-        for task_id in expired:
-            task_name = _pending_broadcast_offers[task_id].get('task_name', task_id[:20])
-            del _pending_broadcast_offers[task_id]
-            log_event(f"[Broadcast] ⏰ Offer expired: {task_name} (no acceptance)")
+# Legacy single-task broadcast (keeping for backwards compatibility)
+def broadcast_task_offer(task_id: str, dashboard_url: str) -> dict:
+    """Legacy: Broadcast a single task. Now triggers full marketplace update."""
+    return broadcast_marketplace(dashboard_url, trigger_reason=f"new_task:{task_id[:20]}")
 
 
 def is_sync_in_progress() -> bool:
@@ -1263,6 +1322,12 @@ def handle_fleet_sync(data):
                         agent.max_capacity = new_capacity
             if 'wallet_threshold' in config:
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
+            
+            # Marketplace settings
+            if 'marketplace_mode_enabled' in config or 'marketplace_task_timeout_seconds' in config:
+                update_marketplace_settings(config)
+                print(f"[FleetState] → marketplace_mode = {'ENABLED' if MARKETPLACE_MODE_ENABLED else 'DISABLED'}, timeout = {MARKETPLACE_TASK_TIMEOUT_SECONDS}s")
+            
             print(f"[FleetState] Applied config: max_dist={fleet_state.max_distance_km}km, chain_lookahead={fleet_state.chain_lookahead_radius_km}km, capacity={fleet_state.default_max_capacity}, wallet={fleet_state.wallet_threshold}")
         
         stats = fleet_state.get_stats()
@@ -1282,7 +1347,9 @@ def handle_fleet_sync(data):
                 'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
                 'wallet_threshold': fleet_state.wallet_threshold,
                 'max_tasks_per_agent': fleet_state.default_max_capacity,
-                'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km
+                'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
+                'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
+                'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
             },
             'fleet_stats': stats
         })
@@ -1685,18 +1752,21 @@ def handle_task_created(data):
     })
     
     # =========================================================================
-    # BROADCAST MODE: Offer task to ALL eligible agents simultaneously
+    # MARKETPLACE MODE: Broadcast all tasks to all eligible agents
     # =========================================================================
-    if BROADCAST_MODE_ENABLED:
+    if MARKETPLACE_MODE_ENABLED:
         task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
         if task_after and task_after.status == TaskStatus.UNASSIGNED:
-            # Broadcast to all eligible agents - first to accept wins
-            broadcast_result = broadcast_task_offer(task_id, dashboard_url)
-            if broadcast_result['success']:
-                print(f"[FleetState] 📡 BROADCAST MODE: Offered {task.restaurant_name} to {len(broadcast_result['offered_to'])} agents")
-                return  # Don't trigger optimization - wait for acceptance
+            # Broadcast full marketplace state - agents see all available tasks
+            broadcast_result = broadcast_marketplace(dashboard_url, trigger_reason=f"task_created:{task.restaurant_name[:20]}")
+            if broadcast_result['success'] and not broadcast_result.get('debounced'):
+                print(f"[Marketplace] 📡 Updated marketplace: {broadcast_result['tasks_count']} tasks available")
+                return  # Don't trigger optimization - agents will claim from marketplace
+            elif broadcast_result.get('debounced'):
+                print(f"[Marketplace] 📡 Marketplace update debounced")
+                return
             else:
-                print(f"[FleetState] 📡 Broadcast failed ({broadcast_result.get('error')}), falling back to optimization")
+                print(f"[Marketplace] 📡 Marketplace broadcast failed, falling back to optimization")
         elif task_after:
             print(f"[FleetState] ⏩ Skipping broadcast - task already {task_after.status.value}")
             return
@@ -1806,14 +1876,16 @@ def handle_task_declined(data):
     # =========================================================================
     task_after_proximity = fleet_state.get_task(str(task_id)) if (FLEET_STATE_AVAILABLE and fleet_state and task_id) else None
     
-    if BROADCAST_MODE_ENABLED and task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
-        # Re-broadcast to remaining eligible agents (excludes those who declined)
-        broadcast_result = broadcast_task_offer(task_id, dashboard_url)
-        if broadcast_result['success']:
-            log_event(f"[Broadcast] 📡 RE-BROADCAST after decline: {task.restaurant_name if task else task_id[:20]} to {len(broadcast_result['offered_to'])} agents")
-            return  # Don't trigger optimization - wait for acceptance
+    if MARKETPLACE_MODE_ENABLED and task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
+        # Broadcast updated marketplace (declined agent removed from eligibility)
+        broadcast_result = broadcast_marketplace(dashboard_url, trigger_reason=f"task_declined:{task.restaurant_name if task else task_id[:20]}")
+        if broadcast_result['success'] and not broadcast_result.get('debounced'):
+            log_event(f"[Marketplace] 📡 Updated marketplace after decline: {broadcast_result['tasks_count']} tasks")
+            return  # Don't trigger optimization - agents will claim from marketplace
+        elif broadcast_result.get('debounced'):
+            return  # Debounced, skip
         else:
-            log_event(f"[Broadcast] 📡 Re-broadcast failed ({broadcast_result.get('error')}), falling back to optimization")
+            log_event(f"[Marketplace] 📡 Marketplace update failed, falling back to optimization")
     
     # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
     if task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
@@ -1826,89 +1898,81 @@ def handle_task_declined(data):
         print(f"[FleetState] ℹ️ Task {str(task_id)[:20]}... already assigned by proximity, skipping event-based optimization.")
 
 
-@socketio.on('task:accepted')
-def handle_task_accepted(data):
+@socketio.on('marketplace:request')
+def handle_marketplace_request(data):
     """
-    Agent accepts a broadcast task offer → First to accept wins.
+    Client requests current marketplace state (e.g., on connect or refresh).
     
-    Payload: { 
-        task_id: str,
-        agent_id: str, 
-        agent_name: str,
-        dashboard_url: str 
-    }
-    
-    This is the NEW broadcast acceptance flow:
-    1. Task was broadcast to multiple agents via task:offered
-    2. Agent clicks "Accept" on their app
-    3. Dashboard sends task:accepted
-    4. First accept wins, others get task:taken notification
+    Payload: { dashboard_url: str }
     """
-    performance_stats["websocket_events"] += 1
-    task_id = data.get('task_id') or data.get('id', '')
-    agent_id = data.get('agent_id', '')
-    agent_name = data.get('agent_name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    log_payload('task:accepted', data)
-    log_event(f"[WebSocket] task:accepted: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+    log_event(f"[Marketplace] 📋 Client requested marketplace state")
     
-    # Handle the acceptance
-    result = handle_task_acceptance(task_id, agent_id, agent_name, dashboard_url)
+    # Build and send current marketplace state to this client only
+    marketplace = build_marketplace_state(dashboard_url)
+    marketplace['trigger'] = 'client_request'
+    marketplace['settings'] = {
+        'mode_enabled': MARKETPLACE_MODE_ENABLED,
+        'task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
+    }
     
-    if result['success'] and result['assigned']:
-        # Successfully assigned!
-        emit('task:accepted_ack', {
-            'task_id': task_id,
-            'agent_id': agent_id,
-            'assigned': True,
-            'message': 'Task assigned to you!'
-        })
-    elif result['reason'] == 'no_pending_offer':
-        # Task wasn't broadcast or already taken
-        # Try to handle as a regular acceptance (fallback for non-broadcast tasks)
-        log_event(f"[Broadcast] ⚠️ No pending broadcast for {task_id[:20]}... - handling as direct acceptance")
-        
-        # Check if task exists and is unassigned
-        if fleet_state:
-            task = fleet_state.get_task(task_id)
-            if task and task.status == TaskStatus.UNASSIGNED:
-                # Direct assignment
-                fleet_state.assign_task(task_id, agent_id)
-                
-                assignment_payload = {
-                    'id': task_id,
-                    'agent_id': agent_id,
-                    'agent_name': agent_name,
-                    'assigned_at': datetime.now(timezone.utc).isoformat(),
-                    'assignment_type': 'direct_accepted',
-                    'dashboard_url': dashboard_url
-                }
-                socketio.emit('task:assigned', assignment_payload)
-                log_event(f"[Broadcast] ✅ DIRECT ACCEPT: {task.restaurant_name} → {agent_name}")
-                
-                emit('task:accepted_ack', {
-                    'task_id': task_id,
-                    'agent_id': agent_id,
-                    'assigned': True,
-                    'message': 'Task assigned to you!'
-                })
-            else:
-                emit('task:accepted_ack', {
-                    'task_id': task_id,
-                    'agent_id': agent_id,
-                    'assigned': False,
-                    'reason': 'task_not_available'
-                })
+    emit('marketplace:update', marketplace)
+
+
+@socketio.on('marketplace:timeout')
+def handle_marketplace_timeout(data):
+    """
+    Dashboard timer expired for one or more tasks - trigger re-broadcast.
+    
+    This is called by the dashboard when its countdown timer expires for tasks
+    that weren't accepted within the allotted time.
+    
+    Payload: { 
+        task_ids: [str],  # Optional - specific tasks that timed out
+        dashboard_url: str 
+    }
+    """
+    performance_stats["websocket_events"] += 1
+    task_ids = data.get('task_ids', [])
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    if task_ids:
+        log_event(f"[Marketplace] ⏰ Dashboard timeout for {len(task_ids)} task(s) - re-broadcasting")
     else:
-        # Failed - task was taken by someone else or offer expired
-        emit('task:accepted_ack', {
-            'task_id': task_id,
-            'agent_id': agent_id,
-            'assigned': False,
-            'reason': result['reason'],
-            'message': 'Task already taken by another agent' if result['reason'] == 'offer_expired' else result['reason']
-        })
+        log_event(f"[Marketplace] ⏰ Dashboard timeout - re-broadcasting all")
+    
+    # Re-broadcast the marketplace
+    broadcast_marketplace(dashboard_url, trigger_reason=f"dashboard_timeout:{len(task_ids) if task_ids else 'all'}")
+
+
+@socketio.on('marketplace:settings')
+def handle_marketplace_settings(data):
+    """
+    Dashboard updates marketplace settings.
+    
+    Payload: {
+        marketplace_mode_enabled: bool,
+        marketplace_task_timeout_seconds: int,
+        dashboard_url: str
+    }
+    """
+    performance_stats["websocket_events"] += 1
+    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    
+    # Update settings
+    update_marketplace_settings(data)
+    
+    # Emit acknowledgment with current settings
+    emit('marketplace:settings_ack', {
+        'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
+        'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS,
+        'received_at': datetime.now().isoformat()
+    })
+    
+    # If marketplace mode was just enabled, broadcast current state
+    if data.get('marketplace_mode_enabled'):
+        broadcast_marketplace(dashboard_url, trigger_reason="mode_enabled")
 
 
 @socketio.on('task:completed')
@@ -1975,7 +2039,15 @@ def handle_task_completed(data):
             'task_removed': True
         })
         
-        # EVENT-BASED: Trigger optimization if there are unassigned tasks and agent has capacity
+        # MARKETPLACE: Agent now has capacity - broadcast updated marketplace
+        if MARKETPLACE_MODE_ENABLED:
+            unassigned_tasks = fleet_state.get_unassigned_tasks()
+            if len(unassigned_tasks) > 0:
+                broadcast_marketplace(dashboard_url, trigger_reason=f"task_completed:{agent_name}")
+                print(f"[Marketplace] {agent_name} completed task, broadcasting {len(unassigned_tasks)} available tasks")
+            return  # Skip legacy optimization in marketplace mode
+        
+        # LEGACY: EVENT-BASED optimization (only if marketplace mode disabled)
         # Note: Proximity triggers may also fire from agent:location_update - debouncing handles dedup
         unassigned_tasks = fleet_state.get_unassigned_tasks()
         unassigned_count = len(unassigned_tasks)
@@ -2323,6 +2395,10 @@ def handle_task_assigned(data):
     if task:
         log_event(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
         print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
+        
+        # MARKETPLACE: Broadcast updated marketplace (task removed, agent capacity reduced)
+        if MARKETPLACE_MODE_ENABLED:
+            broadcast_marketplace(dashboard_url, trigger_reason=f"task_assigned:{task.restaurant_name[:20]}")
     
     emit('task:assigned_ack', {
         'id': task_id,
@@ -2335,6 +2411,10 @@ def handle_task_assigned(data):
 def handle_task_accepted(data):
     """
     Agent accepted the task assignment.
+    
+    In MARKETPLACE MODE: Agent accepted a task from the marketplace.
+    Dashboard has already assigned via Tookan - we update our state and re-broadcast.
+    
     Payload: { id, agent_id, agent_name, accepted_at, dashboard_url }
     """
     performance_stats["websocket_events"] += 1
@@ -2350,6 +2430,10 @@ def handle_task_accepted(data):
         task = fleet_state.accept_task(task_id, str(agent_id))
         if task:
             print(f"[FleetState] Task {task.restaurant_name} accepted by {agent_name}")
+            
+            # MARKETPLACE MODE: Update marketplace after acceptance
+            if MARKETPLACE_MODE_ENABLED:
+                handle_marketplace_acceptance(task_id, str(agent_id), agent_name, dashboard_url)
     
     emit('task:accepted_ack', {
         'id': task_id,
@@ -2431,7 +2515,13 @@ def handle_agent_online(data):
         'triggered_optimization': has_unassigned
     })
     
-    # EVENT-BASED: Only try to give this agent work if there are unassigned tasks
+    # MARKETPLACE: New agent online - broadcast updated marketplace to them
+    if MARKETPLACE_MODE_ENABLED and has_unassigned:
+        broadcast_marketplace(dashboard_url, trigger_reason=f"agent_online:{name}")
+        print(f"[Marketplace] 📡 Sent marketplace to newly online agent: {name}")
+        return  # Skip legacy optimization in marketplace mode
+    
+    # LEGACY: EVENT-BASED optimization (only if marketplace mode disabled)
     if has_unassigned:
         trigger_fleet_optimization('agent:online', {
             'agent_id': agent_id,
@@ -2882,7 +2972,10 @@ def fleet_state_config():
             'wallet_threshold': fleet_state.wallet_threshold,  # Max wallet balance for cash orders
             'max_tasks_per_agent': fleet_state.default_max_capacity,  # Agent capacity limit
             'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
-            'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds
+            'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds,
+            # Marketplace settings
+            'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
+            'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
         }), 200
     
     # POST - update config
@@ -2913,6 +3006,10 @@ def fleet_state_config():
     if 'optimization_cooldown_seconds' in data:
         fleet_state.optimization_cooldown_seconds = float(data['optimization_cooldown_seconds'])
     
+    # Marketplace settings
+    if 'marketplace_mode_enabled' in data or 'marketplace_task_timeout_seconds' in data:
+        update_marketplace_settings(data)
+    
     return jsonify({
         'message': 'Configuration updated',
         'max_distance_km': fleet_state.max_distance_km,
@@ -2921,7 +3018,9 @@ def fleet_state_config():
         'wallet_threshold': fleet_state.wallet_threshold,
         'max_tasks_per_agent': fleet_state.default_max_capacity,
         'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
-        'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds
+        'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds,
+        'marketplace_mode_enabled': MARKETPLACE_MODE_ENABLED,
+        'marketplace_task_timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
     }), 200
 
 
@@ -2964,6 +3063,12 @@ def clear_fleet_state():
 def fleet_map():
     """Serve the fleet map visualization UI."""
     return render_template('fleet_map.html')
+
+
+@app.route('/marketplace')
+def marketplace():
+    """Serve the marketplace debug UI."""
+    return render_template('marketplace.html')
 
 
 if __name__ == '__main__':

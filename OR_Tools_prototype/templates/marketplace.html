@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Marketplace Debug - Task Broadcasting</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --bg-dark: #0a0e14;
+            --bg-card: #12171f;
+            --bg-hover: #1a212d;
+            --accent-green: #00ff88;
+            --accent-blue: #00d4ff;
+            --accent-orange: #ff9500;
+            --accent-red: #ff4444;
+            --accent-purple: #a855f7;
+            --accent-yellow: #ffd700;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --border-color: #21262d;
+        }
+        
+        body {
+            font-family: 'Space Grotesk', sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .header h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, var(--accent-purple), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .mode-toggle {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .mode-badge {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+        }
+        
+        .mode-badge.enabled {
+            background: rgba(0, 255, 136, 0.2);
+            color: var(--accent-green);
+            border: 1px solid var(--accent-green);
+        }
+        
+        .mode-badge.disabled {
+            background: rgba(255, 68, 68, 0.2);
+            color: var(--accent-red);
+            border: 1px solid var(--accent-red);
+        }
+        
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-dot.connected { background: var(--accent-green); }
+        .status-dot.disconnected { background: var(--accent-red); }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            text-align: center;
+        }
+        
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .stat-card .label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+        
+        .stat-card.tasks .value { color: var(--accent-orange); }
+        .stat-card.agents .value { color: var(--accent-blue); }
+        .stat-card.competition .value { color: var(--accent-purple); }
+        .stat-card.timeout .value { color: var(--accent-yellow); }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        
+        @media (max-width: 1200px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        
+        .panel-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .panel-header h2 {
+            font-size: 1.1rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .panel-header h2::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 2px;
+        }
+        
+        .panel.tasks .panel-header h2::before { background: var(--accent-orange); }
+        .panel.agents .panel-header h2::before { background: var(--accent-blue); }
+        .panel.matrix .panel-header h2::before { background: var(--accent-purple); }
+        .panel.log .panel-header h2::before { background: var(--accent-green); }
+        
+        .panel-content {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .task-item, .agent-item {
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border-color);
+            transition: background 0.2s;
+        }
+        
+        .task-item:hover, .agent-item:hover {
+            background: var(--bg-hover);
+        }
+        
+        .task-item:last-child, .agent-item:last-child {
+            border-bottom: none;
+        }
+        
+        .task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .task-name {
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+        
+        .task-meta {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .task-eligible {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        
+        .agent-chip {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            background: rgba(0, 212, 255, 0.15);
+            color: var(--accent-blue);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .agent-chip .distance {
+            color: var(--accent-green);
+        }
+        
+        .badge {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+        
+        .badge.premium { background: rgba(168, 85, 247, 0.2); color: var(--accent-purple); }
+        .badge.competition { background: rgba(255, 149, 0, 0.2); color: var(--accent-orange); }
+        .badge.payment { background: rgba(0, 255, 136, 0.2); color: var(--accent-green); }
+        
+        .agent-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .agent-name {
+            font-weight: 500;
+        }
+        
+        .agent-stats {
+            display: flex;
+            gap: 12px;
+            font-size: 0.8rem;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .agent-stats span {
+            color: var(--text-secondary);
+        }
+        
+        .agent-stats .available {
+            color: var(--accent-green);
+        }
+        
+        .agent-stats .busy {
+            color: var(--accent-orange);
+        }
+        
+        .matrix-panel {
+            grid-column: 1 / -1;
+        }
+        
+        .matrix-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+        
+        .matrix-table th, .matrix-table td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .matrix-table th {
+            background: var(--bg-dark);
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+        
+        .matrix-table td.eligible {
+            color: var(--accent-green);
+        }
+        
+        .matrix-table td.ineligible {
+            color: var(--text-secondary);
+        }
+        
+        .log-panel {
+            grid-column: 1 / -1;
+        }
+        
+        .log-content {
+            max-height: 200px;
+            overflow-y: auto;
+            padding: 12px 20px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+        
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 12px;
+        }
+        
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+        
+        .log-time {
+            color: var(--text-secondary);
+            flex-shrink: 0;
+        }
+        
+        .log-message {
+            word-break: break-word;
+        }
+        
+        .log-entry.broadcast .log-message { color: var(--accent-purple); }
+        .log-entry.accepted .log-message { color: var(--accent-green); }
+        .log-entry.timeout .log-message { color: var(--accent-yellow); }
+        .log-entry.error .log-message { color: var(--accent-red); }
+        
+        .config-panel {
+            margin-top: 24px;
+            padding: 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+        }
+        
+        .config-panel h3 {
+            margin-bottom: 16px;
+            font-size: 1rem;
+            font-weight: 500;
+        }
+        
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        
+        .config-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .config-item label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        
+        .config-item input, .config-item select {
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+        }
+        
+        .config-item input:focus, .config-item select:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: var(--accent-purple);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: var(--accent-blue);
+        }
+        
+        .btn-secondary {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+        
+        .btn-secondary:hover {
+            background: var(--border-color);
+        }
+        
+        .empty-state {
+            padding: 40px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏪 Marketplace Debug</h1>
+        <div class="mode-toggle">
+            <span class="mode-badge" id="modeBadge">LOADING...</span>
+            <div class="connection-status">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="connectionText">Connecting...</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="stats-bar">
+        <div class="stat-card tasks">
+            <div class="value" id="taskCount">-</div>
+            <div class="label">Available Tasks</div>
+        </div>
+        <div class="stat-card agents">
+            <div class="value" id="agentCount">-</div>
+            <div class="label">Active Agents</div>
+        </div>
+        <div class="stat-card competition">
+            <div class="value" id="avgCompetition">-</div>
+            <div class="label">Avg Competition</div>
+        </div>
+        <div class="stat-card timeout">
+            <div class="value" id="timeout">-</div>
+            <div class="label">Timeout (s)</div>
+        </div>
+    </div>
+    
+    <div class="main-content">
+        <div class="panel tasks">
+            <div class="panel-header">
+                <h2>Available Tasks</h2>
+                <button class="btn btn-secondary" onclick="requestMarketplace()">Refresh</button>
+            </div>
+            <div class="panel-content" id="taskList">
+                <div class="empty-state">Waiting for marketplace data...</div>
+            </div>
+        </div>
+        
+        <div class="panel agents">
+            <div class="panel-header">
+                <h2>Active Agents</h2>
+                <span id="agentStats" style="font-size: 0.85rem; color: var(--text-secondary);"></span>
+            </div>
+            <div class="panel-content" id="agentList">
+                <div class="empty-state">Waiting for marketplace data...</div>
+            </div>
+        </div>
+        
+        <div class="panel log log-panel">
+            <div class="panel-header">
+                <h2>Marketplace Activity</h2>
+                <button class="btn btn-secondary" onclick="clearLog()">Clear</button>
+            </div>
+            <div class="log-content" id="logContent">
+                <div class="log-entry">
+                    <span class="log-time">--:--:--</span>
+                    <span class="log-message">Waiting for marketplace events...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="config-panel">
+        <h3>⚙️ Marketplace Settings</h3>
+        <div class="config-grid">
+            <div class="config-item">
+                <label>Mode</label>
+                <select id="marketplaceMode">
+                    <option value="true">Marketplace (Broadcast)</option>
+                    <option value="false">Fleet Optimization</option>
+                </select>
+            </div>
+            <div class="config-item">
+                <label>Task Timeout (seconds)</label>
+                <input type="number" id="taskTimeout" step="10" value="120" min="30" max="600">
+            </div>
+            <div class="config-item" style="justify-content: flex-end;">
+                <button class="btn btn-primary" onclick="updateSettings()">Apply Settings</button>
+            </div>
+            <div class="config-item" style="justify-content: flex-end;">
+                <button class="btn btn-secondary" onclick="triggerTimeout()">Simulate Timeout</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // WebSocket connection
+        const socket = io(window.location.origin, {
+            transports: ['websocket', 'polling']
+        });
+        
+        let logEntries = [];
+        const MAX_LOG_ENTRIES = 50;
+        let currentMarketplace = null;
+        let marketplaceEnabled = true;
+        let taskTimeoutSeconds = 120;
+        
+        // Connection events
+        socket.on('connect', () => {
+            document.getElementById('statusDot').className = 'status-dot connected';
+            document.getElementById('connectionText').textContent = 'Connected';
+            addLog('system', 'Connected to OR-Tools server');
+            requestMarketplace();
+        });
+        
+        socket.on('disconnect', () => {
+            document.getElementById('statusDot').className = 'status-dot disconnected';
+            document.getElementById('connectionText').textContent = 'Disconnected';
+            addLog('error', 'Disconnected from server');
+        });
+        
+        // Listen for marketplace events
+        socket.on('marketplace:update', (data) => {
+            currentMarketplace = data;
+            updateMarketplaceDisplay(data);
+            addLog('broadcast', `📡 Marketplace update: ${data.total_unassigned} tasks, ${data.total_available_agents} agents (${data.trigger})`);
+            
+            // Update settings if provided
+            if (data.settings) {
+                marketplaceEnabled = data.settings.mode_enabled;
+                taskTimeoutSeconds = data.settings.task_timeout_seconds;
+                updateModeDisplay();
+            }
+        });
+        
+        socket.on('marketplace:settings_ack', (data) => {
+            marketplaceEnabled = data.marketplace_mode_enabled;
+            taskTimeoutSeconds = data.marketplace_task_timeout_seconds;
+            updateModeDisplay();
+            addLog('system', `Settings updated: mode=${marketplaceEnabled ? 'MARKETPLACE' : 'FLEET_OPT'}, timeout=${taskTimeoutSeconds}s`);
+        });
+        
+        socket.on('task:assigned', (data) => {
+            addLog('accepted', `✅ Task assigned: ${data.agent_name} got ${data.id?.substring(0, 20)}...`);
+            requestMarketplace();
+        });
+        
+        socket.on('task:accepted_ack', (data) => {
+            addLog('accepted', `✅ Acceptance confirmed: ${data.agent_name} - ${data.id?.substring(0, 20)}...`);
+        });
+        
+        function updateModeDisplay() {
+            const badge = document.getElementById('modeBadge');
+            const select = document.getElementById('marketplaceMode');
+            const timeoutInput = document.getElementById('taskTimeout');
+            
+            badge.textContent = marketplaceEnabled ? 'MARKETPLACE' : 'FLEET OPT';
+            badge.className = 'mode-badge ' + (marketplaceEnabled ? 'enabled' : 'disabled');
+            select.value = marketplaceEnabled.toString();
+            timeoutInput.value = taskTimeoutSeconds;
+            document.getElementById('timeout').textContent = taskTimeoutSeconds;
+        }
+        
+        function updateMarketplaceDisplay(data) {
+            // Update stats
+            document.getElementById('taskCount').textContent = data.total_unassigned || 0;
+            document.getElementById('agentCount').textContent = data.total_available_agents || 0;
+            
+            // Calculate average competition
+            const tasks = data.tasks || [];
+            const avgComp = tasks.length > 0 
+                ? (tasks.reduce((sum, t) => sum + t.competition, 0) / tasks.length).toFixed(1)
+                : 0;
+            document.getElementById('avgCompetition').textContent = avgComp;
+            
+            // Render tasks
+            const taskList = document.getElementById('taskList');
+            if (tasks.length === 0) {
+                taskList.innerHTML = '<div class="empty-state">No available tasks</div>';
+            } else {
+                taskList.innerHTML = tasks.map(task => `
+                    <div class="task-item">
+                        <div class="task-header">
+                            <span class="task-name">${task.restaurant_name} → ${task.customer_name}</span>
+                            <div>
+                                ${task.is_premium ? '<span class="badge premium">PREMIUM</span>' : ''}
+                                <span class="badge competition">${task.competition} agents</span>
+                                <span class="badge payment">$${task.payment?.total?.toFixed(2) || '0.00'}</span>
+                            </div>
+                        </div>
+                        <div class="task-meta">
+                            Pickup: ${task.times?.pickup_before ? new Date(task.times.pickup_before).toLocaleTimeString() : 'N/A'} |
+                            Delivery: ${task.times?.delivery_before ? new Date(task.times.delivery_before).toLocaleTimeString() : 'N/A'}
+                        </div>
+                        <div class="task-eligible">
+                            ${task.eligible_agents?.map(a => `
+                                <span class="agent-chip">
+                                    ${a.agent_name}
+                                    <span class="distance">${a.distance_km}km</span>
+                                </span>
+                            `).join('') || '<span style="color: var(--accent-red);">No eligible agents</span>'}
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+            // Render agents
+            const agents = data.agents || [];
+            const agentList = document.getElementById('agentList');
+            document.getElementById('agentStats').textContent = `${agents.filter(a => a.task_count > 0).length} with tasks`;
+            
+            if (agents.length === 0) {
+                agentList.innerHTML = '<div class="empty-state">No active agents</div>';
+            } else {
+                agentList.innerHTML = agents.map(agent => `
+                    <div class="agent-item">
+                        <div class="agent-info">
+                            <span class="agent-name">${agent.agent_name}</span>
+                            <div class="agent-stats">
+                                <span class="${agent.task_count > 0 ? 'available' : ''}">${agent.task_count} task options</span>
+                                <span class="${agent.current_tasks > 0 ? 'busy' : ''}">${agent.current_tasks} current</span>
+                                <span>+${agent.capacity_remaining} capacity</span>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+        
+        function requestMarketplace() {
+            socket.emit('marketplace:request', {
+                dashboard_url: window.location.origin
+            });
+        }
+        
+        function updateSettings() {
+            const mode = document.getElementById('marketplaceMode').value === 'true';
+            const timeout = parseInt(document.getElementById('taskTimeout').value);
+            
+            socket.emit('marketplace:settings', {
+                marketplace_mode_enabled: mode,
+                marketplace_task_timeout_seconds: timeout,
+                dashboard_url: window.location.origin
+            });
+        }
+        
+        function triggerTimeout() {
+            socket.emit('marketplace:timeout', {
+                task_ids: [],  // Empty = all tasks
+                dashboard_url: window.location.origin
+            });
+            addLog('timeout', '⏰ Simulated timeout - triggering re-broadcast');
+        }
+        
+        function addLog(type, message) {
+            const time = new Date().toLocaleTimeString();
+            logEntries.unshift({ time, type, message });
+            
+            if (logEntries.length > MAX_LOG_ENTRIES) {
+                logEntries = logEntries.slice(0, MAX_LOG_ENTRIES);
+            }
+            
+            renderLog();
+        }
+        
+        function renderLog() {
+            const content = document.getElementById('logContent');
+            content.innerHTML = logEntries.map(entry => `
+                <div class="log-entry ${entry.type}">
+                    <span class="log-time">${entry.time}</span>
+                    <span class="log-message">${entry.message}</span>
+                </div>
+            `).join('');
+        }
+        
+        function clearLog() {
+            logEntries = [];
+            renderLog();
+        }
+        
+        // Initial load
+        updateModeDisplay();
+    </script>
+</body>
+</html>
+
