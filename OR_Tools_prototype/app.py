@@ -347,10 +347,67 @@ def build_marketplace_state(dashboard_url: str) -> dict:
         
         tasks_data.append(task_data)
     
+    # Build agents array with route info (similar to fleet:routes_updated)
+    agents_data = []
+    all_agents = fleet_state.get_all_agents()
+    
+    for agent in all_agents:
+        if not agent.is_online:
+            continue
+            
+        # Get agent's current tasks (assigned but not completed)
+        agent_tasks = fleet_state.get_agent_tasks(agent.id)
+        current_task_ids = [t.id for t in agent_tasks]
+        
+        # Find which unassigned tasks this agent is eligible for
+        available_task_ids = []
+        for task_data in tasks_data:
+            if any(ea['agent_id'] == agent.id for ea in task_data.get('eligible_agents', [])):
+                available_task_ids.append(task_data['id'])
+        
+        # Build route info for current tasks
+        route_stops = []
+        for task in agent_tasks:
+            # Add pickup if not completed
+            if task.status == TaskStatus.ASSIGNED:
+                route_stops.append({
+                    'type': 'pickup',
+                    'task_id': task.id,
+                    'location': [task.restaurant_location.lat, task.restaurant_location.lng],
+                    'name': task.restaurant_name,
+                    'time_window': task.pickup_before.isoformat() if task.pickup_before else None
+                })
+            # Add delivery
+            route_stops.append({
+                'type': 'delivery',
+                'task_id': task.id,
+                'location': [task.delivery_location.lat, task.delivery_location.lng],
+                'name': task.customer_name,
+                'time_window': task.delivery_before.isoformat() if task.delivery_before else None
+            })
+        
+        agent_data = {
+            'agent_id': agent.id,
+            'agent_name': agent.name,
+            'location': [agent.lat, agent.lng] if agent.lat and agent.lng else None,
+            'is_online': agent.is_online,
+            'current_tasks': current_task_ids,
+            'current_task_count': len(current_task_ids),
+            'max_capacity': agent.max_capacity,
+            'available_capacity': agent.available_capacity,
+            'has_capacity': agent.has_capacity,
+            'available_tasks': available_task_ids,
+            'available_task_count': len(available_task_ids),
+            'priority': agent.priority,
+            'route': route_stops
+        }
+        agents_data.append(agent_data)
+    
     return {
         'tasks': tasks_data,
+        'agents': agents_data,
         'total_unassigned': len(tasks_data),
-        'total_available_agents': len(available_agents),
+        'total_available_agents': len([a for a in agents_data if a['has_capacity']]),
         'timestamp': time.time(),
         'dashboard_url': dashboard_url
     }
