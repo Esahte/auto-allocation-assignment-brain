@@ -201,6 +201,11 @@
             border-bottom: none;
         }
         
+        .task-item.no-agents {
+            background: rgba(255, 68, 68, 0.05);
+            border-left: 3px solid var(--accent-red);
+        }
+        
         .task-header {
             display: flex;
             justify-content: space-between;
@@ -466,22 +471,15 @@
     </div>
     
     <div class="main-content">
-        <div class="panel tasks">
+        <div class="panel tasks" style="grid-column: 1 / -1;">
             <div class="panel-header">
                 <h2>Available Tasks</h2>
-                <button class="btn btn-secondary" onclick="requestMarketplace()">Refresh</button>
+                <div style="display: flex; gap: 12px; align-items: center;">
+                    <span id="taskStats" style="font-size: 0.85rem; color: var(--text-secondary);"></span>
+                    <button class="btn btn-secondary" onclick="requestMarketplace()">Refresh</button>
+                </div>
             </div>
-            <div class="panel-content" id="taskList">
-                <div class="empty-state">Waiting for marketplace data...</div>
-            </div>
-        </div>
-        
-        <div class="panel agents">
-            <div class="panel-header">
-                <h2>Active Agents</h2>
-                <span id="agentStats" style="font-size: 0.85rem; color: var(--text-secondary);"></span>
-            </div>
-            <div class="panel-content" id="agentList">
+            <div class="panel-content" id="taskList" style="max-height: 500px;">
                 <div class="empty-state">Waiting for marketplace data...</div>
             </div>
         </div>
@@ -596,12 +594,17 @@
             document.getElementById('taskCount').textContent = data.total_unassigned || 0;
             document.getElementById('agentCount').textContent = data.total_available_agents || 0;
             
-            // Calculate average competition
+            // Calculate stats
             const tasks = data.tasks || [];
-            const avgComp = tasks.length > 0 
-                ? (tasks.reduce((sum, t) => sum + t.competition, 0) / tasks.length).toFixed(1)
+            const tasksWithAgents = tasks.filter(t => t.competition > 0).length;
+            const tasksNoAgents = tasks.filter(t => t.no_eligible_agents).length;
+            const avgComp = tasksWithAgents > 0 
+                ? (tasks.filter(t => t.competition > 0).reduce((sum, t) => sum + t.competition, 0) / tasksWithAgents).toFixed(1)
                 : 0;
             document.getElementById('avgCompetition').textContent = avgComp;
+            document.getElementById('taskStats').textContent = tasksNoAgents > 0 
+                ? `${tasksNoAgents} blocked` 
+                : '';
             
             // Render tasks
             const taskList = document.getElementById('taskList');
@@ -609,12 +612,15 @@
                 taskList.innerHTML = '<div class="empty-state">No available tasks</div>';
             } else {
                 taskList.innerHTML = tasks.map(task => `
-                    <div class="task-item">
+                    <div class="task-item ${task.no_eligible_agents ? 'no-agents' : ''}">
                         <div class="task-header">
                             <span class="task-name">${task.restaurant_name} → ${task.customer_name}</span>
                             <div>
                                 ${task.is_premium ? '<span class="badge premium">PREMIUM</span>' : ''}
-                                <span class="badge competition">${task.competition} agents</span>
+                                ${task.no_eligible_agents 
+                                    ? '<span class="badge" style="background: rgba(255,68,68,0.2); color: var(--accent-red);">NO AGENTS</span>'
+                                    : `<span class="badge competition">${task.competition} agents</span>`
+                                }
                                 <span class="badge payment">$${task.payment?.total?.toFixed(2) || '0.00'}</span>
                             </div>
                         </div>
@@ -623,34 +629,21 @@
                             Delivery: ${task.times?.delivery_before ? new Date(task.times.delivery_before).toLocaleTimeString() : 'N/A'}
                         </div>
                         <div class="task-eligible">
-                            ${task.eligible_agents?.map(a => `
-                                <span class="agent-chip">
-                                    ${a.agent_name}
-                                    <span class="distance">${a.distance_km}km</span>
-                                </span>
-                            `).join('') || '<span style="color: var(--accent-red);">No eligible agents</span>'}
-                        </div>
-                    </div>
-                `).join('');
-            }
-            
-            // Render agents
-            const agents = data.agents || [];
-            const agentList = document.getElementById('agentList');
-            document.getElementById('agentStats').textContent = `${agents.filter(a => a.task_count > 0).length} with tasks`;
-            
-            if (agents.length === 0) {
-                agentList.innerHTML = '<div class="empty-state">No active agents</div>';
-            } else {
-                agentList.innerHTML = agents.map(agent => `
-                    <div class="agent-item">
-                        <div class="agent-info">
-                            <span class="agent-name">${agent.agent_name}</span>
-                            <div class="agent-stats">
-                                <span class="${agent.task_count > 0 ? 'available' : ''}">${agent.task_count} task options</span>
-                                <span class="${agent.current_tasks > 0 ? 'busy' : ''}">${agent.current_tasks} current</span>
-                                <span>+${agent.capacity_remaining} capacity</span>
-                            </div>
+                            ${task.eligible_agents?.length > 0 
+                                ? task.eligible_agents.map(a => `
+                                    <span class="agent-chip">
+                                        ${a.agent_name}
+                                        <span class="distance">${a.distance_km}km</span>
+                                    </span>
+                                `).join('')
+                                : `<span style="color: var(--accent-red);">
+                                    ⚠️ ${task.primary_reason || 'No eligible agents'}
+                                    ${task.ineligibility_reasons 
+                                        ? ` (${Object.entries(task.ineligibility_reasons).map(([r, c]) => r + ':' + c).join(', ')})`
+                                        : ''
+                                    }
+                                   </span>`
+                            }
                         </div>
                     </div>
                 `).join('');

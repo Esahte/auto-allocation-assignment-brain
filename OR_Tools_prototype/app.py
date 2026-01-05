@@ -288,30 +288,29 @@ def build_marketplace_state(dashboard_url: str) -> dict:
     
     # Build task eligibility matrix
     tasks_data = []
-    agent_task_map = {}  # agent_id -> list of eligible task_ids
     
     for task in unassigned_tasks:
         # Find eligible agents for this task
         eligible = fleet_state.find_eligible_agents_for_task(task.id)
         
-        # Filter to truly eligible (no reason = compatible)
-        eligible_list = [
-            (agent, dist, reason) for agent, dist, reason in eligible
-            if reason is None and agent.has_capacity
-        ]
-        
+        # Separate eligible from ineligible
         eligible_agents_data = []
-        for agent, dist, _ in eligible_list:
-            eligible_agents_data.append({
-                'agent_id': agent.id,
-                'agent_name': agent.name,
-                'distance_km': round(dist, 2)
-            })
-            
-            # Track which tasks each agent can see
-            if agent.id not in agent_task_map:
-                agent_task_map[agent.id] = []
-            agent_task_map[agent.id].append(task.id)
+        ineligibility_reasons = {}  # Collect reasons why agents aren't eligible
+        
+        for agent, dist, reason in eligible:
+            if reason is None and agent.has_capacity:
+                # Truly eligible
+                eligible_agents_data.append({
+                    'agent_id': agent.id,
+                    'agent_name': agent.name,
+                    'distance_km': round(dist, 2)
+                })
+            else:
+                # Not eligible - track reason
+                actual_reason = reason if reason else 'at_max_capacity'
+                if actual_reason not in ineligibility_reasons:
+                    ineligibility_reasons[actual_reason] = 0
+                ineligibility_reasons[actual_reason] += 1
         
         task_data = {
             'id': task.id,
@@ -335,29 +334,23 @@ def build_marketplace_state(dashboard_url: str) -> dict:
             'tags': task.tags,
             'is_premium': 'premium' in (task.tags or []),
             'eligible_agents': eligible_agents_data,
-            'competition': len(eligible_agents_data)  # How many agents see this
+            'competition': len(eligible_agents_data)
         }
+        
+        # Add ineligibility info for tasks with no eligible agents
+        if len(eligible_agents_data) == 0:
+            task_data['no_eligible_agents'] = True
+            task_data['ineligibility_reasons'] = ineligibility_reasons
+            # Primary reason (most common)
+            if ineligibility_reasons:
+                task_data['primary_reason'] = max(ineligibility_reasons, key=ineligibility_reasons.get)
+        
         tasks_data.append(task_data)
-    
-    # Build agent view
-    agents_data = []
-    for agent in available_agents:
-        agent_data = {
-            'agent_id': agent.id,
-            'agent_name': agent.name,
-            'location': [agent.location.lat, agent.location.lng] if agent.location else None,
-            'available_tasks': agent_task_map.get(agent.id, []),
-            'task_count': len(agent_task_map.get(agent.id, [])),
-            'current_tasks': len(agent.task_ids),
-            'capacity_remaining': agent.available_capacity
-        }
-        agents_data.append(agent_data)
     
     return {
         'tasks': tasks_data,
-        'agents': agents_data,
         'total_unassigned': len(tasks_data),
-        'total_available_agents': len(agents_data),
+        'total_available_agents': len(available_agents),
         'timestamp': time.time(),
         'dashboard_url': dashboard_url
     }
