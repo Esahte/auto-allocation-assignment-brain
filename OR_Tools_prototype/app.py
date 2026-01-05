@@ -398,6 +398,97 @@ def broadcast_marketplace(dashboard_url: str, trigger_reason: str = "update") ->
     }
 
 
+def broadcast_task_proximity(task_id: str, triggered_by_agent: str, dashboard_url: str) -> dict:
+    """
+    Broadcast a SINGLE task to its eligible agents when proximity is triggered.
+    
+    This is more targeted than full marketplace - creates urgency:
+    "You're near this task - grab it before someone else does!"
+    
+    Returns: {'success': bool, 'task': {...}, 'eligible_count': int}
+    """
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        return {'success': False, 'error': 'Fleet state not available'}
+    
+    task = fleet_state.get_task(task_id)
+    if not task:
+        return {'success': False, 'error': 'Task not found'}
+    
+    if task.status != TaskStatus.UNASSIGNED:
+        return {'success': False, 'error': 'Task already assigned'}
+    
+    # Find eligible agents for this task
+    eligible = fleet_state.find_eligible_agents_for_task(task_id)
+    
+    eligible_agents_data = []
+    ineligibility_reasons = {}
+    
+    for agent, dist, reason in eligible:
+        if reason is None and agent.has_capacity:
+            eligible_agents_data.append({
+                'agent_id': agent.id,
+                'agent_name': agent.name,
+                'distance_km': round(dist, 2)
+            })
+        else:
+            actual_reason = reason if reason else 'at_max_capacity'
+            if actual_reason not in ineligibility_reasons:
+                ineligibility_reasons[actual_reason] = 0
+            ineligibility_reasons[actual_reason] += 1
+    
+    if not eligible_agents_data:
+        return {'success': False, 'error': 'No eligible agents', 'reasons': ineligibility_reasons}
+    
+    # Build single-task payload
+    task_data = {
+        'id': task.id,
+        'restaurant_name': task.restaurant_name,
+        'customer_name': task.customer_name,
+        'locations': {
+            'restaurant': [task.restaurant_location.lat, task.restaurant_location.lng],
+            'delivery': [task.delivery_location.lat, task.delivery_location.lng]
+        },
+        'times': {
+            'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+            'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
+            'created_at': task.created_at.isoformat() if task.created_at else None
+        },
+        'payment': {
+            'delivery_fee': task.delivery_fee,
+            'tips': task.tips,
+            'type': task.payment_type,
+            'total': (task.delivery_fee or 0) + (task.tips or 0)
+        },
+        'tags': task.tags,
+        'is_premium': 'premium' in (task.tags or []),
+        'eligible_agents': eligible_agents_data,
+        'competition': len(eligible_agents_data)
+    }
+    
+    # Emit targeted broadcast
+    proximity_payload = {
+        'event': 'task:proximity',
+        'task': task_data,
+        'triggered_by': triggered_by_agent,
+        'timestamp': time.time(),
+        'timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS,
+        'dashboard_url': dashboard_url
+    }
+    
+    socketio.emit('task:proximity', proximity_payload)
+    
+    agent_names = [a['agent_name'] for a in eligible_agents_data]
+    log_event(f"[Marketplace] 📍 PROXIMITY: {task.restaurant_name} → {len(eligible_agents_data)} agents: {agent_names}")
+    
+    return {
+        'success': True,
+        'task_id': task_id,
+        'task_name': task.restaurant_name,
+        'eligible_count': len(eligible_agents_data),
+        'eligible_agents': [a['agent_id'] for a in eligible_agents_data]
+    }
+
+
 def check_marketplace_timeouts(dashboard_url: str) -> int:
     """
     Check for tasks that have timed out (not accepted within MARKETPLACE_TASK_TIMEOUT_SECONDS).
@@ -2664,13 +2755,22 @@ def handle_agent_location_update(data):
         if eligible_triggers:
             # Get the best trigger (closest task)
             best_trigger = min(eligible_triggers, key=lambda t: t.distance_km)
+            dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+            
             print(f"[DEBUG] Best trigger: {name} → {best_trigger.task.restaurant_name} ({best_trigger.distance_km:.2f}km)")
             
-            # Check cooldown
-            can_trigger = fleet_state.should_trigger_optimization(agent_id)
-            print(f"[DEBUG] Cooldown check for {name}: {'PASSED' if can_trigger else 'ON COOLDOWN'}")
-            
-            if can_trigger:
+            # MARKETPLACE MODE: Broadcast THIS TASK to its eligible agents
+            if MARKETPLACE_MODE_ENABLED:
+                print(f"[Marketplace] 📍 Proximity: {name} is {best_trigger.distance_km:.2f}km from {best_trigger.task.restaurant_name}")
+                
+                # Broadcast just this task to eligible agents (targeted, not full marketplace)
+                broadcast_task_proximity(
+                    task_id=best_trigger.task.id,
+                    triggered_by_agent=name,
+                    dashboard_url=dashboard_url
+                )
+            else:
+                # FLEET OPTIMIZATION MODE: Trigger optimization
                 print(f"[FleetState] 🎯 Proximity trigger: {name} is {best_trigger.distance_km:.2f}km from {best_trigger.task.restaurant_name}")
                 fleet_state.record_optimization(agent_id)
                 
@@ -2682,13 +2782,8 @@ def handle_agent_location_update(data):
                     task_name=best_trigger.task.restaurant_name,
                     distance_km=best_trigger.distance_km,
                     trigger_type=best_trigger.trigger_type,
-                    dashboard_url=data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+                    dashboard_url=dashboard_url
                 )
-            else:
-                # Throttled log for cooldown skips
-                _should_log = _should_log_location(agent_id)
-                if _should_log:
-                    print(f"[FleetState] ⏳ {name} near tasks but on cooldown")
         else:
             # No eligible triggers - throttled logging for regular updates
             if _should_log_location(agent_id):
