@@ -277,6 +277,8 @@ def build_marketplace_state(dashboard_url: str) -> dict:
         'timestamp': ...
     }
     """
+    global _task_offer_times
+    
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         return {'tasks': [], 'agents': [], 'timestamp': time.time(), 'error': 'Fleet state not available'}
     
@@ -285,6 +287,21 @@ def build_marketplace_state(dashboard_url: str) -> dict:
     
     # Get all available agents (online + has capacity)
     available_agents = fleet_state.get_available_agents()
+    
+    # Track first_offered_at for new tasks, clean up completed/assigned tasks
+    now = time.time()
+    unassigned_ids = {t.id for t in unassigned_tasks}
+    
+    with _marketplace_lock:
+        # Remove tracking for tasks no longer unassigned
+        for task_id in list(_task_offer_times.keys()):
+            if task_id not in unassigned_ids:
+                del _task_offer_times[task_id]
+        
+        # Track new tasks
+        for task in unassigned_tasks:
+            if task.id not in _task_offer_times:
+                _task_offer_times[task.id] = now
     
     # Build task eligibility matrix
     tasks_data = []
@@ -312,6 +329,9 @@ def build_marketplace_state(dashboard_url: str) -> dict:
                     ineligibility_reasons[actual_reason] = 0
                 ineligibility_reasons[actual_reason] += 1
         
+        # Get first_offered_at timestamp (when this task first entered marketplace)
+        first_offered_at = _task_offer_times.get(task.id, now)
+        
         task_data = {
             'id': task.id,
             'restaurant_name': task.restaurant_name,
@@ -334,7 +354,9 @@ def build_marketplace_state(dashboard_url: str) -> dict:
             'tags': task.tags,
             'is_premium': 'premium' in (task.tags or []),
             'eligible_agents': eligible_agents_data,
-            'competition': len(eligible_agents_data)
+            'competition': len(eligible_agents_data),
+            'first_offered_at': first_offered_at,  # Unix timestamp when task first entered marketplace
+            'timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS  # For dashboard to calculate remaining time
         }
         
         # Add ineligibility info for tasks with no eligible agents
@@ -523,6 +545,13 @@ def broadcast_task_proximity(task_id: str, triggered_by_agent: str, dashboard_ur
     if not eligible_agents_data:
         return {'success': False, 'error': 'No eligible agents', 'reasons': ineligibility_reasons}
     
+    # Get/set first_offered_at for this task
+    now = time.time()
+    with _marketplace_lock:
+        if task_id not in _task_offer_times:
+            _task_offer_times[task_id] = now
+        first_offered_at = _task_offer_times[task_id]
+    
     # Build single-task payload
     task_data = {
         'id': task.id,
@@ -546,7 +575,9 @@ def broadcast_task_proximity(task_id: str, triggered_by_agent: str, dashboard_ur
         'tags': task.tags,
         'is_premium': 'premium' in (task.tags or []),
         'eligible_agents': eligible_agents_data,
-        'competition': len(eligible_agents_data)
+        'competition': len(eligible_agents_data),
+        'first_offered_at': first_offered_at,
+        'timeout_seconds': MARKETPLACE_TASK_TIMEOUT_SECONDS
     }
     
     # Emit targeted broadcast
@@ -2097,21 +2128,35 @@ def handle_marketplace_timeout(data):
     that weren't accepted within the allotted time.
     
     Payload: { 
-        task_ids: [str],  # Optional - specific tasks that timed out
+        task_ids: [str],  # Specific tasks that timed out (required)
         dashboard_url: str 
     }
+    
+    IMPORTANT: Only the timed-out tasks get their first_offered_at reset.
+    Other tasks keep their existing timers.
     """
+    global _task_offer_times
+    
     performance_stats["websocket_events"] += 1
     task_ids = data.get('task_ids', [])
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    if task_ids:
-        log_event(f"[Marketplace] ⏰ Dashboard timeout for {len(task_ids)} task(s) - re-broadcasting")
-    else:
-        log_event(f"[Marketplace] ⏰ Dashboard timeout - re-broadcasting all")
+    if not task_ids:
+        log_event(f"[Marketplace] ⏰ Dashboard timeout with no task_ids - ignoring")
+        return
     
-    # Re-broadcast the marketplace
-    broadcast_marketplace(dashboard_url, trigger_reason=f"dashboard_timeout:{len(task_ids) if task_ids else 'all'}")
+    # Reset ONLY the timed-out tasks' timestamps
+    now = time.time()
+    with _marketplace_lock:
+        for task_id in task_ids:
+            if task_id in _task_offer_times:
+                _task_offer_times[task_id] = now
+                log_event(f"[Marketplace] ⏰ Reset timer for task {task_id}")
+    
+    log_event(f"[Marketplace] ⏰ {len(task_ids)} task(s) timed out - re-broadcasting (other timers preserved)")
+    
+    # Re-broadcast the marketplace (timed-out tasks have new first_offered_at, others unchanged)
+    broadcast_marketplace(dashboard_url, trigger_reason=f"dashboard_timeout:{len(task_ids)}_tasks")
 
 
 @socketio.on('marketplace:settings')
