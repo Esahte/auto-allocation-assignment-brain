@@ -482,10 +482,37 @@ def broadcast_task_proximity(task_id: str, triggered_by_agent: str, dashboard_ur
     
     for agent, dist, reason in eligible:
         if reason is None and agent.has_capacity:
+            # Build route info for this agent's current tasks
+            agent_tasks = fleet_state.get_agent_tasks(agent.id)
+            route_stops = []
+            for agent_task in agent_tasks:
+                # Add pickup if not completed
+                if agent_task.status == TaskStatus.ASSIGNED:
+                    route_stops.append({
+                        'type': 'pickup',
+                        'task_id': agent_task.id,
+                        'location': [agent_task.restaurant_location.lat, agent_task.restaurant_location.lng],
+                        'name': agent_task.restaurant_name,
+                        'time_window': agent_task.pickup_before.isoformat() if agent_task.pickup_before else None
+                    })
+                # Add delivery
+                route_stops.append({
+                    'type': 'delivery',
+                    'task_id': agent_task.id,
+                    'location': [agent_task.delivery_location.lat, agent_task.delivery_location.lng],
+                    'name': agent_task.customer_name,
+                    'time_window': agent_task.delivery_before.isoformat() if agent_task.delivery_before else None
+                })
+            
             eligible_agents_data.append({
                 'agent_id': agent.id,
                 'agent_name': agent.name,
-                'distance_km': round(dist, 2)
+                'distance_km': round(dist, 2),
+                'location': [agent.lat, agent.lng] if agent.lat and agent.lng else None,
+                'current_task_count': len(agent_tasks),
+                'available_capacity': agent.available_capacity,
+                'priority': agent.priority,
+                'route': route_stops
             })
         else:
             actual_reason = reason if reason else 'at_max_capacity'
