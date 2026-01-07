@@ -2589,11 +2589,11 @@ def handle_task_updated(data):
             app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} updated - triggering proximity broadcast")
             trigger_proximity_broadcast(task_id, force=True)
         else:
-        # Use debounced optimization (same safety nets as task:created, task:declined)
-        trigger_debounced_optimization(
-            trigger_type=f'task:updated:{optimization_reason}',
-            dashboard_url=dashboard_url
-        )
+            # Use debounced optimization (same safety nets as task:created, task:declined)
+            trigger_debounced_optimization(
+                trigger_type=f'task:updated:{optimization_reason}',
+                dashboard_url=dashboard_url
+            )
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
