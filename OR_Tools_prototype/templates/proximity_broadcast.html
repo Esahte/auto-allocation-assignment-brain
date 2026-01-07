@@ -207,6 +207,8 @@
         .task-badge.waiting { background: rgba(139, 148, 158, 0.2); color: var(--text-secondary); }
         .task-badge.urgent { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
         .task-badge.premium { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+        .task-badge.no-agents { background: rgba(57, 197, 207, 0.2); color: var(--accent-cyan); }
+        .task-badge.declined { background: rgba(248, 81, 73, 0.3); color: var(--accent-red); }
         
         /* Broadcast Item */
         .broadcast-item {
@@ -503,48 +505,13 @@
     <script>
         const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
         
-        // Debug socket connection
-        socket.on('connect', () => {
-            console.log('[ProximityDebug] ✅ Socket connected:', socket.id);
-            const badge = document.getElementById('connectionBadge');
-            if (badge) {
-                badge.textContent = `🔌 Connected`;
-                badge.style.background = 'var(--green)';
-            }
-            addLog('system', `🔌 Socket connected (${socket.id?.substring(0, 8)}...)`);
-        });
-        
-        socket.on('disconnect', (reason) => {
-            console.log('[ProximityDebug] ❌ Socket disconnected:', reason);
-            const badge = document.getElementById('connectionBadge');
-            if (badge) {
-                badge.textContent = `❌ Disconnected`;
-                badge.style.background = 'var(--red)';
-            }
-            addLog('error', `🔌 Socket disconnected: ${reason}`);
-        });
-        
-        socket.on('connect_error', (error) => {
-            console.error('[ProximityDebug] Socket connect error:', error);
-            const badge = document.getElementById('connectionBadge');
-            if (badge) {
-                badge.textContent = `⚠️ Error`;
-                badge.style.background = 'var(--red)';
-            }
-            addLog('error', `🔌 Socket error: ${error.message}`);
-        });
-        
-        // Log ALL incoming events for debugging
-        socket.onAny((eventName, ...args) => {
-            console.log('[ProximityDebug] 📩 Event received:', eventName, args);
-        });
-        
         // State
         let agents = [];
         let tasks = [];
         let proximityTriggers = [];
         let activeBroadcasts = new Map();
         let declinedTasks = new Map();  // Tasks blocked due to decline (Tookan won't push)
+        let waitingForAgents = new Map();  // Tasks that tried to broadcast but found no agents
         let logEntries = [];
         const MAX_LOG = 30;
         
@@ -609,39 +576,47 @@
         
         // Listen for proximity broadcasts
         socket.on('task:proximity', (data) => {
-            console.log('[ProximityDebug] 🎯 task:proximity received:', data);
-            
             const task = data.task || {};
             const feasibleAgents = data.feasible_agents || [];
-            
-            if (!task.id) {
-                console.error('[ProximityDebug] ⚠️ task:proximity missing task.id:', data);
-                return;
-            }
             
             // Clear auto-triggered flag so task can timeout again if needed
             autoTriggeredTasks.delete(task.id);
             
-            activeBroadcasts.set(task.id, {
-                task_id: task.id,
-                task_name: task.restaurant_name,
-                customer: task.customer_name,
-                pickup_before: task.times?.pickup_before,
-                delivery_before: task.times?.delivery_before,
-                payment: task.payment?.total || 0,
-                is_premium: task.is_premium,
-                agents: feasibleAgents,
-                competition: data.competition || feasibleAgents.length,
-                first_offered_at: data.first_offered_at,
-                timeout_seconds: data.timeout_seconds || taskTimeout,
-                search_radius_km: data.search_radius_km || defaultRadius,
-                triggered_by: data.triggered_by,
-                timestamp: data.timestamp
-            });
+            // Only add to activeBroadcasts if there are agents to broadcast to
+            if (feasibleAgents.length > 0) {
+                activeBroadcasts.set(task.id, {
+                    task_id: task.id,
+                    task_name: task.restaurant_name,
+                    customer: task.customer_name,
+                    pickup_before: task.times?.pickup_before,
+                    delivery_before: task.times?.delivery_before,
+                    payment: task.payment?.total || 0,
+                    is_premium: task.is_premium,
+                    agents: feasibleAgents,
+                    competition: data.competition || feasibleAgents.length,
+                    first_offered_at: data.first_offered_at,
+                    timeout_seconds: data.timeout_seconds || taskTimeout,
+                    search_radius_km: data.search_radius_km || defaultRadius,
+                    triggered_by: data.triggered_by,
+                    timestamp: data.timestamp
+                });
+                // Remove from waiting since agents found
+                waitingForAgents.delete(task.id);
+                addLog('broadcast', `📡 ${task.restaurant_name} → ${feasibleAgents.length} agents (radius: ${data.search_radius_km}km)`);
+            } else {
+                // No agents found - remove from active broadcasts and track as waiting
+                activeBroadcasts.delete(task.id);
+                waitingForAgents.set(task.id, {
+                    task_id: task.id,
+                    task_name: task.restaurant_name,
+                    search_radius_km: data.search_radius_km || defaultRadius,
+                    last_checked: Date.now(),
+                    triggered_by: data.triggered_by
+                });
+                addLog('warning', `⏳ ${task.restaurant_name} - no agents in ${data.search_radius_km}km radius, waiting...`);
+            }
             
-            console.log('[ProximityDebug] ✅ Added to activeBroadcasts:', task.restaurant_name, 'Total:', activeBroadcasts.size);
-            addLog('broadcast', `📡 ${task.restaurant_name} → ${feasibleAgents.length} agents (radius: ${data.search_radius_km}km)`);
-            updateAllUI();
+            fetchData(); // Refresh to get updated proximity triggers
         });
         
         // Task assigned - remove from active broadcasts
@@ -652,6 +627,7 @@
                 autoTriggeredTasks.delete(data.id);
                 addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name} (assigned)`);
             }
+            waitingForAgents.delete(data.id);  // Clear from waiting
             declinedTasks.delete(data.id);  // Clear from declined if manually assigned
             fetchData();
         });
@@ -661,6 +637,7 @@
             // Task is fully done - remove from all tracking
             activeBroadcasts.delete(data.id);
             autoTriggeredTasks.delete(data.id);
+            waitingForAgents.delete(data.id);
             declinedTasks.delete(data.id);
             addLog('success', `🏁 Task completed by ${data.agent_name}`);
             fetchData();  // Refresh to get updated task list
@@ -670,6 +647,7 @@
         socket.on('task:cancelled', (data) => {
             activeBroadcasts.delete(data.id);
             autoTriggeredTasks.delete(data.id);
+            waitingForAgents.delete(data.id);
             declinedTasks.delete(data.id);
             addLog('warning', `❌ Task cancelled: ${data.reason || 'unknown reason'}`);
             fetchData();  // Refresh to get updated task list
@@ -684,6 +662,7 @@
                 autoTriggeredTasks.delete(taskId);
                 addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name} (accepted)`);
             }
+            waitingForAgents.delete(taskId);  // Clear from waiting
             declinedTasks.delete(taskId);  // Also clear from declined if somehow there
             fetchData();
         });
@@ -758,16 +737,30 @@
             activeBroadcasts.forEach(b => totalFeasible += b.agents.length);
             document.getElementById('feasibleAgents').textContent = totalFeasible;
             
-            // Blocked = unassigned tasks NOT in active broadcasts + declined tasks
+            // Blocked/Waiting breakdown:
+            // - Tasks in waitingForAgents = no agents nearby
+            // - Tasks in declinedTasks = blocked due to decline
+            // - Tasks not in any category = awaiting first proximity trigger
             const broadcastingTaskIds = new Set(activeBroadcasts.keys());
-            const blockedCount = tasks.filter(t => !broadcastingTaskIds.has(t.id)).length;
+            const waitingCount = waitingForAgents.size;
             const declinedCount = declinedTasks.size;
-            document.getElementById('blockedTasks').textContent = blockedCount + declinedCount;
+            const awaitingTrigger = tasks.filter(t => 
+                !broadcastingTaskIds.has(t.id) && 
+                !waitingForAgents.has(t.id) && 
+                !declinedTasks.has(t.id)
+            ).length;
             
-            // Update blocked label to show declined count
+            const totalBlocked = waitingCount + declinedCount + awaitingTrigger;
+            document.getElementById('blockedTasks').textContent = totalBlocked;
+            
+            // Update blocked label to show breakdown
             const blockedLabel = document.querySelector('#blockedTasks').parentElement;
-            if (blockedLabel && declinedCount > 0) {
-                blockedLabel.title = `${declinedCount} declined (manual only), ${blockedCount} waiting`;
+            if (blockedLabel) {
+                const parts = [];
+                if (waitingCount > 0) parts.push(`${waitingCount} no agents`);
+                if (declinedCount > 0) parts.push(`${declinedCount} declined`);
+                if (awaitingTrigger > 0) parts.push(`${awaitingTrigger} awaiting trigger`);
+                blockedLabel.title = parts.join(', ') || 'None blocked';
             }
             
             document.getElementById('timeout').textContent = taskTimeout;
@@ -827,6 +820,9 @@
             list.innerHTML = sorted.map(t => {
                 const isBroadcasting = activeBroadcasts.has(t.id);
                 const broadcast = activeBroadcasts.get(t.id);
+                const isWaitingForAgents = waitingForAgents.has(t.id);
+                const waitingInfo = waitingForAgents.get(t.id);
+                const isDeclined = declinedTasks.has(t.id);
                 const urgency = t.urgency_score || 0;
                 const isPremium = t.is_premium || (t.tips && t.tips > 0);
                 const pickupTime = t.pickup_before ? new Date(t.pickup_before).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '?';
@@ -834,6 +830,10 @@
                 let badge = '';
                 if (isBroadcasting) {
                     badge = `<span class="task-badge broadcasting">📡 ${broadcast.agents.length} AGENTS</span>`;
+                } else if (isDeclined) {
+                    badge = '<span class="task-badge declined">⛔ DECLINED</span>';
+                } else if (isWaitingForAgents) {
+                    badge = `<span class="task-badge no-agents">⏳ NO AGENTS (${waitingInfo.search_radius_km}km)</span>`;
                 } else if (urgency >= 70) {
                     badge = '<span class="task-badge urgent">URGENT</span>';
                 } else if (isPremium) {
