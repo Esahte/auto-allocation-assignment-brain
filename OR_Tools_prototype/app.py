@@ -2412,6 +2412,7 @@ def handle_task_updated(data):
     # Track what fields changed
     changes = []
     status_changed_to_unassigned = False
+    declined_by_cleared_by_admin = False  # Track if we cleared declined_by due to admin reset
     
     # Update task fields
     meta = data.get('_meta', {})
@@ -2453,6 +2454,7 @@ def handle_task_updated(data):
                 existing_task.declined_by = set()
                 changes.append('declined_by_cleared')
                 status_changed_to_unassigned = True
+                declined_by_cleared_by_admin = True  # CRITICAL: Don't let field update below re-add declines!
         
         # Check if task is being reassigned to a different agent
         elif new_assigned_agent and str(new_assigned_agent) != str(old_assigned_agent or ''):
@@ -2541,7 +2543,9 @@ def handle_task_updated(data):
             existing_task.max_distance_km = new_dist
             changes.append('max_distance_km')
     
-    if 'declined_by' in data:
+    # CRITICAL: Only process declined_by from data if we didn't just clear it due to admin reset
+    # Otherwise the dashboard's stale declined_by data would overwrite our clearing
+    if 'declined_by' in data and not declined_by_cleared_by_admin:
         new_declined = set(str(d) for d in (data['declined_by'] or []))
         if existing_task.declined_by != new_declined:
             existing_task.declined_by = new_declined
