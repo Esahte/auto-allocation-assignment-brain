@@ -503,6 +503,42 @@
     <script>
         const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
         
+        // Debug socket connection
+        socket.on('connect', () => {
+            console.log('[ProximityDebug] ✅ Socket connected:', socket.id);
+            const badge = document.getElementById('connectionBadge');
+            if (badge) {
+                badge.textContent = `🔌 Connected`;
+                badge.style.background = 'var(--green)';
+            }
+            addLog('system', `🔌 Socket connected (${socket.id?.substring(0, 8)}...)`);
+        });
+        
+        socket.on('disconnect', (reason) => {
+            console.log('[ProximityDebug] ❌ Socket disconnected:', reason);
+            const badge = document.getElementById('connectionBadge');
+            if (badge) {
+                badge.textContent = `❌ Disconnected`;
+                badge.style.background = 'var(--red)';
+            }
+            addLog('error', `🔌 Socket disconnected: ${reason}`);
+        });
+        
+        socket.on('connect_error', (error) => {
+            console.error('[ProximityDebug] Socket connect error:', error);
+            const badge = document.getElementById('connectionBadge');
+            if (badge) {
+                badge.textContent = `⚠️ Error`;
+                badge.style.background = 'var(--red)';
+            }
+            addLog('error', `🔌 Socket error: ${error.message}`);
+        });
+        
+        // Log ALL incoming events for debugging
+        socket.onAny((eventName, ...args) => {
+            console.log('[ProximityDebug] 📩 Event received:', eventName, args);
+        });
+        
         // State
         let agents = [];
         let tasks = [];
@@ -573,8 +609,15 @@
         
         // Listen for proximity broadcasts
         socket.on('task:proximity', (data) => {
+            console.log('[ProximityDebug] 🎯 task:proximity received:', data);
+            
             const task = data.task || {};
             const feasibleAgents = data.feasible_agents || [];
+            
+            if (!task.id) {
+                console.error('[ProximityDebug] ⚠️ task:proximity missing task.id:', data);
+                return;
+            }
             
             // Clear auto-triggered flag so task can timeout again if needed
             autoTriggeredTasks.delete(task.id);
@@ -596,8 +639,9 @@
                 timestamp: data.timestamp
             });
             
+            console.log('[ProximityDebug] ✅ Added to activeBroadcasts:', task.restaurant_name, 'Total:', activeBroadcasts.size);
             addLog('broadcast', `📡 ${task.restaurant_name} → ${feasibleAgents.length} agents (radius: ${data.search_radius_km}km)`);
-            fetchData(); // Refresh to get updated proximity triggers
+            updateAllUI();
         });
         
         // Task assigned - remove from active broadcasts
