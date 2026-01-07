@@ -2101,16 +2101,6 @@ def handle_task_declined(data):
         'decline_recorded': True,
         'triggered_optimization': triggered_optimization
     })
-    
-    # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
-    if task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
-        trigger_fleet_optimization('task:declined', {
-            'id': task_id,
-            'declined_by': declined_by,
-            'dashboard_url': dashboard_url
-        })
-    elif task_after_proximity:
-        print(f"[FleetState] ℹ️ Task {str(task_id)[:20]}... already assigned by proximity, skipping event-based optimization.")
 
 
 @socketio.on('proximity:timeout')
