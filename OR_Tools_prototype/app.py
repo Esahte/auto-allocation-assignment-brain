@@ -2609,28 +2609,34 @@ def handle_task_assigned(data):
     
     log_payload('task:assigned', data)
     
-    # Update fleet state (returns None if already assigned to this agent)
+    # Update fleet state (returns None if already assigned to this agent or task doesn't exist)
     task = None
+    task_name = 'Unknown'
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
         task = fleet_state.assign_task(task_id, str(agent_id), agent_name)
+        if task:
+            task_name = task.restaurant_name
     
-    # Only log if this was a new assignment (not a duplicate)
+    log_event(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
+    
     if task:
-        log_event(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
         print(f"[FleetState] Task {task.restaurant_name} assigned to {agent_name}")
-        
-        # PROXIMITY BROADCAST: Clean up tracking for this task
-        if PROXIMITY_BROADCAST_ENABLED:
-            clean_task_tracking(task_id)
-        
-        # Broadcast assignment to ALL clients (debug pages, etc.)
-        socketio.emit('task:assigned', {
-            'id': task_id,
-            'agent_id': agent_id,
-            'agent_name': agent_name,
-            'task_name': task.restaurant_name,
-            'assigned_at': datetime.now().isoformat()
-        })
+    else:
+        print(f"[FleetState] Task {task_id[:20]}... assigned to {agent_name} (not in fleet state or duplicate)")
+    
+    # PROXIMITY BROADCAST: Always clean up tracking for this task
+    if PROXIMITY_BROADCAST_ENABLED:
+        clean_task_tracking(task_id)
+    
+    # ALWAYS broadcast assignment to ALL clients (debug pages need to clear Active Broadcasts)
+    # Even if task wasn't in our state, the debug page might have it
+    socketio.emit('task:assigned', {
+        'id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'task_name': task_name,
+        'assigned_at': datetime.now().isoformat()
+    })
     
     emit('task:assigned_ack', {
         'id': task_id,

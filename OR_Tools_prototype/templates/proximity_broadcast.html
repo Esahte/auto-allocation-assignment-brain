@@ -638,15 +638,22 @@
         
         // Task assigned - remove from active broadcasts
         socket.on('task:assigned', (data) => {
-            if (activeBroadcasts.has(data.id)) {
-                const broadcast = activeBroadcasts.get(data.id);
-                activeBroadcasts.delete(data.id);
-                autoTriggeredTasks.delete(data.id);
+            const taskId = data.id || data.task_id;
+            console.log('[DEBUG] task:assigned received:', taskId, 'activeBroadcasts has:', activeBroadcasts.has(taskId));
+            
+            if (activeBroadcasts.has(taskId)) {
+                const broadcast = activeBroadcasts.get(taskId);
+                activeBroadcasts.delete(taskId);
+                autoTriggeredTasks.delete(taskId);
                 addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name} (assigned)`);
+            } else {
+                // Task wasn't in activeBroadcasts but still log it
+                addLog('success', `✅ ${data.task_name || taskId?.substring(0, 15) + '...'} → ${data.agent_name} (assigned)`);
             }
-            waitingForAgents.delete(data.id);  // Clear from waiting
-            declinedTasks.delete(data.id);  // Clear from declined if manually assigned
-            fetchData();
+            waitingForAgents.delete(taskId);  // Clear from waiting
+            declinedTasks.delete(taskId);  // Clear from declined if manually assigned
+            updateAllUI();  // Immediately update UI
+            fetchData();    // Then refresh data
         });
         
         // Pickup completed - agent picked up food, now delivering
