@@ -1852,10 +1852,9 @@ def handle_task_created(data):
         })
         
         # =========================================================================
-        # PROXIMITY BROADCAST MODE: Skip all event-based optimization
+        # PROXIMITY BROADCAST MODE: Immediately try to find nearby agents
         # =========================================================================
         if PROXIMITY_BROADCAST_ENABLED:
-            # In proximity mode, tasks are broadcast when agents get near them
             # Emit a notification that a new task is available
             socketio.emit('task:available', {
                 'id': task_id,
@@ -1866,16 +1865,26 @@ def handle_task_created(data):
                 'delivery_fee': task.delivery_fee,
                 'tips': task.tips,
                 'is_premium': task.is_premium_task,
-                'message': 'Task awaiting proximity trigger'
+                'message': 'New task - checking for nearby agents'
             })
-            print(f"[ProximityBroadcast] 📋 New task available: {task.restaurant_name} - awaiting proximity trigger (fleet optimization SKIPPED)")
+            
+            # IMMEDIATELY try to broadcast to nearby agents (don't wait for location updates)
+            print(f"[ProximityBroadcast] 📋 New task: {task.restaurant_name} - checking for nearby agents")
+            broadcast_result = trigger_proximity_broadcast(task_id, force=True)
+            
+            if broadcast_result.get('success') and not broadcast_result.get('debounced'):
+                agents_count = len(broadcast_result.get('agents', []))
+                print(f"[ProximityBroadcast] ✅ Immediate broadcast: {task.restaurant_name} → {agents_count} agents")
+            elif broadcast_result.get('error'):
+                print(f"[ProximityBroadcast] ⚠️ No agents nearby for {task.restaurant_name}: {broadcast_result.get('error')}")
             
             emit('task:created_ack', {
                 'id': task_id,
                 'received_at': datetime.now().isoformat(),
                 'added_to_fleet_state': True,
                 'proximity_mode': True,
-                'triggered_optimization': False
+                'immediate_broadcast': broadcast_result.get('success', False),
+                'agents_found': len(broadcast_result.get('agents', []))
             })
             return  # EXIT EARLY - proximity broadcast handles assignment
         
