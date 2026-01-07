@@ -1276,12 +1276,12 @@ class FleetState:
         skip_distance_check = (agent.priority == 1 and task.is_premium_task)
         
         if not skip_distance_check:
-        if agent.current_tasks:
-            # Use projected location for busy agents
-            distance = agent.projected_location.distance_to(task.restaurant_location)
-        else:
-            distance = agent.current_location.distance_to(task.restaurant_location)
-        
+            if agent.current_tasks:
+                # Use projected location for busy agents
+                distance = agent.projected_location.distance_to(task.restaurant_location)
+            else:
+                distance = agent.current_location.distance_to(task.restaurant_location)
+            
             # Use override if provided (for expanded radius), otherwise task-specific, otherwise global
             if override_max_distance_km is not None:
                 max_dist = override_max_distance_km
@@ -1289,9 +1289,9 @@ class FleetState:
                 max_dist = task.max_distance_km
             else:
                 max_dist = self.max_distance_km
-        
-        if max_dist is not None and distance > max_dist:
-            return f"too_far ({distance:.1f}km > {max_dist}km)"
+            
+            if max_dist is not None and distance > max_dist:
+                return f"too_far ({distance:.1f}km > {max_dist}km)"
         
         # 8. Direction Coherence - New task delivery should be in same direction as existing tasks
         # Prevents inefficient zig-zag routes
