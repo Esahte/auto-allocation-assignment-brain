@@ -2633,7 +2633,12 @@ def handle_task_updated(data):
         if PROXIMITY_BROADCAST_ENABLED:
             # Use proximity broadcast instead of fleet optimization
             app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} updated - triggering proximity broadcast")
-            trigger_proximity_broadcast(task_id, force=True)
+            trigger_proximity_broadcast(
+                task_id=task_id,
+                triggered_by_agent='task_updated',
+                dashboard_url=dashboard_url,
+                force=True
+            )
         else:
             # Use debounced optimization (same safety nets as task:created, task:declined)
             trigger_debounced_optimization(
