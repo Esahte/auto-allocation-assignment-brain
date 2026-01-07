@@ -377,6 +377,7 @@ class FleetState:
         self._preserved_tags: Dict[str, list] = {}  # Preserved tags data across syncs (esp. TEST tags)
         self._preserved_assignments: Dict[str, str] = {}  # Preserved optimistic assignments (task_id -> agent_id)
         self._dashboard_unassigned_tasks: set = set()  # Task IDs dashboard explicitly says are unassigned
+        self._task_expanded_radii: Dict[str, float] = {}  # Task-specific expanded radii
         
         # Optimization tracking
         self._last_optimization_time: Dict[str, float] = {}  # agent_id -> timestamp
@@ -476,7 +477,7 @@ class FleetState:
                     agent.current_location = Location(lat=location[0], lng=location[1])
                 # Priority: agent:online is SOURCE OF TRUTH - always update (even to None)
                 # This allows dashboard to explicitly remove priority by sending undefined/null
-                agent.priority = priority
+                    agent.priority = priority
                 if max_capacity is not None:
                     agent.max_capacity = max_capacity
                 if tags is not None:
@@ -1086,10 +1087,25 @@ class FleetState:
     # PROXIMITY AND ELIGIBILITY CHECKING
     # =========================================================================
     
+    def set_task_expanded_radius(self, task_id: str, radius_km: float):
+        """Set expanded radius for a specific task."""
+        self._task_expanded_radii[task_id] = radius_km
+        logger.info(f"[FleetState] Set expanded radius for task {task_id[:20]}...: {radius_km}km")
+    
+    def get_task_radius(self, task_id: str) -> float:
+        """Get the effective radius for a task (expanded or default)."""
+        return self._task_expanded_radii.get(task_id, self.assignment_radius_km)
+    
+    def clear_task_expanded_radius(self, task_id: str):
+        """Clear expanded radius when task is assigned/completed."""
+        self._task_expanded_radii.pop(task_id, None)
+    
     def _check_proximity_triggers(self, agent: AgentState) -> List[ProximityTrigger]:
         """
         Check if agent is within assignment radius of any unassigned task.
         Returns list of proximity triggers.
+        
+        NOTE: Uses task-specific expanded radii if set, otherwise default assignment_radius_km.
         """
         triggers = []
         
@@ -1114,10 +1130,13 @@ class FleetState:
                 logger.warning(f"[FleetState] Skipping task {task.id[:20]}... - invalid restaurant_location")
                 continue
             
+            # Get task-specific radius (expanded or default)
+            task_radius = self.get_task_radius(task.id)
+            
             # Check current location
             current_distance = agent.current_location.distance_to(task.restaurant_location)
             
-            if current_distance <= self.assignment_radius_km:
+            if current_distance <= task_radius:
                 eligibility = self._check_eligibility(agent, task)
                 trigger = ProximityTrigger(
                     agent=agent,
@@ -1138,7 +1157,10 @@ class FleetState:
                     continue
                 projected_distance = agent.projected_location.distance_to(task.restaurant_location)
                 
-                if projected_distance <= self.chain_lookahead_radius_km:
+                # Use larger of task_radius or chain_lookahead_radius_km for projected checks
+                projected_radius = max(task_radius, self.chain_lookahead_radius_km)
+                
+                if projected_distance <= projected_radius:
                     eligibility = self._check_eligibility(agent, task)
                     trigger = ProximityTrigger(
                         agent=agent,
@@ -1254,12 +1276,12 @@ class FleetState:
         skip_distance_check = (agent.priority == 1 and task.is_premium_task)
         
         if not skip_distance_check:
-            if agent.current_tasks:
-                # Use projected location for busy agents
-                distance = agent.projected_location.distance_to(task.restaurant_location)
-            else:
-                distance = agent.current_location.distance_to(task.restaurant_location)
-            
+        if agent.current_tasks:
+            # Use projected location for busy agents
+            distance = agent.projected_location.distance_to(task.restaurant_location)
+        else:
+            distance = agent.current_location.distance_to(task.restaurant_location)
+        
             # Use override if provided (for expanded radius), otherwise task-specific, otherwise global
             if override_max_distance_km is not None:
                 max_dist = override_max_distance_km
@@ -1267,9 +1289,9 @@ class FleetState:
                 max_dist = task.max_distance_km
             else:
                 max_dist = self.max_distance_km
-            
-            if max_dist is not None and distance > max_dist:
-                return f"too_far ({distance:.1f}km > {max_dist}km)"
+        
+        if max_dist is not None and distance > max_dist:
+            return f"too_far ({distance:.1f}km > {max_dist}km)"
         
         # 8. Direction Coherence - New task delivery should be in same direction as existing tasks
         # Prevents inefficient zig-zag routes

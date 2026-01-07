@@ -577,13 +577,17 @@ def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -
     # Cap at max radius
     new_radius_km = min(new_radius_km, PROXIMITY_MAX_RADIUS_KM)
     
-    # Store expanded radius
+    # Store expanded radius in app.py tracking
     with _proximity_lock:
         old_radius = _task_expanded_radius.get(task_id, PROXIMITY_DEFAULT_RADIUS_KM)
         _task_expanded_radius[task_id] = new_radius_km
         
         # Reset timer for this task
         _task_offer_times[task_id] = time.time()
+    
+    # CRITICAL: Also update FleetState so proximity triggers use expanded radius
+    if FLEET_STATE_AVAILABLE and fleet_state:
+        fleet_state.set_task_expanded_radius(task_id, new_radius_km)
     
     log_event(f"[ProximityBroadcast] 📏 Expanded radius for task {task_id}: {old_radius}km → {new_radius_km}km")
     
@@ -606,6 +610,10 @@ def clean_task_tracking(task_id: str):
         _task_expanded_radius.pop(task_id, None)
         _last_proximity_broadcast.pop(task_id, None)
         _task_current_agents.pop(task_id, None)
+    
+    # Also clear from FleetState
+    if FLEET_STATE_AVAILABLE and fleet_state:
+        fleet_state.clear_task_expanded_radius(task_id)
 
 
 def handle_proximity_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
@@ -2570,11 +2578,11 @@ def handle_task_updated(data):
             app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} updated - triggering proximity broadcast")
             trigger_proximity_broadcast(task_id, force=True)
         else:
-            # Use debounced optimization (same safety nets as task:created, task:declined)
-            trigger_debounced_optimization(
-                trigger_type=f'task:updated:{optimization_reason}',
-                dashboard_url=dashboard_url
-            )
+        # Use debounced optimization (same safety nets as task:created, task:declined)
+        trigger_debounced_optimization(
+            trigger_type=f'task:updated:{optimization_reason}',
+            dashboard_url=dashboard_url
+        )
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
