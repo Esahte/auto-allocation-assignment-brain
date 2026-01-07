@@ -2452,6 +2452,13 @@ def handle_task_updated(data):
                 existing_task.status = TaskStatus.UNASSIGNED
                 changes.append(f'status:{new_status}')
                 status_changed_to_unassigned = True
+                
+                # IMPORTANT: If admin explicitly sets status to "Unassigned", clear declined_by
+                # This unblocks the task for proximity broadcast - admin is resetting it
+                if existing_task.declined_by:
+                    print(f"[FleetState] Clearing declined_by for {existing_task.restaurant_name} (admin reset to Unassigned)")
+                    existing_task.declined_by = set()
+                    changes.append('declined_by_cleared')
         
         # Check if task is being reassigned to a different agent
         elif new_assigned_agent and str(new_assigned_agent) != str(old_assigned_agent or ''):
@@ -2615,13 +2622,17 @@ def handle_task_updated(data):
         'timestamp': datetime.now().isoformat()
     })
     
-    # If declined_by was cleared, emit unblocked event for debug dashboards
-    if 'declined_by' in changes and len(existing_task.declined_by) == 0:
+    # If declined_by was cleared (either directly or via status reset), emit unblocked event
+    was_unblocked = (
+        ('declined_by' in changes and len(existing_task.declined_by) == 0) or
+        'declined_by_cleared' in changes
+    )
+    if was_unblocked:
         app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} unblocked - declined_by cleared")
         socketio.emit('task:unblocked', {
             'task_id': task_id,
             'restaurant_name': restaurant_name,
-            'reason': 'declined_by_cleared',
+            'reason': 'admin_reset_to_unassigned' if 'declined_by_cleared' in changes else 'declined_by_cleared',
             'timestamp': datetime.now().isoformat()
         })
     
