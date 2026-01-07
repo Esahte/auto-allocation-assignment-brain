@@ -1485,6 +1485,14 @@ def handle_fleet_sync(data):
             'fleet_stats': stats
         })
         
+        # Broadcast to ALL clients (debug dashboards) that fleet state was updated
+        socketio.emit('fleet:state_updated', {
+            'reason': 'sync',
+            'agents': stats['online_agents'],
+            'unassigned_tasks': stats['unassigned_tasks'],
+            'timestamp': datetime.now().isoformat()
+        })
+        
         log_event(f"[FleetState] ✅ SYNC COMPLETE: {stats['online_agents']} agents, {stats['unassigned_tasks']} unassigned tasks")
         print(f"[FleetState] Config: max_dist={fleet_state.max_distance_km}km, max_lateness={fleet_state.max_lateness_minutes}min, wallet=${fleet_state.wallet_threshold}")
         

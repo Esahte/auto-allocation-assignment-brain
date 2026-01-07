@@ -591,6 +591,12 @@
             fetchData();  // Refresh to get updated task list
         });
         
+        // Fleet state updated (sync or other changes) - refresh data
+        socket.on('fleet:state_updated', (data) => {
+            addLog('system', `🔄 Fleet sync: ${data.agents} agents, ${data.unassigned_tasks} tasks`);
+            fetchData();  // Refresh to get updated fleet state
+        });
+        
         // Listen for proximity broadcasts
         socket.on('task:proximity', (data) => {
             const task = data.task || {};
