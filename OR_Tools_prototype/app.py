@@ -1874,7 +1874,12 @@ def handle_task_created(data):
             
             # IMMEDIATELY try to broadcast to nearby agents (don't wait for location updates)
             print(f"[ProximityBroadcast] 📋 New task: {task.restaurant_name} - checking for nearby agents")
-            broadcast_result = trigger_proximity_broadcast(task_id, force=True)
+            broadcast_result = trigger_proximity_broadcast(
+                task_id=task_id,
+                triggered_by_agent='task_created',
+                dashboard_url=dashboard_url,
+                force=True
+            )
             
             if broadcast_result.get('success') and not broadcast_result.get('debounced'):
                 agents_count = len(broadcast_result.get('agents', []))
