@@ -561,8 +561,24 @@
             addLog('error', 'Disconnected from server');
         });
         
-        // Listen for fleet updates
-        socket.on('fleet:routes_updated', () => {
+        // Listen for fleet updates (includes task assignments from fleet optimizer)
+        socket.on('fleet:routes_updated', (data) => {
+            // Check if any tasks were assigned and remove from activeBroadcasts
+            if (data && data.agent_routes) {
+                data.agent_routes.forEach(route => {
+                    const assignedTasks = route.assigned_new_tasks || [];
+                    assignedTasks.forEach(taskId => {
+                        if (activeBroadcasts.has(taskId)) {
+                            const broadcast = activeBroadcasts.get(taskId);
+                            activeBroadcasts.delete(taskId);
+                            autoTriggeredTasks.delete(taskId);
+                            addLog('success', `✅ ${broadcast.task_name} → ${route.driver_name} (fleet optimizer)`);
+                        }
+                        waitingForAgents.delete(taskId);
+                        declinedTasks.delete(taskId);
+                    });
+                });
+            }
             fetchData();
         });
         
