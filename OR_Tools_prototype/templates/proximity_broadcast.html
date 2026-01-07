@@ -22,6 +22,7 @@
             --accent-orange: #d29922;
             --accent-red: #f85149;
             --accent-purple: #a371f7;
+            --accent-cyan: #39c5cf;
         }
         
         body {
@@ -63,7 +64,7 @@
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
             gap: 12px;
             margin-bottom: 24px;
         }
@@ -72,18 +73,18 @@
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 16px;
+            padding: 14px;
             text-align: center;
         }
         
         .stat-card .value {
-            font-size: 1.8rem;
+            font-size: 1.6rem;
             font-weight: 700;
             font-family: 'IBM Plex Mono', monospace;
         }
         
         .stat-card .label {
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             color: var(--text-secondary);
             margin-top: 4px;
         }
@@ -92,14 +93,17 @@
         .stat-card.green .value { color: var(--accent-green); }
         .stat-card.orange .value { color: var(--accent-orange); }
         .stat-card.purple .value { color: var(--accent-purple); }
+        .stat-card.red .value { color: var(--accent-red); }
+        .stat-card.cyan .value { color: var(--accent-cyan); }
         
         .main-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 20px;
+            gap: 16px;
+            margin-bottom: 16px;
         }
         
-        @media (max-width: 1000px) {
+        @media (max-width: 1200px) {
             .main-grid { grid-template-columns: 1fr; }
         }
         
@@ -111,7 +115,7 @@
         }
         
         .panel-header {
-            padding: 12px 16px;
+            padding: 10px 14px;
             border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
@@ -120,18 +124,95 @@
         }
         
         .panel-header h2 {
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             font-weight: 600;
         }
         
         .panel-content {
-            max-height: 400px;
+            max-height: 320px;
             overflow-y: auto;
         }
         
-        .broadcast-item {
-            padding: 12px 16px;
+        .panel-content.tall {
+            max-height: 400px;
+        }
+        
+        /* Agent Item */
+        .agent-item {
+            padding: 10px 14px;
             border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .agent-item:last-child { border-bottom: none; }
+        
+        .agent-info .agent-name {
+            font-weight: 500;
+            font-size: 0.9rem;
+        }
+        
+        .agent-info .agent-details {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            font-family: 'IBM Plex Mono', monospace;
+            margin-top: 2px;
+        }
+        
+        .agent-status {
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        
+        .agent-status.idle { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+        .agent-status.busy { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
+        .agent-status.at-capacity { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+        
+        /* Task Item */
+        .task-item {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .task-item:last-child { border-bottom: none; }
+        
+        .task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .task-name {
+            font-weight: 500;
+            font-size: 0.9rem;
+        }
+        
+        .task-details {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+        
+        .task-badge {
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        
+        .task-badge.broadcasting { background: rgba(163, 113, 247, 0.2); color: var(--accent-purple); }
+        .task-badge.waiting { background: rgba(139, 148, 158, 0.2); color: var(--text-secondary); }
+        .task-badge.urgent { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
+        .task-badge.premium { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+        
+        /* Broadcast Item */
+        .broadcast-item {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(163, 113, 247, 0.05);
         }
         
         .broadcast-item:last-child { border-bottom: none; }
@@ -140,22 +221,17 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
         
         .broadcast-task {
             font-weight: 500;
-            color: var(--accent-orange);
-        }
-        
-        .broadcast-time {
-            font-size: 0.75rem;
-            color: var(--text-secondary);
-            font-family: 'IBM Plex Mono', monospace;
+            color: var(--accent-purple);
+            font-size: 0.9rem;
         }
         
         .broadcast-meta {
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             color: var(--text-secondary);
             margin-bottom: 8px;
         }
@@ -164,33 +240,64 @@
             display: flex;
             flex-wrap: wrap;
             gap: 6px;
+            margin-bottom: 8px;
         }
         
         .agent-chip {
             padding: 4px 8px;
             border-radius: 4px;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-family: 'IBM Plex Mono', monospace;
             background: rgba(88, 166, 255, 0.15);
             color: var(--accent-blue);
         }
         
-        .agent-chip.winner {
-            background: rgba(63, 185, 80, 0.2);
-            color: var(--accent-green);
+        .timer-display {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.85rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: rgba(210, 153, 34, 0.2);
+            color: var(--accent-orange);
         }
         
+        .radius-badge {
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(163, 113, 247, 0.2);
+            color: var(--accent-purple);
+        }
+        
+        /* Blocked Task Item */
+        .blocked-item {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .blocked-item:last-child { border-bottom: none; }
+        
+        .blocked-reason {
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(248, 81, 73, 0.15);
+            color: var(--accent-red);
+            margin-top: 4px;
+            display: inline-block;
+        }
+        
+        /* Log */
         .log-entry {
-            padding: 8px 16px;
+            padding: 6px 14px;
             border-bottom: 1px solid var(--border);
             font-family: 'IBM Plex Mono', monospace;
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             display: flex;
-            gap: 12px;
+            gap: 10px;
         }
         
         .log-entry:last-child { border-bottom: none; }
-        
         .log-time { color: var(--text-secondary); flex-shrink: 0; }
         .log-message { word-break: break-word; }
         
@@ -199,16 +306,16 @@
         .log-entry.warning .log-message { color: var(--accent-orange); }
         .log-entry.error .log-message { color: var(--accent-red); }
         
+        /* Config Panel */
         .config-panel {
-            grid-column: 1 / -1;
-            margin-top: 20px;
+            margin-top: 16px;
         }
         
         .config-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             gap: 12px;
-            padding: 16px;
+            padding: 14px;
         }
         
         .config-item {
@@ -218,7 +325,7 @@
         }
         
         .config-item label {
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             color: var(--text-secondary);
         }
         
@@ -226,10 +333,10 @@
             background: var(--bg-primary);
             border: 1px solid var(--border);
             border-radius: 4px;
-            padding: 8px 12px;
+            padding: 8px 10px;
             color: var(--text-primary);
             font-family: 'IBM Plex Mono', monospace;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
         }
         
         .config-item input:focus, .config-item select:focus {
@@ -238,57 +345,41 @@
         }
         
         .btn {
-            padding: 8px 16px;
+            padding: 6px 12px;
             border: none;
             border-radius: 4px;
             font-family: 'Inter', sans-serif;
             font-weight: 500;
+            font-size: 0.75rem;
             cursor: pointer;
             transition: opacity 0.2s;
         }
         
         .btn:hover { opacity: 0.8; }
-        
-        .btn-primary {
-            background: var(--accent-blue);
-            color: white;
-        }
-        
-        .btn-secondary {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border: 1px solid var(--border);
-        }
+        .btn-primary { background: var(--accent-blue); color: white; }
+        .btn-secondary { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); }
         
         .empty-state {
-            padding: 40px;
+            padding: 30px;
             text-align: center;
             color: var(--text-secondary);
-        }
-        
-        .timer-display {
-            font-family: 'IBM Plex Mono', monospace;
             font-size: 0.85rem;
-            padding: 2px 6px;
-            border-radius: 4px;
-            background: rgba(210, 153, 34, 0.2);
-            color: var(--accent-orange);
         }
         
-        .radius-display {
-            font-size: 0.75rem;
-            padding: 2px 6px;
-            border-radius: 4px;
-            background: rgba(163, 113, 247, 0.2);
-            color: var(--accent-purple);
+        .section-divider {
+            grid-column: 1 / -1;
+            padding: 10px 0;
+            border-top: 1px solid var(--border);
+            margin-top: 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-secondary);
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>
-            📡 Proximity Broadcast Debug
-        </h1>
+        <h1>📡 Proximity Broadcast Debug</h1>
         <div style="display: flex; gap: 12px; align-items: center;">
             <span class="status-badge" id="modeBadge">LOADING</span>
             <span class="status-badge" id="connectionBadge">Connecting...</span>
@@ -296,49 +387,93 @@
     </div>
     
     <div class="stats-grid">
-        <div class="stat-card blue">
-            <div class="value" id="activebroadcasts">0</div>
-            <div class="label">Active Broadcasts</div>
-        </div>
-        <div class="stat-card green">
-            <div class="value" id="totalAgents">0</div>
-            <div class="label">Feasible Agents</div>
+        <div class="stat-card cyan">
+            <div class="value" id="onlineAgents">0</div>
+            <div class="label">Online Agents</div>
         </div>
         <div class="stat-card orange">
+            <div class="value" id="unassignedTasks">0</div>
+            <div class="label">Unassigned Tasks</div>
+        </div>
+        <div class="stat-card purple">
+            <div class="value" id="activeBroadcasts">0</div>
+            <div class="label">Broadcasting</div>
+        </div>
+        <div class="stat-card green">
+            <div class="value" id="feasibleAgents">0</div>
+            <div class="label">Feasible Agents</div>
+        </div>
+        <div class="stat-card red">
+            <div class="value" id="blockedTasks">0</div>
+            <div class="label">Blocked Tasks</div>
+        </div>
+        <div class="stat-card blue">
             <div class="value" id="timeout">120</div>
             <div class="label">Timeout (s)</div>
         </div>
-        <div class="stat-card purple">
-            <div class="value" id="defaultRadius">3.0</div>
-            <div class="label">Default Radius (km)</div>
-        </div>
     </div>
     
+    <!-- Row 1: Agents and Unassigned Tasks -->
     <div class="main-grid">
         <div class="panel">
             <div class="panel-header">
-                <h2>📋 Active Proximity Broadcasts</h2>
-                <span id="broadcastCount" style="color: var(--text-secondary); font-size: 0.8rem;"></span>
+                <h2>👥 Online Agents</h2>
+                <span id="agentCount" style="color: var(--text-secondary); font-size: 0.75rem;"></span>
             </div>
-            <div class="panel-content" id="broadcastList">
-                <div class="empty-state">Waiting for proximity triggers...</div>
+            <div class="panel-content" id="agentList">
+                <div class="empty-state">Loading agents...</div>
             </div>
         </div>
         
         <div class="panel">
             <div class="panel-header">
-                <h2>📝 Event Log</h2>
-                <button class="btn btn-secondary" onclick="clearLog()" style="padding: 4px 8px; font-size: 0.75rem;">Clear</button>
+                <h2>📋 Unassigned Tasks</h2>
+                <span id="taskCount" style="color: var(--text-secondary); font-size: 0.75rem;"></span>
             </div>
-            <div class="panel-content" id="logContent">
-                <div class="log-entry">
-                    <span class="log-time">--:--:--</span>
-                    <span class="log-message">Connecting to server...</span>
-                </div>
+            <div class="panel-content" id="taskList">
+                <div class="empty-state">Loading tasks...</div>
             </div>
         </div>
     </div>
     
+    <!-- Row 2: Active Broadcasts and Blocked Tasks -->
+    <div class="main-grid" style="margin-top: 16px;">
+        <div class="panel">
+            <div class="panel-header">
+                <h2>📡 Active Broadcasts</h2>
+                <span id="broadcastCount" style="color: var(--text-secondary); font-size: 0.75rem;"></span>
+            </div>
+            <div class="panel-content tall" id="broadcastList">
+                <div class="empty-state">No active broadcasts</div>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <div class="panel-header">
+                <h2>🚫 Blocked Tasks</h2>
+                <span style="color: var(--text-secondary); font-size: 0.75rem;">No eligible agents</span>
+            </div>
+            <div class="panel-content" id="blockedList">
+                <div class="empty-state">No blocked tasks</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Row 3: Event Log -->
+    <div class="panel" style="margin-top: 16px;">
+        <div class="panel-header">
+            <h2>📝 Event Log</h2>
+            <button class="btn btn-secondary" onclick="clearLog()">Clear</button>
+        </div>
+        <div class="panel-content" id="logContent" style="max-height: 200px;">
+            <div class="log-entry">
+                <span class="log-time">--:--:--</span>
+                <span class="log-message">Connecting to server...</span>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Settings Panel -->
     <div class="panel config-panel">
         <div class="panel-header">
             <h2>⚙️ Proximity Broadcast Settings</h2>
@@ -368,19 +503,52 @@
     <script>
         const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
         
-        let activeBroadcasts = new Map();  // task_id -> broadcast data
+        // State
+        let agents = [];
+        let tasks = [];
+        let proximityTriggers = [];
+        let activeBroadcasts = new Map();
+        let declinedTasks = new Map();  // Tasks blocked due to decline (Tookan won't push)
         let logEntries = [];
-        const MAX_LOG = 50;
+        const MAX_LOG = 30;
         
         // Settings
         let broadcastEnabled = true;
         let taskTimeout = 120;
         let defaultRadius = 3.0;
         
+        // Fetch initial data
+        async function fetchData() {
+            try {
+                const [agentsRes, tasksRes, proximityRes, configRes] = await Promise.all([
+                    fetch('/fleet-state/agents'),
+                    fetch('/fleet-state/tasks'),
+                    fetch('/fleet-state/proximity'),
+                    fetch('/fleet-state/config')
+                ]);
+                
+                agents = (await agentsRes.json()).agents || [];
+                const tasksData = await tasksRes.json();
+                tasks = tasksData.tasks || tasksData.unassigned_tasks || [];
+                const proximityData = await proximityRes.json();
+                proximityTriggers = proximityData.triggers || [];
+                
+                const config = await configRes.json();
+                broadcastEnabled = config.proximity_broadcast_enabled ?? true;
+                taskTimeout = config.proximity_task_timeout_seconds || 120;
+                defaultRadius = config.proximity_default_radius_km || 3.0;
+                
+                updateAllUI();
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+        
         socket.on('connect', () => {
             document.getElementById('connectionBadge').textContent = 'Connected';
             document.getElementById('connectionBadge').className = 'status-badge connected';
             addLog('system', 'Connected to OR-Tools server');
+            fetchData();
         });
         
         socket.on('disconnect', () => {
@@ -389,10 +557,27 @@
             addLog('error', 'Disconnected from server');
         });
         
+        // Listen for fleet updates
+        socket.on('fleet:routes_updated', () => {
+            fetchData();
+        });
+        
+        // Track which tasks have been auto-triggered (declared here so it's accessible)
+        const autoTriggeredTasks = new Set();
+        
+        // New task created - refresh data
+        socket.on('task:created', (data) => {
+            addLog('system', `📋 New task: ${data.restaurant_name} ${data.is_premium ? '⭐' : ''}`);
+            fetchData();  // Refresh to get updated task list
+        });
+        
         // Listen for proximity broadcasts
         socket.on('task:proximity', (data) => {
             const task = data.task || {};
-            const agents = data.feasible_agents || [];
+            const feasibleAgents = data.feasible_agents || [];
+            
+            // Clear auto-triggered flag so task can timeout again if needed
+            autoTriggeredTasks.delete(task.id);
             
             activeBroadcasts.set(task.id, {
                 task_id: task.id,
@@ -402,8 +587,8 @@
                 delivery_before: task.times?.delivery_before,
                 payment: task.payment?.total || 0,
                 is_premium: task.is_premium,
-                agents: agents,
-                competition: data.competition || agents.length,
+                agents: feasibleAgents,
+                competition: data.competition || feasibleAgents.length,
                 first_offered_at: data.first_offered_at,
                 timeout_seconds: data.timeout_seconds || taskTimeout,
                 search_radius_km: data.search_radius_km || defaultRadius,
@@ -411,8 +596,8 @@
                 timestamp: data.timestamp
             });
             
-            addLog('broadcast', `📡 ${task.restaurant_name} → ${agents.length} agents (radius: ${data.search_radius_km}km)`);
-            updateUI();
+            addLog('broadcast', `📡 ${task.restaurant_name} → ${feasibleAgents.length} agents (radius: ${data.search_radius_km}km)`);
+            fetchData(); // Refresh to get updated proximity triggers
         });
         
         // Task assigned - remove from active broadcasts
@@ -420,30 +605,89 @@
             if (activeBroadcasts.has(data.id)) {
                 const broadcast = activeBroadcasts.get(data.id);
                 activeBroadcasts.delete(data.id);
-                addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name}`);
-                updateUI();
+                autoTriggeredTasks.delete(data.id);
+                addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name} (assigned)`);
+            }
+            declinedTasks.delete(data.id);  // Clear from declined if manually assigned
+            fetchData();
+        });
+        
+        // Task completed - refresh data (task no longer in unassigned list)
+        socket.on('task:completed', (data) => {
+            // Task is fully done - remove from all tracking
+            activeBroadcasts.delete(data.id);
+            autoTriggeredTasks.delete(data.id);
+            declinedTasks.delete(data.id);
+            addLog('success', `🏁 Task completed by ${data.agent_name}`);
+            fetchData();  // Refresh to get updated task list
+        });
+        
+        // Task cancelled - remove from all tracking
+        socket.on('task:cancelled', (data) => {
+            activeBroadcasts.delete(data.id);
+            autoTriggeredTasks.delete(data.id);
+            declinedTasks.delete(data.id);
+            addLog('warning', `❌ Task cancelled: ${data.reason || 'unknown reason'}`);
+            fetchData();  // Refresh to get updated task list
+        });
+        
+        // Task accepted - remove from active broadcasts (proximity mode)
+        socket.on('task:accepted', (data) => {
+            const taskId = data.id || data.task_id;
+            if (activeBroadcasts.has(taskId)) {
+                const broadcast = activeBroadcasts.get(taskId);
+                activeBroadcasts.delete(taskId);
+                autoTriggeredTasks.delete(taskId);
+                addLog('success', `✅ ${broadcast.task_name} → ${data.agent_name} (accepted)`);
+            }
+            declinedTasks.delete(taskId);  // Also clear from declined if somehow there
+            fetchData();
+        });
+        
+        // Task blocked (declined - Tookan won't push notifications)
+        socket.on('task:blocked', (data) => {
+            const taskId = data.task_id;
+            declinedTasks.set(taskId, {
+                task_id: taskId,
+                restaurant_name: data.restaurant_name,
+                reason: data.reason,
+                details: data.details,
+                declined_by: data.declined_by || [],
+                timestamp: data.timestamp
+            });
+            
+            // Remove from active broadcasts if it was there
+            if (activeBroadcasts.has(taskId)) {
+                activeBroadcasts.delete(taskId);
+                autoTriggeredTasks.delete(taskId);
+            }
+            
+            addLog('error', `⛔ ${data.restaurant_name} BLOCKED - ${data.details}`);
+            updateAllUI();
+        });
+        
+        // Settings updated via config:update_ack
+        socket.on('config:update_ack', (data) => {
+            if (data.success && data.config_applied) {
+                broadcastEnabled = data.config_applied.proximity_broadcast_enabled ?? broadcastEnabled;
+                taskTimeout = data.config_applied.proximity_task_timeout_seconds ?? taskTimeout;
+                defaultRadius = data.config_applied.proximity_default_radius_km ?? defaultRadius;
+                updateSettingsUI();
+                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, timeout=${taskTimeout}s, radius=${defaultRadius}km`);
+            } else if (!data.success) {
+                addLog('error', `❌ Settings update failed: ${data.error}`);
             }
         });
         
-        // Settings acknowledgment
-        socket.on('proximity:settings_ack', (data) => {
-            broadcastEnabled = data.proximity_broadcast_enabled;
-            taskTimeout = data.proximity_task_timeout_seconds;
-            defaultRadius = data.proximity_default_radius_km || 3.0;
-            updateSettingsUI();
-            addLog('system', `Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, timeout=${taskTimeout}s, radius=${defaultRadius}km`);
-        });
-        
-        // Timeout result
+        // Timeout/expand results
         socket.on('proximity:timeout_result', (data) => {
             if (data.success) {
-                addLog('warning', `⏰ Task ${data.task_id.substring(0, 15)}... timeout - re-broadcast to ${data.broadcast_count} agents`);
+                addLog('warning', `⏰ Task timeout - re-broadcast to ${data.broadcast_count} agents`);
             } else {
-                addLog('error', `⏰ Task timeout failed: ${data.error}`);
+                addLog('error', `⏰ Timeout failed: ${data.error}`);
             }
         });
         
-        // Expand result
         socket.on('proximity:expand_result', (data) => {
             if (data.success) {
                 addLog('broadcast', `📏 Radius expanded to ${data.new_radius_km}km - ${data.broadcast_count} agents`);
@@ -452,32 +696,139 @@
             }
         });
         
-        function updateUI() {
-            // Update stats
-            document.getElementById('activebroadcasts').textContent = activeBroadcasts.size;
+        function updateAllUI() {
+            updateStatsUI();
+            updateAgentsUI();
+            updateTasksUI();
+            updateBroadcastsUI();
+            updateBlockedUI();
+            updateSettingsUI();
+        }
+        
+        function updateStatsUI() {
+            document.getElementById('onlineAgents').textContent = agents.length;
+            document.getElementById('unassignedTasks').textContent = tasks.length;
+            document.getElementById('activeBroadcasts').textContent = activeBroadcasts.size;
             
-            let totalAgents = 0;
-            activeBroadcasts.forEach(b => totalAgents += b.agents.length);
-            document.getElementById('totalAgents').textContent = totalAgents;
+            let totalFeasible = 0;
+            activeBroadcasts.forEach(b => totalFeasible += b.agents.length);
+            document.getElementById('feasibleAgents').textContent = totalFeasible;
             
-            document.getElementById('broadcastCount').textContent = activeBroadcasts.size > 0 
-                ? `${activeBroadcasts.size} task(s)` : '';
+            // Blocked = unassigned tasks NOT in active broadcasts + declined tasks
+            const broadcastingTaskIds = new Set(activeBroadcasts.keys());
+            const blockedCount = tasks.filter(t => !broadcastingTaskIds.has(t.id)).length;
+            const declinedCount = declinedTasks.size;
+            document.getElementById('blockedTasks').textContent = blockedCount + declinedCount;
             
-            // Render broadcasts
+            // Update blocked label to show declined count
+            const blockedLabel = document.querySelector('#blockedTasks').parentElement;
+            if (blockedLabel && declinedCount > 0) {
+                blockedLabel.title = `${declinedCount} declined (manual only), ${blockedCount} waiting`;
+            }
+            
+            document.getElementById('timeout').textContent = taskTimeout;
+        }
+        
+        function updateAgentsUI() {
+            const list = document.getElementById('agentList');
+            document.getElementById('agentCount').textContent = `${agents.length} total`;
+            
+            if (agents.length === 0) {
+                list.innerHTML = '<div class="empty-state">No agents online</div>';
+                return;
+            }
+            
+            // Sort: idle first, then busy, then at capacity
+            const sorted = [...agents].sort((a, b) => {
+                const statusOrder = { 'idle': 0, 'busy': 1, 'at_capacity': 2 };
+                const aStatus = a.current_tasks >= a.max_capacity ? 'at_capacity' : (a.current_tasks > 0 ? 'busy' : 'idle');
+                const bStatus = b.current_tasks >= b.max_capacity ? 'at_capacity' : (b.current_tasks > 0 ? 'busy' : 'idle');
+                return (statusOrder[aStatus] || 2) - (statusOrder[bStatus] || 2);
+            });
+            
+            list.innerHTML = sorted.map(a => {
+                const taskCount = a.current_tasks || 0;
+                const maxCap = a.max_capacity || 2;
+                const status = taskCount >= maxCap ? 'at-capacity' : (taskCount > 0 ? 'busy' : 'idle');
+                const statusLabel = status === 'at-capacity' ? 'AT_CAPACITY' : status.toUpperCase();
+                const lat = a.current_location?.lat || 0;
+                const lng = a.current_location?.lng || 0;
+                
+                return `
+                    <div class="agent-item">
+                        <div class="agent-info">
+                            <div class="agent-name">${a.name}</div>
+                            <div class="agent-details">
+                                ID: ${a.id} | Tasks: ${taskCount}/${maxCap} | Loc: [${lat.toFixed(4)}, ${lng.toFixed(4)}]
+                            </div>
+                        </div>
+                        <span class="agent-status ${status}">${statusLabel}</span>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        function updateTasksUI() {
+            const list = document.getElementById('taskList');
+            document.getElementById('taskCount').textContent = `${tasks.length} unassigned`;
+            
+            if (tasks.length === 0) {
+                list.innerHTML = '<div class="empty-state">No unassigned tasks</div>';
+                return;
+            }
+            
+            // Sort by urgency
+            const sorted = [...tasks].sort((a, b) => (b.urgency_score || 0) - (a.urgency_score || 0));
+            
+            list.innerHTML = sorted.map(t => {
+                const isBroadcasting = activeBroadcasts.has(t.id);
+                const broadcast = activeBroadcasts.get(t.id);
+                const urgency = t.urgency_score || 0;
+                const isPremium = t.is_premium || (t.tips && t.tips > 0);
+                const pickupTime = t.pickup_before ? new Date(t.pickup_before).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '?';
+                
+                let badge = '';
+                if (isBroadcasting) {
+                    badge = `<span class="task-badge broadcasting">📡 ${broadcast.agents.length} AGENTS</span>`;
+                } else if (urgency >= 70) {
+                    badge = '<span class="task-badge urgent">URGENT</span>';
+                } else if (isPremium) {
+                    badge = '<span class="task-badge premium">⭐ PREMIUM</span>';
+                } else {
+                    badge = '<span class="task-badge waiting">WAITING</span>';
+                }
+                
+                return `
+                    <div class="task-item">
+                        <div class="task-header">
+                            <span class="task-name">${t.restaurant_name} → ${t.customer_name}</span>
+                            ${badge}
+                        </div>
+                        <div class="task-details">
+                            Urgency: ${urgency} | Pickup: ${pickupTime} | $${((t.delivery_fee || 0) + (t.tips || 0)).toFixed(2)}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        function updateBroadcastsUI() {
             const list = document.getElementById('broadcastList');
+            document.getElementById('broadcastCount').textContent = activeBroadcasts.size > 0 
+                ? `${activeBroadcasts.size} active` : '';
+            
             if (activeBroadcasts.size === 0) {
-                list.innerHTML = '<div class="empty-state">No active broadcasts</div>';
+                list.innerHTML = '<div class="empty-state">No active broadcasts - waiting for proximity triggers</div>';
                 return;
             }
             
             const now = Date.now() / 1000;
-            let html = '';
             
-            activeBroadcasts.forEach((b, taskId) => {
+            list.innerHTML = Array.from(activeBroadcasts.values()).map(b => {
                 const elapsed = now - b.first_offered_at;
                 const remaining = Math.max(0, b.timeout_seconds - elapsed);
                 
-                html += `
+                return `
                     <div class="broadcast-item">
                         <div class="broadcast-header">
                             <span class="broadcast-task">${b.task_name} → ${b.customer}</span>
@@ -486,7 +837,7 @@
                         <div class="broadcast-meta">
                             ${b.is_premium ? '⭐ PREMIUM | ' : ''}
                             $${b.payment.toFixed(2)} | 
-                            <span class="radius-display">${b.search_radius_km}km</span> |
+                            <span class="radius-badge">${b.search_radius_km}km</span> |
                             Triggered by: ${b.triggered_by}
                         </div>
                         <div class="agents-list">
@@ -494,19 +845,99 @@
                                 <span class="agent-chip">${a.agent_name} (${a.distance_km}km)</span>
                             `).join('')}
                         </div>
-                        <div style="margin-top: 8px; display: flex; gap: 8px;">
-                            <button class="btn btn-secondary" onclick="triggerTimeout('${taskId}')" style="padding: 4px 8px; font-size: 0.7rem;">
-                                Timeout
-                            </button>
-                            <button class="btn btn-secondary" onclick="expandRadius('${taskId}', ${b.search_radius_km + 2})" style="padding: 4px 8px; font-size: 0.7rem;">
-                                Expand +2km
-                            </button>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="btn btn-secondary" onclick="triggerTimeout('${b.task_id}')">Timeout</button>
+                            <button class="btn btn-secondary" onclick="expandRadius('${b.task_id}', ${b.search_radius_km + 2})">Expand +2km</button>
                         </div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        function updateBlockedUI() {
+            const list = document.getElementById('blockedList');
+            const broadcastingTaskIds = new Set(activeBroadcasts.keys());
+            const blocked = tasks.filter(t => !broadcastingTaskIds.has(t.id));
+            
+            if (blocked.length === 0 && declinedTasks.size === 0) {
+                list.innerHTML = '<div class="empty-state">All tasks are broadcasting or have eligible agents</div>';
+                return;
+            }
+            
+            // Build reasons from proximity triggers
+            const taskReasons = {};
+            proximityTriggers.forEach(trigger => {
+                if (!trigger.is_eligible && trigger.eligibility_reason) {
+                    if (!taskReasons[trigger.task_id]) {
+                        taskReasons[trigger.task_id] = new Set();
+                    }
+                    taskReasons[trigger.task_id].add(trigger.eligibility_reason);
+                }
+            });
+            
+            let html = '';
+            
+            // First show DECLINED tasks (permanent blocks - need manual assignment)
+            declinedTasks.forEach((declined, taskId) => {
+                const declinedByStr = declined.declined_by.length > 0 
+                    ? `Declined by: ${declined.declined_by.length} agent(s)` 
+                    : '';
+                html += `
+                    <div class="blocked-item" style="border-left: 3px solid #ef4444; background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(239, 68, 68, 0.05) 100%);">
+                        <div class="task-header">
+                            <span class="task-name">${declined.restaurant_name}</span>
+                            <span style="background: #ef4444; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold;">⛔ DECLINED</span>
+                        </div>
+                        <div class="task-details">
+                            ${declinedByStr} | Needs manual assignment
+                        </div>
+                        <span class="blocked-reason" style="color: #ef4444;">Tookan won't push notifications to declined tasks</span>
                     </div>
                 `;
             });
             
-            list.innerHTML = html;
+            // Then show other blocked tasks (might become eligible)
+            blocked.forEach(t => {
+                // Skip if already shown in declined section
+                if (declinedTasks.has(t.id)) return;
+                
+                // Check if task has declined_by data (was declined before page loaded)
+                const hasDeclines = t.declined_by && t.declined_by.length > 0;
+                
+                if (hasDeclines) {
+                    // Show as declined task - needs manual assignment
+                    html += `
+                        <div class="blocked-item" style="border-left: 3px solid #ef4444; background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(239, 68, 68, 0.05) 100%);">
+                            <div class="task-header">
+                                <span class="task-name">${t.restaurant_name} → ${t.customer_name}</span>
+                                <span style="background: #ef4444; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold;">⛔ DECLINED</span>
+                            </div>
+                            <div class="task-details">
+                                $${((t.delivery_fee || 0) + (t.tips || 0)).toFixed(2)} | ${t.is_premium ? '⭐ PREMIUM' : 'Regular'} | Declined by ${t.declined_by.length} agent(s)
+                            </div>
+                            <span class="blocked-reason" style="color: #ef4444;">Tookan won't push notifications - needs manual assignment</span>
+                        </div>
+                    `;
+                } else {
+                    // Regular blocked task - no declines, just no eligible agents
+                    const reasons = taskReasons[t.id] ? Array.from(taskReasons[t.id]) : ['No agents within radius'];
+                    const reasonDisplay = reasons.slice(0, 3).join(', ');
+                    
+                    html += `
+                        <div class="blocked-item">
+                            <div class="task-header">
+                                <span class="task-name">${t.restaurant_name} → ${t.customer_name}</span>
+                            </div>
+                            <div class="task-details">
+                                $${((t.delivery_fee || 0) + (t.tips || 0)).toFixed(2)} | ${t.is_premium ? '⭐ PREMIUM' : 'Regular'}
+                            </div>
+                            <span class="blocked-reason">${reasonDisplay}</span>
+                        </div>
+                    `;
+                }
+            });
+            
+            list.innerHTML = html || '<div class="empty-state">All tasks are broadcasting or have eligible agents</div>';
         }
         
         function updateSettingsUI() {
@@ -515,17 +946,19 @@
             document.getElementById('modeSelect').value = broadcastEnabled.toString();
             document.getElementById('timeoutInput').value = taskTimeout;
             document.getElementById('radiusInput').value = defaultRadius;
-            document.getElementById('timeout').textContent = taskTimeout;
-            document.getElementById('defaultRadius').textContent = defaultRadius.toFixed(1);
         }
         
         function applySettings() {
-            socket.emit('proximity:settings', {
-                proximity_broadcast_enabled: document.getElementById('modeSelect').value === 'true',
-                proximity_task_timeout_seconds: parseInt(document.getElementById('timeoutInput').value),
-                proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value),
+            // Use existing config:update event
+            socket.emit('config:update', {
+                config: {
+                    proximity_broadcast_enabled: document.getElementById('modeSelect').value === 'true',
+                    proximity_task_timeout_seconds: parseInt(document.getElementById('timeoutInput').value),
+                    proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value)
+                },
                 dashboard_url: window.location.origin
             });
+            addLog('system', 'Sending settings update...');
         }
         
         function triggerTimeout(taskId) {
@@ -565,12 +998,44 @@
             renderLog();
         }
         
-        // Update timers every second
-        setInterval(updateUI, 1000);
+        // Update timers and AUTO-TRIGGER timeout when timer reaches 0
+        setInterval(() => {
+            const now = Date.now() / 1000;
+            
+            // Check for tasks that hit 0s and need auto-trigger
+            activeBroadcasts.forEach((b, taskId) => {
+                const elapsed = now - b.first_offered_at;
+                const remaining = b.timeout_seconds - elapsed;
+                
+                // If timer hit 0 and we haven't already triggered for this task
+                if (remaining <= 0 && !autoTriggeredTasks.has(taskId)) {
+                    autoTriggeredTasks.add(taskId);
+                    addLog('warning', `⏰ Auto-triggering timeout for ${b.task_name}`);
+                    
+                    // Emit timeout event to re-run solver
+                    socket.emit('proximity:timeout', {
+                        task_id: taskId,
+                        dashboard_url: window.location.origin
+                    });
+                }
+            });
+            
+            // Clean up triggered tasks that are no longer in active broadcasts
+            autoTriggeredTasks.forEach(taskId => {
+                if (!activeBroadcasts.has(taskId)) {
+                    autoTriggeredTasks.delete(taskId);
+                }
+            });
+            
+            updateBroadcastsUI();
+            updateStatsUI();
+        }, 1000);
         
-        // Initial UI
+        // Refresh fleet data every 10 seconds
+        setInterval(fetchData, 10000);
+        
+        // Initial load
         updateSettingsUI();
     </script>
 </body>
 </html>
-

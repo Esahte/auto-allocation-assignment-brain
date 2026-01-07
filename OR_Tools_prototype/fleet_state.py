@@ -739,7 +739,9 @@ class FleetState:
     
     def accept_task(self, task_id: str, agent_id: str) -> Optional[TaskState]:
         """
-        Mark task as accepted by agent (status change from ASSIGNED).
+        Mark task as accepted by agent.
+        This also assigns the task if not already assigned (handles case where
+        dashboard sends task:accepted without task:assigned first).
         """
         with self._lock:
             # Convert to strings for consistent lookup
@@ -748,7 +750,33 @@ class FleetState:
             
             if task_id in self._tasks:
                 task = self._tasks[task_id]
-                # Could add an ACCEPTED status if needed, for now just log
+                
+                # CRITICAL: If task is still UNASSIGNED, assign it now
+                # This handles dashboards that send task:accepted without task:assigned
+                if task.status == TaskStatus.UNASSIGNED:
+                    task.status = TaskStatus.ASSIGNED
+                    task.assigned_agent_id = agent_id
+                    
+                    # Add to agent's current tasks if not already there
+                    if agent_id in self._agents:
+                        agent = self._agents[agent_id]
+                        if not any(t.id == task_id for t in agent.current_tasks):
+                            current_task = CurrentTask(
+                                id=task.id,
+                                job_type=task.job_type,
+                                restaurant_location=task.restaurant_location,
+                                delivery_location=task.delivery_location,
+                                pickup_before=task.pickup_before,
+                                delivery_before=task.delivery_before,
+                                pickup_completed=task.pickup_completed
+                            )
+                            agent.current_tasks.append(current_task)
+                            # Update agent status
+                            if len(agent.current_tasks) >= agent.max_capacity:
+                                agent.status = AgentStatus.AT_CAPACITY
+                            else:
+                                agent.status = AgentStatus.BUSY
+                
                 task.last_updated = datetime.now(timezone.utc)
                 
                 if agent_id in self._agents:
@@ -1124,10 +1152,16 @@ class FleetState:
         
         return triggers
     
-    def _check_eligibility(self, agent: AgentState, task: TaskState) -> Optional[str]:
+    def _check_eligibility(self, agent: AgentState, task: TaskState, override_max_distance_km: float = None) -> Optional[str]:
         """
         Check if agent is eligible to take task.
         Returns None if eligible, or reason string if not.
+        
+        Args:
+            agent: Agent to check
+            task: Task to check
+            override_max_distance_km: If provided, use this instead of task's max_distance_km
+                                      (used when radius is expanded in proximity broadcast)
         
         Business Rules Checked:
         0. Priority - Priority 1 agents only get premium tasks (tips >= $5 OR delivery_fee >= $18)
@@ -1216,24 +1250,30 @@ class FleetState:
                 return "outside_geofence"
         
         # 7. Check max distance (using current or projected location)
-        # Priority 1 agents BYPASS distance for premium tasks
-        if agent.priority == 1 and task.is_premium_task:
-            return None  # Priority 1 agents bypass distance for premium tasks
+        # Priority 1 agents BYPASS distance for premium tasks (but NOT direction check!)
+        skip_distance_check = (agent.priority == 1 and task.is_premium_task)
         
-        if agent.current_tasks:
-            # Use projected location for busy agents
-            distance = agent.projected_location.distance_to(task.restaurant_location)
-        else:
-            distance = agent.current_location.distance_to(task.restaurant_location)
-        
-        # Use task-specific max_distance_km if set, otherwise use global
-        max_dist = task.max_distance_km if task.max_distance_km is not None else self.max_distance_km
-        
-        if max_dist is not None and distance > max_dist:
-            return f"too_far ({distance:.1f}km > {max_dist}km)"
+        if not skip_distance_check:
+            if agent.current_tasks:
+                # Use projected location for busy agents
+                distance = agent.projected_location.distance_to(task.restaurant_location)
+            else:
+                distance = agent.current_location.distance_to(task.restaurant_location)
+            
+            # Use override if provided (for expanded radius), otherwise task-specific, otherwise global
+            if override_max_distance_km is not None:
+                max_dist = override_max_distance_km
+            elif task.max_distance_km is not None:
+                max_dist = task.max_distance_km
+            else:
+                max_dist = self.max_distance_km
+            
+            if max_dist is not None and distance > max_dist:
+                return f"too_far ({distance:.1f}km > {max_dist}km)"
         
         # 8. Direction Coherence - New task delivery should be in same direction as existing tasks
         # Prevents inefficient zig-zag routes
+        # NOTE: This applies to ALL agents including Priority 1 - we don't want zig-zag routes!
         if agent.current_tasks:
             direction_result = self._check_delivery_direction_coherence(agent, task)
             if direction_result:
@@ -1257,8 +1297,8 @@ class FleetState:
             return None  # No existing tasks, any direction is fine
         
         # Use agent's current location as the reference point
-        agent_lat = agent.lat if agent.lat else 0
-        agent_lng = agent.lng if agent.lng else 0
+        agent_lat = agent.current_location.lat if agent.current_location else 0
+        agent_lng = agent.current_location.lng if agent.current_location else 0
         
         if agent_lat == 0 and agent_lng == 0:
             return None  # No location data, can't check direction
@@ -1275,13 +1315,13 @@ class FleetState:
         
         # Check against each existing task's delivery direction
         for existing_task in agent.current_tasks:
-            existing_task_obj = self._tasks.get(existing_task)
-            if not existing_task_obj:
+            # existing_task is a CurrentTask object, use it directly
+            if not existing_task.delivery_location:
                 continue
             
             # Calculate direction vector for existing task's delivery (from agent)
-            existing_delivery_lat = existing_task_obj.delivery_location.lat
-            existing_delivery_lng = existing_task_obj.delivery_location.lng
+            existing_delivery_lat = existing_task.delivery_location.lat
+            existing_delivery_lng = existing_task.delivery_location.lng
             existing_delta_lat = existing_delivery_lat - agent_lat
             existing_delta_lng = existing_delivery_lng - agent_lng
             

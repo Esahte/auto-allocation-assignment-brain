@@ -242,6 +242,7 @@ _proximity_lock = threading.Lock()
 _last_proximity_broadcast = {}  # Track last broadcast per task: {task_id: timestamp}
 _task_offer_times = {}  # Track when each task was first offered: {task_id: timestamp}
 _task_expanded_radius = {}  # Track expanded radius per task: {task_id: radius_km}
+_task_current_agents = {}  # Track current feasible agents per task: {task_id: set(agent_ids)}
 
 # Configuration (can be updated via dashboard settings)
 PROXIMITY_BROADCAST_ENABLED = True  # Toggle between broadcast (multi-agent) and auto-assign (single agent)
@@ -255,7 +256,8 @@ def trigger_proximity_broadcast(
     task_id: str,
     triggered_by_agent: str,
     dashboard_url: str,
-    radius_km: float = None
+    radius_km: float = None,
+    force: bool = False
 ) -> dict:
     """
     Run solver for a SINGLE task with all nearby agents in BROADCAST mode.
@@ -265,11 +267,17 @@ def trigger_proximity_broadcast(
     2. Runs the solver to verify time feasibility for each agent
     3. Broadcasts task:proximity to all FEASIBLE agents
     
+    OPTIMIZATION: Only broadcasts if:
+    - force=True (timeout, expand, decline events)
+    - OR a NEW agent enters the feasible set
+    - Skips broadcast if same agents are still feasible (no spam)
+    
     Args:
         task_id: The task to broadcast
         triggered_by_agent: Name of agent who triggered proximity (for logging)
         dashboard_url: Dashboard URL for callbacks
         radius_km: Search radius (uses expanded radius if set, else default)
+        force: If True, always broadcast (used for timeout/expand/decline)
     
     Returns: {
         'success': bool,
@@ -279,7 +287,7 @@ def trigger_proximity_broadcast(
         'broadcast_count': int
     }
     """
-    global _task_offer_times, _last_proximity_broadcast
+    global _task_offer_times, _last_proximity_broadcast, _task_current_agents
     
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         return {'success': False, 'error': 'Fleet state not available'}
@@ -290,6 +298,16 @@ def trigger_proximity_broadcast(
     
     if task.status != TaskStatus.UNASSIGNED:
         return {'success': False, 'error': 'Task already assigned'}
+    
+    # BLOCK: Tasks with declines - Tookan won't push notifications to declined tasks
+    if task.declined_by and len(task.declined_by) > 0:
+        return {
+            'success': False, 
+            'error': 'Task blocked - declined (Tookan won\'t push notifications)',
+            'blocked': True,
+            'blocked_reason': 'declined_no_tookan_push',
+            'declined_by': list(task.declined_by)
+        }
     
     # Debounce per-task broadcasts
     now = time.time()
@@ -316,8 +334,8 @@ def trigger_proximity_broadcast(
         min_dist = min(current_dist, projected_dist)
         
         if min_dist <= search_radius:
-            # Check business rule eligibility
-            eligibility = fleet_state._check_eligibility(agent, task)
+            # Check business rule eligibility (pass expanded radius to override task's default)
+            eligibility = fleet_state._check_eligibility(agent, task, override_max_distance_km=search_radius)
             nearby_agents.append({
                 'agent': agent,
                 'distance_km': min_dist,
@@ -384,16 +402,15 @@ def trigger_proximity_broadcast(
         task_export = {
             'tasks': [{
                 'id': task.id,
-                'order_id': task.order_id,
                 'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
                 'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
                 'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
                 'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
-                'payment_type': task.payment_type,
+                'payment_method': task.payment_method,
                 'tags': task.tags,
                 '_meta': {
                     'restaurant_name': task.restaurant_name,
-                    'customer_name': task.customer_name,
+                    'customer_name': task.meta.get('customer_name', 'Unknown'),
                     'delivery_fee': task.delivery_fee,
                     'tips': task.tips
                 }
@@ -413,7 +430,7 @@ def trigger_proximity_broadcast(
                     'agent_id': agent.id,
                     'agent_name': agent.name,
                     'distance_km': round(agent_info['distance_km'], 2),
-                    'location': [agent.lat, agent.lng] if agent.lat and agent.lng else None,
+                    'location': [agent.current_location.lat, agent.current_location.lng] if agent.current_location else None,
                     'current_task_count': len(agent.current_tasks),
                     'available_capacity': agent.available_capacity,
                     'priority': agent.priority,
@@ -443,6 +460,29 @@ def trigger_proximity_broadcast(
             'infeasible': infeasible_agents
         }
     
+    # Check if we should skip broadcast (same agents, not forced)
+    current_feasible_ids = set(a['agent_id'] for a in feasible_agents)
+    with _proximity_lock:
+        previous_agents = _task_current_agents.get(task_id, set())
+        new_agents = current_feasible_ids - previous_agents
+        
+        if not force and not new_agents and previous_agents:
+            # Same agents as before, skip broadcast
+            return {
+                'success': True,
+                'skipped': True,
+                'reason': 'same_agents',
+                'current_agents': list(current_feasible_ids)
+            }
+        
+        # Update tracked agents
+        _task_current_agents[task_id] = current_feasible_ids
+        
+        # Log if new agent entered
+        if new_agents and not force:
+            new_names = [a['agent_name'] for a in feasible_agents if a['agent_id'] in new_agents]
+            log_event(f"[ProximityBroadcast] 🆕 New agent(s) for {task.restaurant_name}: {new_names}")
+    
     # Track first_offered_at for timer
     with _proximity_lock:
         if task_id not in _task_offer_times:
@@ -468,7 +508,7 @@ def trigger_proximity_broadcast(
             'payment': {
                 'delivery_fee': task.delivery_fee,
                 'tips': task.tips,
-                'type': task.payment_type,
+                'type': task.payment_method,
                 'total': (task.delivery_fee or 0) + (task.tips or 0)
             },
             'tags': task.tags,
@@ -547,23 +587,25 @@ def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -
     
     log_event(f"[ProximityBroadcast] 📏 Expanded radius for task {task_id}: {old_radius}km → {new_radius_km}km")
     
-    # Re-run broadcast with expanded radius
+    # Re-run broadcast with expanded radius (force=True to always broadcast on expand)
     return trigger_proximity_broadcast(
         task_id=task_id,
         triggered_by_agent="radius_expansion",
         dashboard_url=dashboard_url,
-        radius_km=new_radius_km
+        radius_km=new_radius_km,
+        force=True
     )
 
 
 def clean_task_tracking(task_id: str):
     """Clean up tracking data when a task is assigned/completed."""
-    global _task_offer_times, _task_expanded_radius, _last_proximity_broadcast
+    global _task_offer_times, _task_expanded_radius, _last_proximity_broadcast, _task_current_agents
     
     with _proximity_lock:
         _task_offer_times.pop(task_id, None)
         _task_expanded_radius.pop(task_id, None)
         _last_proximity_broadcast.pop(task_id, None)
+        _task_current_agents.pop(task_id, None)
 
 
 def handle_proximity_acceptance(task_id: str, agent_id: str, agent_name: str, dashboard_url: str) -> dict:
@@ -1530,6 +1572,22 @@ def handle_config_update(data):
         # chain_lookahead_radius_km is now synced with max_distance_km automatically
         # No need to update it separately in config updates
         
+        # Proximity broadcast settings
+        if 'proximity_broadcast_enabled' in config:
+            old_val = PROXIMITY_BROADCAST_ENABLED
+            update_proximity_broadcast_settings({'proximity_broadcast_enabled': config['proximity_broadcast_enabled']})
+            changes.append(f"proximity_broadcast_enabled: {old_val} → {PROXIMITY_BROADCAST_ENABLED}")
+        
+        if 'proximity_task_timeout_seconds' in config:
+            old_val = PROXIMITY_TASK_TIMEOUT_SECONDS
+            update_proximity_broadcast_settings({'proximity_task_timeout_seconds': config['proximity_task_timeout_seconds']})
+            changes.append(f"proximity_task_timeout_seconds: {old_val} → {PROXIMITY_TASK_TIMEOUT_SECONDS}")
+        
+        if 'proximity_default_radius_km' in config:
+            old_val = PROXIMITY_DEFAULT_RADIUS_KM
+            update_proximity_broadcast_settings({'proximity_default_radius_km': config['proximity_default_radius_km']})
+            changes.append(f"proximity_default_radius_km: {old_val} → {PROXIMITY_DEFAULT_RADIUS_KM}")
+        
         # Log changes
         if changes:
             print(f"[FleetState] ✅ Config updated:")
@@ -1548,7 +1606,10 @@ def handle_config_update(data):
                 'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
                 'wallet_threshold': fleet_state.wallet_threshold,
                 'max_tasks_per_agent': fleet_state.default_max_capacity,
-                'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km
+                'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
+                'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
+                'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
+                'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM
             }
         })
         
@@ -1763,6 +1824,48 @@ def handle_task_created(data):
         task = fleet_state.add_task(task_data)
         print(f"[FleetState] Added task: {task.restaurant_name} → {task.customer_name} | fee=${task.delivery_fee:.2f}, tips=${task.tips:.2f} [{premium_indicator}]")
         
+        # Broadcast to all clients so dashboards can update their task lists
+        socketio.emit('task:created', {
+            'id': task_id,
+            'restaurant_name': task.restaurant_name,
+            'customer_name': task.customer_name,
+            'delivery_fee': task.delivery_fee,
+            'tips': task.tips,
+            'is_premium': task.is_premium_task,
+            'created_at': datetime.now(timezone.utc).isoformat()
+        })
+        
+        # =========================================================================
+        # PROXIMITY BROADCAST MODE: Skip all event-based optimization
+        # =========================================================================
+        if PROXIMITY_BROADCAST_ENABLED:
+            # In proximity mode, tasks are broadcast when agents get near them
+            # Emit a notification that a new task is available
+            socketio.emit('task:available', {
+                'id': task_id,
+                'restaurant_name': task.restaurant_name,
+                'customer_name': task.customer_name,
+                'location': [task.restaurant_location.lat, task.restaurant_location.lng] if task.restaurant_location else None,
+                'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+                'delivery_fee': task.delivery_fee,
+                'tips': task.tips,
+                'is_premium': task.is_premium_task,
+                'message': 'Task awaiting proximity trigger'
+            })
+            print(f"[ProximityBroadcast] 📋 New task available: {task.restaurant_name} - awaiting proximity trigger (fleet optimization SKIPPED)")
+            
+            emit('task:created_ack', {
+                'id': task_id,
+                'received_at': datetime.now().isoformat(),
+                'added_to_fleet_state': True,
+                'proximity_mode': True,
+                'triggered_optimization': False
+            })
+            return  # EXIT EARLY - proximity broadcast handles assignment
+        
+        # =========================================================================
+        # FLEET OPTIMIZATION MODE (PROXIMITY_BROADCAST_ENABLED = False)
+        # =========================================================================
         # PROACTIVE CHECK: Are any agents already near this task?
         eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
         nearby_eligible = [
@@ -1832,30 +1935,7 @@ def handle_task_created(data):
         'triggered_optimization': triggered_optimization
     })
     
-    # =========================================================================
-    # PROXIMITY BROADCAST MODE: Task will be broadcast when agents are nearby
-    # =========================================================================
-    if PROXIMITY_BROADCAST_ENABLED:
-        task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
-        if task_after and task_after.status == TaskStatus.UNASSIGNED:
-            # In proximity mode, tasks are broadcast when agents get near them
-            # Emit a simple notification that a new task is available
-            socketio.emit('task:available', {
-                'id': task_id,
-                'restaurant_name': task.restaurant_name,
-                'customer_name': task.customer_name,
-                'location': [task.restaurant_location.lat, task.restaurant_location.lng] if task.restaurant_location else None,
-                'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
-                'message': 'Task awaiting proximity trigger'
-            })
-            print(f"[ProximityBroadcast] 📋 New task available: {task.restaurant_name} - awaiting proximity trigger")
-            return  # Don't trigger fleet optimization - proximity will handle it
-        elif task_after:
-            print(f"[FleetState] ⏩ Skipping - task already {task_after.status.value}")
-            return
-    
-    # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
-    # Only trigger if proximity didn't already assign the task
+    # EVENT-BASED optimization (only when PROXIMITY_BROADCAST_ENABLED = False)
     task_after = fleet_state.get_task(str(task_id)) if fleet_state else None
     if task_after and task_after.status == TaskStatus.UNASSIGNED:
         trigger_fleet_optimization('task:created', {
@@ -1890,6 +1970,40 @@ def handle_task_declined(data):
         # Get the task to check its restaurant name
         task = fleet_state.get_task(task_id)
         
+        # =========================================================================
+        # PROXIMITY BROADCAST MODE: Block declined tasks (Tookan won't push notifications)
+        # =========================================================================
+        if PROXIMITY_BROADCAST_ENABLED and task:
+            # IMPORTANT: Tookan does NOT push notifications to tasks that have been declined
+            # So there's no point re-broadcasting. These tasks need manual assignment.
+            log_event(f"[ProximityBroadcast] ⛔ Task {task.restaurant_name} BLOCKED - declined by {latest_agent_name} (Tookan won't push notifications)")
+            
+            emit('task:declined_ack', {
+                'id': task_id,
+                'declined_by': declined_by,
+                'received_at': datetime.now().isoformat(),
+                'decline_recorded': True,
+                'proximity_mode': True,
+                'blocked': True,
+                'blocked_reason': 'declined_no_tookan_push',
+                'triggered_optimization': False
+            })
+            
+            # Emit blocked update so debug dashboard can show it
+            socketio.emit('task:blocked', {
+                'task_id': task_id,
+                'restaurant_name': task.restaurant_name,
+                'reason': 'declined',
+                'details': f'Declined by {latest_agent_name} - Tookan will not push notifications',
+                'declined_by': list(declined_by),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            })
+            
+            return  # EXIT EARLY - do NOT re-broadcast declined tasks
+        
+        # =========================================================================
+        # FLEET OPTIMIZATION MODE (PROXIMITY_BROADCAST_ENABLED = False)
+        # =========================================================================
         if task:
             # PROACTIVE CHECK: Find another eligible agent near this task
             eligible_agents = fleet_state.find_eligible_agents_for_task(task_id)
@@ -1951,26 +2065,8 @@ def handle_task_declined(data):
         'declined_by': declined_by,
         'received_at': datetime.now().isoformat(),
         'decline_recorded': True,
-        'triggered_optimization': True
+        'triggered_optimization': triggered_optimization
     })
-    
-    # =========================================================================
-    # PROXIMITY BROADCAST MODE: Re-run broadcast for this task (agent removed from eligible)
-    # =========================================================================
-    task_after_proximity = fleet_state.get_task(str(task_id)) if (FLEET_STATE_AVAILABLE and fleet_state and task_id) else None
-    
-    if PROXIMITY_BROADCAST_ENABLED and task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
-        # Re-broadcast this specific task (declined agent is now ineligible)
-        result = trigger_proximity_broadcast(
-            task_id=task_id,
-            triggered_by_agent=f"declined_by_{agent_name}",
-            dashboard_url=dashboard_url
-        )
-        if result.get('success'):
-            log_event(f"[ProximityBroadcast] 📡 Re-broadcast after decline: {result.get('broadcast_count', 0)} agents")
-            return
-        else:
-            log_event(f"[ProximityBroadcast] ⚠️ Re-broadcast failed: {result.get('error')}, falling back to optimization")
     
     # FALLBACK: EVENT-BASED optimization (only if broadcast mode disabled or failed)
     if task_after_proximity and task_after_proximity.status == TaskStatus.UNASSIGNED:
@@ -2010,11 +2106,12 @@ def handle_proximity_timeout(data):
     
     log_event(f"[ProximityBroadcast] ⏰ Task {task_id} timed out - re-running solver")
     
-    # Re-run proximity broadcast (solver verifies feasibility)
+    # Re-run proximity broadcast (force=True to always broadcast on timeout)
     result = trigger_proximity_broadcast(
         task_id=task_id,
         triggered_by_agent="timeout",
-        dashboard_url=dashboard_url
+        dashboard_url=dashboard_url,
+        force=True
     )
     
     # Emit result
@@ -2058,33 +2155,6 @@ def handle_proximity_expand_radius(data):
         'success': result.get('success', False),
         'broadcast_count': result.get('broadcast_count', 0),
         'error': result.get('error')
-    })
-
-
-@socketio.on('proximity:settings')
-def handle_proximity_settings(data):
-    """
-    Dashboard updates proximity broadcast settings.
-    
-    Payload: {
-        proximity_broadcast_enabled: bool,
-        proximity_task_timeout_seconds: int,
-        proximity_default_radius_km: float,
-        dashboard_url: str
-    }
-    """
-    performance_stats["websocket_events"] += 1
-    
-    # Update settings
-    update_proximity_broadcast_settings(data)
-    
-    # Emit acknowledgment with current settings
-    emit('proximity:settings_ack', {
-        'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
-        'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
-        'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
-        'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM,
-        'received_at': datetime.now().isoformat()
     })
 
 
@@ -2150,6 +2220,14 @@ def handle_task_completed(data):
             'agent_id': agent_id,
             'received_at': datetime.now().isoformat(),
             'task_removed': True
+        })
+        
+        # Broadcast to all clients so dashboards can update
+        socketio.emit('task:completed', {
+            'id': task_id,
+            'agent_id': agent_id,
+            'agent_name': agent_name,
+            'completed_at': datetime.now(timezone.utc).isoformat()
         })
         
         # PROXIMITY BROADCAST: Agent now has capacity - proximity will trigger when they're near tasks
@@ -2232,6 +2310,13 @@ def handle_task_cancelled(data):
         'reason': reason,
         'received_at': datetime.now().isoformat(),
         'task_removed': True
+    })
+    
+    # Broadcast to all clients so dashboards can update
+    socketio.emit('task:cancelled', {
+        'id': task_id,
+        'reason': reason,
+        'cancelled_at': datetime.now(timezone.utc).isoformat()
     })
     
     # No auto-optimization - task removed from state
@@ -2478,11 +2563,18 @@ def handle_task_updated(data):
     # Trigger optimization with all safety nets (debouncing, sync lock, global lock)
     if should_optimize:
         app.logger.info(f"[FleetState] Task {restaurant_name} updated ({optimization_reason}) - triggering optimization")
-        # Use debounced optimization (same safety nets as task:created, task:declined)
-        trigger_debounced_optimization(
-            trigger_type=f'task:updated:{optimization_reason}',
-            dashboard_url=dashboard_url
-        )
+        
+        # Check if proximity broadcast mode is enabled
+        if PROXIMITY_BROADCAST_ENABLED:
+            # Use proximity broadcast instead of fleet optimization
+            app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} updated - triggering proximity broadcast")
+            trigger_proximity_broadcast(task_id, force=True)
+        else:
+            # Use debounced optimization (same safety nets as task:created, task:declined)
+            trigger_debounced_optimization(
+                trigger_type=f'task:updated:{optimization_reason}',
+                dashboard_url=dashboard_url
+            )
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
@@ -2511,6 +2603,15 @@ def handle_task_assigned(data):
         # PROXIMITY BROADCAST: Clean up tracking for this task
         if PROXIMITY_BROADCAST_ENABLED:
             clean_task_tracking(task_id)
+        
+        # Broadcast assignment to ALL clients (debug pages, etc.)
+        socketio.emit('task:assigned', {
+            'id': task_id,
+            'agent_id': agent_id,
+            'agent_name': agent_name,
+            'task_name': task.restaurant_name,
+            'assigned_at': datetime.now().isoformat()
+        })
     
     emit('task:assigned_ack', {
         'id': task_id,
@@ -2546,6 +2647,15 @@ def handle_task_accepted(data):
             # PROXIMITY BROADCAST: Clean up tracking after acceptance
             if PROXIMITY_BROADCAST_ENABLED:
                 handle_proximity_acceptance(task_id, str(agent_id), agent_name, dashboard_url)
+            
+            # Broadcast acceptance to ALL clients (debug pages, etc.)
+            socketio.emit('task:accepted', {
+                'id': task_id,
+                'agent_id': agent_id,
+                'agent_name': agent_name,
+                'task_name': task.restaurant_name,
+                'accepted_at': datetime.now().isoformat()
+            })
     
     emit('task:accepted_ack', {
         'id': task_id,
@@ -2989,11 +3099,13 @@ def get_fleet_agents():
                 'lng': agent.projected_location.lng
             },
             'current_tasks': len(agent.current_tasks),
+            'max_capacity': agent.max_capacity,  # Individual agent's max tasks
             'capacity': f"{len(agent.current_tasks)}/{agent.max_capacity}",
             'has_capacity': agent.has_capacity,
             'is_idle': agent.is_idle,
             'tags': agent.tags,
             'wallet_balance': agent.wallet_balance,
+            'priority': agent.priority,
             'last_update': agent.last_updated.isoformat()
         })
     
@@ -3029,16 +3141,24 @@ def get_fleet_tasks():
             'delivery_before': task.delivery_before.isoformat(),
             'urgency_score': task.urgency_score(),
             'is_urgent': task.is_urgent,
-            'is_overdue': task.is_overdue
+            'is_overdue': task.is_overdue,
+            'delivery_fee': task.delivery_fee,
+            'tips': task.tips,
+            'is_premium': task.is_premium_task,
+            'payment_method': task.payment_method,
+            'declined_by': list(task.declined_by) if task.declined_by else []
         })
     
     # Sort by urgency
     unassigned.sort(key=lambda t: t['urgency_score'], reverse=True)
     
+    declined_count = len([t for t in unassigned if t['declined_by']])
+    
     return jsonify({
         'unassigned_count': len(unassigned),
         'urgent_count': len([t for t in unassigned if t['is_urgent']]),
         'overdue_count': len([t for t in unassigned if t['is_overdue']]),
+        'declined_count': declined_count,
         'tasks': unassigned
     }), 200
 
