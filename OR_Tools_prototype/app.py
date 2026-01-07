@@ -1454,10 +1454,14 @@ def handle_fleet_sync(data):
             if 'wallet_threshold' in config:
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
             
-            # Proximity broadcast settings
-            if 'proximity_broadcast_enabled' in config or 'proximity_task_timeout_seconds' in config:
-                update_proximity_broadcast_settings(config)
-                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'}, timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s")
+            # Proximity broadcast settings - ONLY update timeout/radius, NOT the mode
+            # Mode should only change via explicit config:update to prevent sync from resetting user's toggle
+            if 'proximity_task_timeout_seconds' in config or 'proximity_default_radius_km' in config:
+                # Filter out proximity_broadcast_enabled to preserve current mode during sync
+                safe_config = {k: v for k, v in config.items() if k != 'proximity_broadcast_enabled'}
+                if safe_config:
+                    update_proximity_broadcast_settings(safe_config)
+                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'} (preserved), timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s")
             
             print(f"[FleetState] Applied config: max_dist={fleet_state.max_distance_km}km, chain_lookahead={fleet_state.chain_lookahead_radius_km}km, capacity={fleet_state.default_max_capacity}, wallet={fleet_state.wallet_threshold}")
         
