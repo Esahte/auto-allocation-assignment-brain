@@ -2449,16 +2449,20 @@ def handle_task_updated(data):
                 
                 # Clear the assignment on the task
                 existing_task.assigned_agent_id = None
-                existing_task.status = TaskStatus.UNASSIGNED
                 changes.append(f'status:{new_status}')
                 status_changed_to_unassigned = True
-                
-                # IMPORTANT: If admin explicitly sets status to "Unassigned", clear declined_by
-                # This unblocks the task for proximity broadcast - admin is resetting it
-                if existing_task.declined_by:
-                    print(f"[FleetState] Clearing declined_by for {existing_task.restaurant_name} (admin reset to Unassigned)")
-                    existing_task.declined_by = set()
-                    changes.append('declined_by_cleared')
+            
+            # Always update status to unassigned (even if it was already unassigned)
+            existing_task.status = TaskStatus.UNASSIGNED
+            
+            # IMPORTANT: If admin explicitly sets status to "Unassigned", clear declined_by
+            # This unblocks the task for proximity broadcast - admin is resetting it
+            # This runs REGARDLESS of whether task had a previous assignment
+            if existing_task.declined_by:
+                print(f"[FleetState] 🔓 Clearing declined_by for {existing_task.restaurant_name} (admin reset to {new_status})")
+                existing_task.declined_by = set()
+                changes.append('declined_by_cleared')
+                status_changed_to_unassigned = True
         
         # Check if task is being reassigned to a different agent
         elif new_assigned_agent and str(new_assigned_agent) != str(old_assigned_agent or ''):
