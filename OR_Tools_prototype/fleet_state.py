@@ -857,6 +857,11 @@ class FleetState:
                     else:
                         incoming_declined_by.add(str(d))
             
+            # IMPORTANT: If dashboard explicitly sends status="Unassigned" (admin reset),
+            # treat this as clearing declined_by - admin wants to reset the task
+            dashboard_status = task_data.get('status', '').lower() if task_data.get('status') else None
+            admin_reset_to_unassigned = (dashboard_status in ['unassigned'] and not assigned_agent)
+            
             if task_id in self._tasks:
                 # Update existing
                 task = self._tasks[task_id]
@@ -893,9 +898,13 @@ class FleetState:
                 task.meta = task_data.get('_meta', task.meta)
                 task.last_updated = datetime.now(timezone.utc)
                 
-                # MERGE declined_by: Keep existing local declines AND add any from dashboard
-                # This ensures we never lose decline history regardless of source
-                if incoming_declined_by:
+                # Handle declined_by based on whether this is an admin reset
+                if admin_reset_to_unassigned and task.declined_by:
+                    # Admin explicitly set status to "Unassigned" - clear declined_by to unblock task
+                    logger.info(f"[FleetState] 🔓 Admin reset task {task_id[:20]}... to Unassigned - clearing declined_by (was {len(task.declined_by)} agents)")
+                    task.declined_by = set()
+                elif incoming_declined_by:
+                    # MERGE declined_by: Keep existing local declines AND add any from dashboard
                     old_count = len(task.declined_by)
                     task.declined_by.update(incoming_declined_by)
                     if len(task.declined_by) > old_count:
@@ -928,7 +937,11 @@ class FleetState:
                         elif len(agent.current_tasks) > 0:
                             agent.status = AgentStatus.BUSY
             else:
-                # Create new
+                # Create new - if admin reset to unassigned, don't include declined_by
+                task_declined_by = set() if admin_reset_to_unassigned else incoming_declined_by
+                if admin_reset_to_unassigned and incoming_declined_by:
+                    logger.info(f"[FleetState] 🔓 New task {task_id[:20]}... with status=Unassigned - ignoring {len(incoming_declined_by)} declines (admin reset)")
+                
                 task = TaskState(
                     id=task_id,
                     job_type=task_data.get('job_type', 'PAIRED'),
@@ -945,7 +958,7 @@ class FleetState:
                     tips=tips,
                     max_distance_km=max_distance_km,
                     meta=task_data.get('_meta', {}),
-                    declined_by=incoming_declined_by  # Include any dashboard-provided declines
+                    declined_by=task_declined_by
                 )
                 self._tasks[task_id] = task
                 # Log premium task info for debugging
