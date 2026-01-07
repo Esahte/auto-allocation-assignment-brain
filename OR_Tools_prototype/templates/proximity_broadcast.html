@@ -307,6 +307,7 @@
         .log-entry.success .log-message { color: var(--accent-green); }
         .log-entry.warning .log-message { color: var(--accent-orange); }
         .log-entry.error .log-message { color: var(--accent-red); }
+        .log-entry.info .log-message { color: var(--accent-cyan); }
         
         /* Config Panel */
         .config-panel {
@@ -632,14 +633,21 @@
             fetchData();
         });
         
-        // Task completed - refresh data (task no longer in unassigned list)
+        // Pickup completed - agent picked up food, now delivering
+        socket.on('pickup:completed', (data) => {
+            const restaurant = data.restaurant_name || 'Unknown';
+            addLog('info', `📦 Pickup: ${restaurant} by ${data.agent_name} (now delivering)`);
+            // Don't remove from tracking - task still in progress
+        });
+        
+        // Task (delivery) completed - refresh data (task no longer in unassigned list)
         socket.on('task:completed', (data) => {
             // Task is fully done - remove from all tracking
             activeBroadcasts.delete(data.id);
             autoTriggeredTasks.delete(data.id);
             waitingForAgents.delete(data.id);
             declinedTasks.delete(data.id);
-            addLog('success', `🏁 Task completed by ${data.agent_name}`);
+            addLog('success', `🏁 Delivery completed by ${data.agent_name}`);
             fetchData();  // Refresh to get updated task list
         });
         

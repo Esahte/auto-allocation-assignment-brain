@@ -524,12 +524,10 @@ def trigger_proximity_broadcast(
         'dashboard_url': dashboard_url
     }
     
-    # Emit to all connected clients (explicit namespace for GCP compatibility)
-    socketio.emit('task:proximity', proximity_payload, namespace='/')
+    socketio.emit('task:proximity', proximity_payload)
     
     agent_names = [a['agent_name'] for a in feasible_agents]
     log_event(f"[ProximityBroadcast] 📡 {task.restaurant_name} → {len(feasible_agents)} agents: {agent_names} (radius: {search_radius}km)")
-    log_event(f"[ProximityBroadcast] 📤 Emitted task:proximity for {task.id[:20]}... to all clients")
     
     return {
         'success': True,
@@ -1861,18 +1859,8 @@ def handle_task_created(data):
                 'tips': task.tips,
                 'is_premium': task.is_premium_task,
                 'message': 'Task awaiting proximity trigger'
-            }, namespace='/')
+            })
             print(f"[ProximityBroadcast] 📋 New task available: {task.restaurant_name} - awaiting proximity trigger (fleet optimization SKIPPED)")
-            
-            # IMMEDIATELY trigger proximity broadcast so it shows in Active Broadcasts
-            # This finds any agents already near the task and emits task:proximity
-            dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
-            trigger_proximity_broadcast(
-                task_id=task_id,
-                triggered_by_agent="task_created",
-                dashboard_url=dashboard_url,
-                force=True  # Force broadcast even if no new agents
-            )
             
             emit('task:created_ack', {
                 'id': task_id,
@@ -2205,9 +2193,11 @@ def handle_task_completed(data):
         log_event(f"[WebSocket] task:pickup_completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
         
         # Just mark pickup as complete - DON'T remove task from agent
+        restaurant_name = None
         if FLEET_STATE_AVAILABLE and fleet_state and task_id:
             task = fleet_state.mark_pickup_complete(str(task_id))
             if task:
+                restaurant_name = task.restaurant_name
                 print(f"[FleetState] Pickup completed: {task.restaurant_name} (agent still busy with delivery)")
         
         emit('task:completed_ack', {
@@ -2216,6 +2206,15 @@ def handle_task_completed(data):
             'received_at': datetime.now().isoformat(),
             'task_removed': False,
             'pickup_completed': True
+        })
+        
+        # Broadcast pickup completion to all clients
+        socketio.emit('pickup:completed', {
+            'id': task_id,
+            'agent_id': agent_id,
+            'agent_name': agent_name,
+            'restaurant_name': restaurant_name,
+            'completed_at': datetime.now(timezone.utc).isoformat()
         })
     else:
         log_event(f"[WebSocket] task:completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
@@ -2588,18 +2587,13 @@ def handle_task_updated(data):
         if PROXIMITY_BROADCAST_ENABLED:
             # Use proximity broadcast instead of fleet optimization
             app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} updated - triggering proximity broadcast")
-            trigger_proximity_broadcast(
-                task_id=task_id,
-                triggered_by_agent="task_updated",
-                dashboard_url=dashboard_url,
-                force=True
-            )
+            trigger_proximity_broadcast(task_id, force=True)
         else:
-            # Use debounced optimization (same safety nets as task:created, task:declined)
-            trigger_debounced_optimization(
-                trigger_type=f'task:updated:{optimization_reason}',
-                dashboard_url=dashboard_url
-            )
+        # Use debounced optimization (same safety nets as task:created, task:declined)
+        trigger_debounced_optimization(
+            trigger_type=f'task:updated:{optimization_reason}',
+            dashboard_url=dashboard_url
+        )
 
 @socketio.on('task:assigned')
 def handle_task_assigned(data):
