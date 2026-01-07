@@ -2577,7 +2577,7 @@ def handle_task_updated(data):
         should_optimize = True
         optimization_reason = f'fields_changed:{",".join(changed_routing_fields)}'
     
-    # Emit acknowledgment
+    # Emit acknowledgment to sender
     emit('task:updated_ack', {
         'id': task_id,
         'success': True,
@@ -2586,6 +2586,26 @@ def handle_task_updated(data):
         'triggered_optimization': should_optimize,
         'received_at': datetime.now().isoformat()
     })
+    
+    # Broadcast to ALL clients (debug dashboards) so they can update
+    socketio.emit('task:updated', {
+        'id': task_id,
+        'restaurant_name': restaurant_name,
+        'changes': changes,
+        'declined_by': list(existing_task.declined_by) if existing_task.declined_by else [],
+        'status': existing_task.status.value if hasattr(existing_task.status, 'value') else str(existing_task.status),
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # If declined_by was cleared, emit unblocked event for debug dashboards
+    if 'declined_by' in changes and len(existing_task.declined_by) == 0:
+        app.logger.info(f"[ProximityBroadcast] Task {restaurant_name} unblocked - declined_by cleared")
+        socketio.emit('task:unblocked', {
+            'task_id': task_id,
+            'restaurant_name': restaurant_name,
+            'reason': 'declined_by_cleared',
+            'timestamp': datetime.now().isoformat()
+        })
     
     # Trigger optimization with all safety nets (debouncing, sync lock, global lock)
     if should_optimize:

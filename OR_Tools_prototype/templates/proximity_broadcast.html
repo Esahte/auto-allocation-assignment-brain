@@ -690,6 +690,33 @@
             fetchData();  // Refresh to get updated task list
         });
         
+        // Task updated - check if it was unblocked (declined_by cleared)
+        socket.on('task:updated', (data) => {
+            const taskId = data.id || data.task_id;
+            const changes = data.changes || [];
+            
+            // If declined_by was cleared, remove from blocked tasks
+            if (changes.includes('declined_by') && (!data.declined_by || data.declined_by.length === 0)) {
+                if (declinedTasks.has(taskId)) {
+                    declinedTasks.delete(taskId);
+                    addLog('success', `🔓 ${data.restaurant_name} unblocked - declined_by cleared`);
+                }
+            }
+            
+            updateAllUI();
+            fetchData();  // Refresh to get updated task data
+        });
+        
+        // Task unblocked - remove from declined/blocked tracking
+        socket.on('task:unblocked', (data) => {
+            const taskId = data.task_id || data.id;
+            declinedTasks.delete(taskId);
+            waitingForAgents.delete(taskId);
+            addLog('success', `🔓 ${data.restaurant_name} unblocked (${data.reason})`);
+            updateAllUI();
+            fetchData();
+        });
+        
         // Task accepted - remove from active broadcasts (proximity mode)
         socket.on('task:accepted', (data) => {
             const taskId = data.id || data.task_id;
