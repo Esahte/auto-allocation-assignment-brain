@@ -857,10 +857,28 @@ class FleetState:
                     else:
                         incoming_declined_by.add(str(d))
             
-            # IMPORTANT: If dashboard explicitly sends status="Unassigned" (admin reset),
-            # treat this as clearing declined_by - admin wants to reset the task
+            # IMPORTANT: Determine if this is an "admin reset" scenario where
+            # we should clear declined_by to unblock the task:
+            # 
+            # If a task is in dashboard's unassigned_tasks array, it means admin
+            # considers it available for assignment. If it has declined_by populated,
+            # clear it - the admin is explicitly making it available again.
+            #
+            # This handles the case where admin changes status from "Declined" to 
+            # "Unassigned" but the dashboard doesn't clear declined_by in the payload.
+            
             dashboard_status = task_data.get('status', '').lower() if task_data.get('status') else None
-            admin_reset_to_unassigned = (dashboard_status in ['unassigned'] and not assigned_agent)
+            
+            # Check if task is explicitly in dashboard's unassigned_tasks array
+            task_in_unassigned_array = task_id in self._dashboard_unassigned_tasks
+            
+            # Admin reset if task is in unassigned_tasks AND has declines to clear
+            # (if task is in in_progress_tasks, don't touch declined_by)
+            admin_reset_to_unassigned = (
+                task_in_unassigned_array 
+                and not assigned_agent 
+                and incoming_declined_by  # Only matters if there are declines
+            )
             
             if task_id in self._tasks:
                 # Update existing
