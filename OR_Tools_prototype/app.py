@@ -2454,7 +2454,11 @@ def handle_task_updated(data):
                 existing_task.declined_by = set()
                 changes.append('declined_by_cleared')
                 status_changed_to_unassigned = True
-                declined_by_cleared_by_admin = True  # CRITICAL: Don't let field update below re-add declines!
+            
+            # CRITICAL: Always block declined_by field updates when status is "unassigned"
+            # This prevents the SECOND update (delivery job) from re-adding declines
+            # after the FIRST update (pickup job) already cleared them
+            declined_by_cleared_by_admin = True
         
         # Check if task is being reassigned to a different agent
         elif new_assigned_agent and str(new_assigned_agent) != str(old_assigned_agent or ''):
