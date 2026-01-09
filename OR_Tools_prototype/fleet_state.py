@@ -572,9 +572,20 @@ class FleetState:
             agent.current_tasks = []
             
             for t in tasks:
-                # Parse locations
-                restaurant_loc = t.get('restaurant_location', [0, 0])
-                delivery_loc = t.get('delivery_location', [0, 0])
+                # Parse locations with validation
+                restaurant_loc = t.get('restaurant_location') or [0, 0]
+                delivery_loc = t.get('delivery_location') or [0, 0]
+                
+                # Validate location values
+                if not isinstance(restaurant_loc, (list, tuple)) or len(restaurant_loc) < 2:
+                    restaurant_loc = [0, 0]
+                if restaurant_loc[0] is None or restaurant_loc[1] is None:
+                    restaurant_loc = [0, 0]
+                
+                if not isinstance(delivery_loc, (list, tuple)) or len(delivery_loc) < 2:
+                    delivery_loc = [0, 0]
+                if delivery_loc[0] is None or delivery_loc[1] is None:
+                    delivery_loc = [0, 0]
                 
                 # Parse times
                 pickup_before = t.get('pickup_before')
@@ -817,9 +828,22 @@ class FleetState:
             # Convert task_id to string for consistent lookup
             task_id = str(task_data.get('id', ''))
             
-            # Parse locations
-            restaurant_loc = task_data.get('restaurant_location', [0, 0])
-            delivery_loc = task_data.get('delivery_location', [0, 0])
+            # Parse locations with validation
+            restaurant_loc = task_data.get('restaurant_location') or [0, 0]
+            delivery_loc = task_data.get('delivery_location') or [0, 0]
+            
+            # Validate location values - ensure they're valid numbers
+            if not isinstance(restaurant_loc, (list, tuple)) or len(restaurant_loc) < 2:
+                restaurant_loc = [0, 0]
+            if restaurant_loc[0] is None or restaurant_loc[1] is None:
+                logger.warning(f"[FleetState] Task {task_id} has None in restaurant_location: {restaurant_loc}")
+                restaurant_loc = [0, 0]
+            
+            if not isinstance(delivery_loc, (list, tuple)) or len(delivery_loc) < 2:
+                delivery_loc = [0, 0]
+            if delivery_loc[0] is None or delivery_loc[1] is None:
+                logger.warning(f"[FleetState] Task {task_id} has None in delivery_location: {delivery_loc}")
+                delivery_loc = [0, 0]
             
             # Parse times
             pickup_before = task_data.get('pickup_before')
@@ -1130,6 +1154,10 @@ class FleetState:
     def clear_task_expanded_radius(self, task_id: str):
         """Clear expanded radius when task is assigned/completed."""
         self._task_expanded_radii.pop(task_id, None)
+    
+    def get_task_expanded_radius(self, task_id: str) -> Optional[float]:
+        """Get the expanded radius for a task (if set), or None if using default."""
+        return self._task_expanded_radii.get(task_id)
     
     def _check_proximity_triggers(self, agent: AgentState) -> List[ProximityTrigger]:
         """

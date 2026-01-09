@@ -271,6 +271,28 @@
             color: var(--accent-purple);
         }
         
+        /* Batch Badge */
+        .batch-badge {
+            font-size: 0.7rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: linear-gradient(135deg, rgba(255, 193, 7, 0.3), rgba(255, 152, 0, 0.3));
+            color: #ffc107;
+            font-weight: 600;
+            margin-right: 8px;
+            animation: pulse-batch 2s ease-in-out infinite;
+        }
+        
+        @keyframes pulse-batch {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        .broadcast-item.batched {
+            background: rgba(255, 193, 7, 0.08);
+            border-left: 3px solid #ffc107;
+        }
+        
         /* Blocked Task Item */
         .blocked-item {
             padding: 10px 14px;
@@ -369,6 +391,13 @@
             font-size: 0.85rem;
         }
         
+        .empty-state.warning {
+            color: var(--accent-orange);
+            background: rgba(210, 153, 34, 0.1);
+            border: 1px dashed var(--accent-orange);
+            border-radius: 4px;
+        }
+        
         .section-divider {
             grid-column: 1 / -1;
             padding: 10px 0;
@@ -386,6 +415,7 @@
         <div style="display: flex; gap: 12px; align-items: center;">
             <span class="status-badge" id="modeBadge">LOADING</span>
             <span class="status-badge" id="connectionBadge">Connecting...</span>
+            <button class="btn btn-primary" onclick="requestSync()" title="Request full state sync from main dashboard">🔄 Sync</button>
         </div>
     </div>
     
@@ -497,6 +527,10 @@
                 <label>Default Radius (km)</label>
                 <input type="number" id="radiusInput" value="3.0" min="0.5" max="10" step="0.5">
             </div>
+            <div class="config-item">
+                <label>Max Broadcasts/Agent</label>
+                <input type="number" id="maxBroadcastsInput" value="3" min="1" max="10" step="1" title="Max times a task can be broadcast to the same agent">
+            </div>
             <div class="config-item" style="justify-content: flex-end;">
                 <button class="btn btn-primary" onclick="applySettings()">Apply Settings</button>
             </div>
@@ -504,7 +538,13 @@
     </div>
     
     <script>
-        const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
+        const socket = io(window.location.origin, { 
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000
+        });
         
         // State
         let agents = [];
@@ -520,15 +560,21 @@
         let broadcastEnabled = true;
         let taskTimeout = 120;
         let defaultRadius = 3.0;
+        let maxBroadcastsPerAgent = 3;
+        
+        // Stale data detection
+        let lastDataReceived = Date.now();
+        let staleDataWarningShown = false;
         
         // Fetch initial data
         async function fetchData() {
             try {
-                const [agentsRes, tasksRes, proximityRes, configRes] = await Promise.all([
+                const [agentsRes, tasksRes, proximityRes, configRes, healthRes] = await Promise.all([
                     fetch('/fleet-state/agents'),
                     fetch('/fleet-state/tasks'),
                     fetch('/fleet-state/proximity'),
-                    fetch('/fleet-state/config')
+                    fetch('/fleet-state/config'),
+                    fetch('/fleet-state/health')
                 ]);
                 
                 agents = (await agentsRes.json()).agents || [];
@@ -541,6 +587,29 @@
                 broadcastEnabled = config.proximity_broadcast_enabled ?? true;
                 taskTimeout = config.proximity_task_timeout_seconds || 120;
                 defaultRadius = config.proximity_default_radius_km || 3.0;
+                maxBroadcastsPerAgent = config.proximity_max_broadcasts_per_agent || 3;
+                
+                // Check health for stale data warning (event-driven, so only warn if no events for 5+ min)
+                const health = await healthRes.json();
+                if (health.warning && !staleDataWarningShown) {
+                    addLog('warning', `⚠️ ${health.warning}`);
+                    staleDataWarningShown = true;
+                }
+                
+                // Check if state is empty (only warn once)
+                if (agents.length === 0 && tasks.length === 0 && !staleDataWarningShown) {
+                    addLog('warning', '⚠️ Fleet state is EMPTY - click Sync button');
+                    staleDataWarningShown = true;
+                } else if (agents.length > 0 || tasks.length > 0) {
+                    // We have data, update last received time
+                    if (health.last_event_time) {
+                        lastDataReceived = Date.now();
+                    }
+                    // Only reset warning if we're getting fresh events
+                    if (health.seconds_since_last_event && health.seconds_since_last_event < 300) {
+                        staleDataWarningShown = false;
+                    }
+                }
                 
                 updateAllUI();
             } catch (e) {
@@ -552,17 +621,58 @@
             document.getElementById('connectionBadge').textContent = 'Connected';
             document.getElementById('connectionBadge').className = 'status-badge connected';
             addLog('system', 'Connected to OR-Tools server');
+            staleDataWarningShown = false;
             fetchData();
         });
         
         socket.on('disconnect', () => {
-            document.getElementById('connectionBadge').textContent = 'Disconnected';
+            document.getElementById('connectionBadge').textContent = 'Reconnecting...';
             document.getElementById('connectionBadge').className = 'status-badge disconnected';
-            addLog('error', 'Disconnected from server');
+            addLog('error', 'Disconnected - attempting to reconnect');
         });
+        
+        socket.on('reconnect', (attemptNumber) => {
+            addLog('system', `Reconnected after ${attemptNumber} attempts`);
+            fetchData();
+        });
+        
+        socket.on('reconnect_attempt', (attemptNumber) => {
+            document.getElementById('connectionBadge').textContent = `Retry ${attemptNumber}...`;
+        });
+        
+        // Request sync from main dashboard
+        function requestSync() {
+            addLog('system', '🔄 Requesting sync from main dashboard...');
+            socket.emit('debug:request_sync', { 
+                source: 'proximity_broadcast',
+                timestamp: new Date().toISOString()
+            });
+            fetchData();
+        }
+        
+        // Listen for sync acknowledgments
+        socket.on('fleet:sync_ack', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
+            if (data.success) {
+                addLog('success', `✅ Sync: ${data.synced?.agents || 0} agents, ${data.synced?.unassigned_tasks || 0} tasks`);
+            }
+            fetchData();
+        });
+        
+        // Check for stale data (5 min threshold for event-driven system)
+        setInterval(() => {
+            const timeSinceLastUpdate = Date.now() - lastDataReceived;
+            if (timeSinceLastUpdate > 300000 && !staleDataWarningShown) {  // 5 minutes
+                addLog('warning', '⚠️ No events in 5+ min - connection may be broken');
+                staleDataWarningShown = true;
+            }
+        }, 30000);
         
         // Listen for fleet updates (includes task assignments from fleet optimizer)
         socket.on('fleet:routes_updated', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
             // Check if any tasks were assigned and remove from activeBroadcasts
             if (data && data.agent_routes) {
                 data.agent_routes.forEach(route => {
@@ -587,26 +697,85 @@
         
         // New task created - refresh data
         socket.on('task:created', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
             addLog('system', `📋 New task: ${data.restaurant_name} ${data.is_premium ? '⭐' : ''}`);
             fetchData();  // Refresh to get updated task list
         });
         
         // Fleet state updated (sync or other changes) - refresh data
         socket.on('fleet:state_updated', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
             addLog('system', `🔄 Fleet sync: ${data.agents} agents, ${data.unassigned_tasks} tasks`);
             fetchData();  // Refresh to get updated fleet state
         });
         
+        // Agent status changed (online/offline) - update UI immediately
+        socket.on('agent:status_changed', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
+            const agentId = data.agent_id;
+            const status = data.status;
+            const name = data.name || 'Unknown';
+            
+            if (status === 'offline') {
+                // Remove agent from local list
+                agents = agents.filter(a => String(a.id) !== String(agentId));
+                addLog('warning', `🔴 Agent offline: ${name}`);
+            } else if (status === 'online') {
+                // Add/update agent in local list
+                const existingIdx = agents.findIndex(a => String(a.id) === String(agentId));
+                const newAgent = {
+                    id: agentId,
+                    name: name,
+                    location: data.location,
+                    max_capacity: data.max_capacity || 2,
+                    current_tasks: data.current_tasks || 0,
+                    tags: data.tags || [],
+                    priority: data.priority,
+                    is_online: true
+                };
+                if (existingIdx >= 0) {
+                    agents[existingIdx] = newAgent;
+                } else {
+                    agents.push(newAgent);
+                }
+                addLog('success', `🟢 Agent online: ${name}${data.priority ? ' ⭐' : ''}`);
+            }
+            
+            updateAllUI();  // Refresh the agent list display
+        });
+        
         // Listen for proximity broadcasts
         socket.on('task:proximity', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
             const task = data.task || {};
             const feasibleAgents = data.feasible_agents || [];
             
             // Clear auto-triggered flag so task can timeout again if needed
             autoTriggeredTasks.delete(task.id);
             
+            // Check if this is part of a batch
+            const isBatched = data.is_batched || false;
+            const batchSize = data.batch_size || 1;
+            const batchedWith = feasibleAgents[0]?.batched_with || 0;
+            
             // Only add to activeBroadcasts if there are agents to broadcast to
             if (feasibleAgents.length > 0) {
+                // Check if this is a RE-BROADCAST (task already in activeBroadcasts)
+                const isReBroadcast = activeBroadcasts.has(task.id);
+                
+                // For re-broadcasts, reset timer to NOW (not backend's first_offered_at)
+                // This ensures timer restarts when new broadcasts happen (timeout or agent movement)
+                const timerStart = isReBroadcast ? (Date.now() / 1000) : data.first_offered_at;
+                
+                // Clear auto-triggered flag so task can timeout again
+                if (isReBroadcast) {
+                    autoTriggeredTasks.delete(task.id);
+                }
+                
                 activeBroadcasts.set(task.id, {
                     task_id: task.id,
                     task_name: task.restaurant_name,
@@ -617,18 +786,28 @@
                     is_premium: task.is_premium,
                     agents: feasibleAgents,
                     competition: data.competition || feasibleAgents.length,
-                    first_offered_at: data.first_offered_at,
+                    first_offered_at: timerStart,
                     timeout_seconds: data.timeout_seconds || taskTimeout,
                     search_radius_km: data.search_radius_km || defaultRadius,
                     triggered_by: data.triggered_by,
-                    timestamp: data.timestamp
+                    timestamp: data.timestamp,
+                    is_batched: isBatched,
+                    batch_size: batchSize,
+                    batched_with: batchedWith
                 });
                 // Remove from waiting since agents found
                 waitingForAgents.delete(task.id);
-                addLog('broadcast', `📡 ${task.restaurant_name} → ${feasibleAgents.length} agents (radius: ${data.search_radius_km}km)`);
+                
+                // Log with batch indicator if applicable
+                if (isBatched && batchSize > 1) {
+                    addLog('broadcast', `📦 ${task.restaurant_name} → ${feasibleAgents[0]?.agent_name} (BATCHED with ${batchedWith} others)`);
+                } else {
+                    addLog('broadcast', `📡 ${task.restaurant_name} → ${feasibleAgents.length} agents (radius: ${data.search_radius_km}km)`);
+                }
             } else {
-                // No agents found - remove from active broadcasts and track as waiting
+                // No agents found - remove from active broadcasts and track as waiting (blocked)
                 activeBroadcasts.delete(task.id);
+                autoTriggeredTasks.delete(task.id);  // Clear flag so it can be re-triggered later
                 waitingForAgents.set(task.id, {
                     task_id: task.id,
                     task_name: task.restaurant_name,
@@ -636,14 +815,35 @@
                     last_checked: Date.now(),
                     triggered_by: data.triggered_by
                 });
-                addLog('warning', `⏳ ${task.restaurant_name} - no agents in ${data.search_radius_km}km radius, waiting...`);
+                addLog('warning', `⚠️ ${task.restaurant_name} → BLOCKED (no agents in ${data.search_radius_km}km)`);
+                updateAllUI();  // Immediately update UI to show in blocked section
             }
             
             fetchData(); // Refresh to get updated proximity triggers
         });
         
+        // Listen for BATCHED proximity broadcasts (multiple tasks to one agent)
+        socket.on('proximity:batched_broadcast', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
+            const agent = data.agent || {};
+            const tasks = data.tasks || [];
+            const taskCount = data.task_count || tasks.length;
+            
+            if (tasks.length > 0) {
+                const taskNames = tasks.map(t => t.restaurant_name).join(', ');
+                addLog('broadcast', `📦 BATCHED: ${agent.name} can do ${taskCount} tasks: ${taskNames}`);
+            }
+            
+            // Note: Individual task:proximity events are also emitted for backward compatibility
+            // so we don't need to manually update activeBroadcasts here
+            updateAllUI();
+        });
+        
         // Task assigned - remove from active broadcasts
         socket.on('task:assigned', (data) => {
+            lastDataReceived = Date.now();
+            staleDataWarningShown = false;
             const taskId = data.id || data.task_id;
             console.log('[DEBUG] task:assigned received:', taskId, 'activeBroadcasts has:', activeBroadcasts.has(taskId));
             
@@ -759,8 +959,9 @@
                 broadcastEnabled = data.config_applied.proximity_broadcast_enabled ?? broadcastEnabled;
                 taskTimeout = data.config_applied.proximity_task_timeout_seconds ?? taskTimeout;
                 defaultRadius = data.config_applied.proximity_default_radius_km ?? defaultRadius;
+                maxBroadcastsPerAgent = data.config_applied.proximity_max_broadcasts_per_agent ?? maxBroadcastsPerAgent;
                 updateSettingsUI();
-                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, timeout=${taskTimeout}s, radius=${defaultRadius}km`);
+                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, timeout=${taskTimeout}s, radius=${defaultRadius}km, maxBcast=${maxBroadcastsPerAgent}`);
             } else if (!data.success) {
                 addLog('error', `❌ Settings update failed: ${data.error}`);
             }
@@ -768,18 +969,83 @@
         
         // Timeout/expand results
         socket.on('proximity:timeout_result', (data) => {
-            if (data.success) {
-                addLog('warning', `⏰ Task timeout - re-broadcast to ${data.broadcast_count} agents`);
+            const taskId = data.task_id;
+            const broadcastCount = data.broadcast_count || 0;
+            
+            if (data.success && broadcastCount > 0) {
+                // Agents found after timeout - reset timer and allow future timeouts
+                addLog('warning', `⏰ Task timeout - re-broadcast to ${broadcastCount} agents`);
+                const broadcast = activeBroadcasts.get(taskId);
+                if (broadcast) {
+                    broadcast.first_offered_at = Date.now() / 1000;  // Reset timer
+                    autoTriggeredTasks.delete(taskId);  // Allow future auto-triggers
+                    addLog('broadcast', `🔄 ${broadcast.task_name} re-broadcast to ${broadcastCount} agents (timer reset)`);
+                    updateAllUI();
+                }
             } else {
-                addLog('error', `⏰ Timeout failed: ${data.error}`);
+                // NO agents found OR timeout failed - move to blocked
+                // This handles: success=true+count=0, success=false (capacity, no agents, etc.)
+                const broadcast = activeBroadcasts.get(taskId);
+                if (broadcast && taskId) {
+                    const reason = data.error || 'no agents available';
+                    addLog('warning', `⏰ Timeout: ${broadcast.task_name} → BLOCKED (${reason})`);
+                    
+                    // Move to waiting for agents (blocked)
+                    waitingForAgents.set(taskId, {
+                        task_id: taskId,
+                        task_name: broadcast.task_name,
+                        search_radius_km: broadcast.search_radius_km || defaultRadius,
+                        last_checked: Date.now(),
+                        triggered_by: 'timeout',
+                        block_reason: reason
+                    });
+                    activeBroadcasts.delete(taskId);
+                    autoTriggeredTasks.delete(taskId);
+                    updateAllUI();
+                } else if (!taskId) {
+                    addLog('error', `⏰ Timeout failed: no task_id in response`);
+                }
             }
         });
         
         socket.on('proximity:expand_result', (data) => {
-            if (data.success) {
-                addLog('broadcast', `📏 Radius expanded to ${data.new_radius_km}km - ${data.broadcast_count} agents`);
+            const taskId = data.task_id;
+            const broadcastCount = data.broadcast_count || 0;
+            const newRadius = data.new_radius_km || defaultRadius;
+            
+            if (data.success && broadcastCount > 0) {
+                // Agents found at expanded radius - update the broadcast's radius and reset timer
+                addLog('broadcast', `📏 Radius expanded to ${newRadius}km - ${broadcastCount} agents`);
+                const broadcast = activeBroadcasts.get(taskId);
+                if (broadcast) {
+                    broadcast.search_radius_km = newRadius;
+                    broadcast.first_offered_at = Date.now() / 1000;  // Reset timer (in seconds)
+                    autoTriggeredTasks.delete(taskId);  // Allow future auto-triggers
+                    updateAllUI();
+                }
             } else {
-                addLog('error', `📏 Expand failed: ${data.error}`);
+                // NO agents found OR expand failed - move to blocked
+                const broadcast = activeBroadcasts.get(taskId);
+                if (broadcast && taskId) {
+                    const reason = data.error || `no agents at ${newRadius}km`;
+                    addLog('warning', `📏 Expand: ${broadcast.task_name} → BLOCKED (${reason})`);
+                    
+                    waitingForAgents.set(taskId, {
+                        task_id: taskId,
+                        task_name: broadcast.task_name,
+                        search_radius_km: newRadius,
+                        last_checked: Date.now(),
+                        triggered_by: 'expand',
+                        block_reason: reason
+                    });
+                    activeBroadcasts.delete(taskId);
+                    autoTriggeredTasks.delete(taskId);
+                    updateAllUI();
+                } else if (!taskId) {
+                    addLog('error', `📏 Expand failed: no task_id in response`);
+                } else {
+                    addLog('error', `📏 Expand failed: ${data.error}`);
+                }
             }
         });
         
@@ -835,7 +1101,7 @@
             document.getElementById('agentCount').textContent = `${agents.length} total`;
             
             if (agents.length === 0) {
-                list.innerHTML = '<div class="empty-state">No agents online</div>';
+                list.innerHTML = '<div class="empty-state warning">⚠️ No agents - click Sync button</div>';
                 return;
             }
             
@@ -936,13 +1202,25 @@
                 const elapsed = now - b.first_offered_at;
                 const remaining = Math.max(0, b.timeout_seconds - elapsed);
                 
+                // Check if this task is part of a batch
+                const isBatched = b.is_batched || false;
+                const batchSize = b.batch_size || 1;
+                const batchedWith = b.batched_with || 0;
+                
+                // Build batch indicator
+                let batchBadge = '';
+                if (isBatched && batchSize > 1) {
+                    batchBadge = `<span class="batch-badge" title="This task is batched with ${batchedWith} other task(s) for efficient routing">📦 BATCHED (${batchSize})</span>`;
+                }
+                
                 return `
-                    <div class="broadcast-item">
+                    <div class="broadcast-item ${isBatched ? 'batched' : ''}">
                         <div class="broadcast-header">
                             <span class="broadcast-task">${b.task_name} → ${b.customer}</span>
                             <span class="timer-display">${Math.floor(remaining)}s</span>
                         </div>
                         <div class="broadcast-meta">
+                            ${batchBadge}
                             ${b.is_premium ? '⭐ PREMIUM | ' : ''}
                             $${b.payment.toFixed(2)} | 
                             <span class="radius-badge">${b.search_radius_km}km</span> |
@@ -950,7 +1228,7 @@
                         </div>
                         <div class="agents-list">
                             ${b.agents.map(a => `
-                                <span class="agent-chip">${a.agent_name} (${a.distance_km}km)</span>
+                                <span class="agent-chip">${a.agent_name} (${a.distance_km}km)${a.batched_with ? ' 📦' : ''}</span>
                             `).join('')}
                         </div>
                         <div style="display: flex; gap: 8px;">
@@ -967,7 +1245,10 @@
             const broadcastingTaskIds = new Set(activeBroadcasts.keys());
             const blocked = tasks.filter(t => !broadcastingTaskIds.has(t.id));
             
-            if (blocked.length === 0 && declinedTasks.size === 0) {
+            // Count total blocked items
+            const totalBlocked = declinedTasks.size + waitingForAgents.size + blocked.filter(t => !declinedTasks.has(t.id) && !waitingForAgents.has(t.id)).length;
+            
+            if (totalBlocked === 0) {
                 list.innerHTML = '<div class="empty-state">All tasks are broadcasting or have eligible agents</div>';
                 return;
             }
@@ -1004,10 +1285,32 @@
                 `;
             });
             
+            // Then show WAITING FOR AGENTS tasks (timeout/expand found no agents)
+            waitingForAgents.forEach((waiting, taskId) => {
+                // Skip if already shown in declined section
+                if (declinedTasks.has(taskId)) return;
+                
+                const reason = waiting.block_reason || waiting.triggered_by || 'No agents found';
+                const radiusInfo = waiting.search_radius_km ? `${waiting.search_radius_km}km radius` : '';
+                
+                html += `
+                    <div class="blocked-item" style="border-left: 3px solid #f59e0b; background: linear-gradient(135deg, rgba(245, 158, 11, 0.1) 0%, rgba(245, 158, 11, 0.05) 100%);">
+                        <div class="task-header">
+                            <span class="task-name">${waiting.task_name}</span>
+                            <span style="background: #f59e0b; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold;">⏳ NO AGENTS</span>
+                        </div>
+                        <div class="task-details">
+                            ${radiusInfo} | Triggered by: ${waiting.triggered_by || 'unknown'}
+                        </div>
+                        <span class="blocked-reason" style="color: #f59e0b;">${reason}</span>
+                    </div>
+                `;
+            });
+            
             // Then show other blocked tasks (might become eligible)
             blocked.forEach(t => {
-                // Skip if already shown in declined section
-                if (declinedTasks.has(t.id)) return;
+                // Skip if already shown in declined or waiting sections
+                if (declinedTasks.has(t.id) || waitingForAgents.has(t.id)) return;
                 
                 // Check if task has declined_by data (was declined before page loaded)
                 const hasDeclines = t.declined_by && t.declined_by.length > 0;
@@ -1054,6 +1357,7 @@
             document.getElementById('modeSelect').value = broadcastEnabled.toString();
             document.getElementById('timeoutInput').value = taskTimeout;
             document.getElementById('radiusInput').value = defaultRadius;
+            document.getElementById('maxBroadcastsInput').value = maxBroadcastsPerAgent;
         }
         
         function applySettings() {
@@ -1062,7 +1366,8 @@
                 config: {
                     proximity_broadcast_enabled: document.getElementById('modeSelect').value === 'true',
                     proximity_task_timeout_seconds: parseInt(document.getElementById('timeoutInput').value),
-                    proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value)
+                    proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value),
+                    proximity_max_broadcasts_per_agent: parseInt(document.getElementById('maxBroadcastsInput').value)
                 },
                 dashboard_url: window.location.origin
             });
