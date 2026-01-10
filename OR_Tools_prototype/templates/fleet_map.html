@@ -205,6 +205,7 @@
         .status-badge.idle { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
         .status-badge.busy { background: rgba(0, 212, 255, 0.15); color: var(--accent-blue); }
         .status-badge.at_capacity { background: rgba(255, 149, 0, 0.15); color: var(--accent-orange); }
+        .status-badge.offline { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
         .status-badge.offline { background: rgba(255, 68, 68, 0.15); color: var(--accent-red); }
         .status-badge.urgent { background: rgba(255, 68, 68, 0.15); color: var(--accent-red); }
         .status-badge.eligible { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
@@ -529,9 +530,12 @@
             const name = data.name || 'Unknown';
             
             if (status === 'offline') {
-                // Remove agent from local data
+                // Mark agent as offline (don't remove - show OFFLINE badge)
                 if (fleetData.agents) {
-                    fleetData.agents = fleetData.agents.filter(a => String(a.id) !== String(agentId));
+                    const existingIdx = fleetData.agents.findIndex(a => String(a.id) === String(agentId));
+                    if (existingIdx >= 0) {
+                        fleetData.agents[existingIdx].is_online = false;
+                    }
                 }
                 addLog('warning', `🔴 Agent offline: ${name}`);
             } else if (status === 'online') {
@@ -549,7 +553,7 @@
                     is_online: true
                 };
                 if (existingIdx >= 0) {
-                    fleetData.agents[existingIdx] = newAgent;
+                    fleetData.agents[existingIdx] = { ...fleetData.agents[existingIdx], ...newAgent };
                 } else {
                     fleetData.agents.push(newAgent);
                 }
@@ -681,9 +685,49 @@
                         <span class="status-badge ${agent.status.toLowerCase()}">${agent.status.toUpperCase()}</span>
                     </div>
                 `).join('');
+                
+                // Store agents in fleetData for status updates
+                fleetData.agents = data.agents;
             } catch (e) {
                 console.error('Failed to refresh agents:', e);
             }
+        }
+        
+        // Update agent list from local fleetData (used by status_changed events)
+        function updateAgentsList() {
+            if (!fleetData.agents || fleetData.agents.length === 0) return;
+            
+            const list = document.getElementById('agentList');
+            const onlineAgents = fleetData.agents.filter(a => a.is_online !== false);
+            document.getElementById('agentCount').textContent = onlineAgents.length;
+            
+            list.innerHTML = fleetData.agents.map(agent => {
+                // Compute status based on is_online flag
+                let status;
+                const isOnline = agent.is_online !== false;
+                if (!isOnline) {
+                    status = 'offline';
+                } else {
+                    status = agent.status || 'idle';
+                }
+                
+                const lat = agent.current_location?.lat || 0;
+                const lng = agent.current_location?.lng || 0;
+                
+                return `
+                    <div class="agent-item">
+                        <div class="agent-info">
+                            <span class="agent-name">${agent.name}</span>
+                            <span class="agent-meta">
+                                ID: ${agent.id} | 
+                                Tasks: ${agent.capacity || '0/2'} | 
+                                Loc: [${lat.toFixed(4)}, ${lng.toFixed(4)}]
+                            </span>
+                        </div>
+                        <span class="status-badge ${status.toLowerCase()}">${status.toUpperCase()}</span>
+                    </div>
+                `;
+            }).join('');
         }
         
         async function refreshTasks() {

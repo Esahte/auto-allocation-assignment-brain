@@ -521,7 +521,11 @@ def get_all_agent_proximity_locations(agent_id: str) -> list:
 
 def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id: str, tolerance_degrees: float = None) -> tuple:
     """
-    Check if a task's direction is compatible with an agent's pending broadcasts.
+    Check if a task's direction is compatible with an agent's CURRENT TASKS and pending broadcasts.
+    
+    This ensures we don't broadcast tasks going in opposite directions to an agent who:
+    1. Already has accepted/assigned tasks going a certain direction
+    2. Has pending broadcasts going a certain direction
     
     Args:
         task_bearing: The bearing of the new task (restaurant → delivery)
@@ -530,36 +534,65 @@ def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id:
     
     Returns:
         (is_compatible: bool, reason: str or None)
-        - If no pending broadcasts, returns (True, None)
-        - If compatible, returns (True, None)
+        - If no current tasks or pending broadcasts, returns (True, None)
+        - If compatible with all, returns (True, None)
         - If not compatible, returns (False, reason_string)
     """
+    import math
+    
     if tolerance_degrees is None:
         tolerance_degrees = PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES
     
+    all_bearings = []
+    
+    # =======================================================================
+    # FIRST: Check against CURRENT TASKS (accepted/assigned tasks)
+    # This is critical - we don't want to send opposite-direction tasks
+    # =======================================================================
+    if fleet_state:
+        agent = fleet_state.get_agent(str(agent_id))
+        if agent and agent.current_tasks:
+            for current_task in agent.current_tasks:
+                try:
+                    current_bearing = get_task_delivery_bearing(current_task)
+                    if current_bearing is not None:
+                        # Check individual compatibility with each current task
+                        diff = angular_difference(task_bearing, current_bearing)
+                        if diff > tolerance_degrees:
+                            return (False, f"conflicts with current task (bearing {round(task_bearing)}° vs {round(current_bearing)}°, diff {round(diff)}°)")
+                        all_bearings.append(current_bearing)
+                except Exception as e:
+                    # Log but don't fail - skip this task's direction check
+                    print(f"[DirectionCheck] Warning: Could not get bearing for current task: {e}")
+    
+    # =======================================================================
+    # SECOND: Check against PENDING BROADCASTS
+    # =======================================================================
     pending_directions = get_agent_pending_directions(agent_id)
+    if pending_directions:
+        for task_id, pending_bearing in pending_directions.items():
+            if pending_bearing is not None:
+                # Check individual compatibility with each pending broadcast
+                diff = angular_difference(task_bearing, pending_bearing)
+                if diff > tolerance_degrees:
+                    return (False, f"bearing {round(task_bearing)}° differs {round(diff)}° from pending broadcast {round(pending_bearing)}°")
+                all_bearings.append(pending_bearing)
     
-    if not pending_directions:
-        return (True, None)  # No pending broadcasts, always compatible
+    # If we have any bearings, also check against the average direction
+    if all_bearings:
+        # Calculate circular mean for all bearings (handles wrap-around at 0/360)
+        sin_sum = sum(math.sin(math.radians(b)) for b in all_bearings)
+        cos_sum = sum(math.cos(math.radians(b)) for b in all_bearings)
+        avg_bearing = math.degrees(math.atan2(sin_sum, cos_sum))
+        avg_bearing = (avg_bearing + 360) % 360
+        
+        # Check if new task is within tolerance of average direction
+        diff = angular_difference(task_bearing, avg_bearing)
+        if diff > tolerance_degrees:
+            source = "current+pending" if pending_directions else "current tasks"
+            return (False, f"bearing {round(task_bearing)}° differs {round(diff)}° from {source} avg {round(avg_bearing)}°")
     
-    # Check against each pending broadcast's direction
-    # Use the average direction of pending broadcasts as reference
-    bearings = list(pending_directions.values())
-    
-    # Calculate circular mean for bearings (handles wrap-around at 0/360)
-    import math
-    sin_sum = sum(math.sin(math.radians(b)) for b in bearings)
-    cos_sum = sum(math.cos(math.radians(b)) for b in bearings)
-    avg_bearing = math.degrees(math.atan2(sin_sum, cos_sum))
-    avg_bearing = (avg_bearing + 360) % 360
-    
-    # Check if new task is within tolerance of average pending direction
-    diff = angular_difference(task_bearing, avg_bearing)
-    
-    if diff <= tolerance_degrees:
-        return (True, None)
-    else:
-        return (False, f"bearing {round(task_bearing)}° differs {round(diff)}° from pending avg {round(avg_bearing)}°")
+    return (True, None)  # Compatible or no existing direction constraints
 
 
 def get_task_broadcast_count_for_agent(task_id: str, agent_id: str) -> int:
@@ -632,11 +665,19 @@ def get_task_delivery_bearing(task) -> float:
     """
     Calculate the bearing from restaurant to delivery for a task.
     This represents the "direction" the task is going.
+    Returns None if locations are missing.
     """
-    return calculate_bearing(
-        task.restaurant_location.lat, task.restaurant_location.lng,
-        task.delivery_location.lat, task.delivery_location.lng
-    )
+    try:
+        if not task or not task.restaurant_location or not task.delivery_location:
+            return None
+        if task.restaurant_location.lat is None or task.delivery_location.lat is None:
+            return None
+        return calculate_bearing(
+            task.restaurant_location.lat, task.restaurant_location.lng,
+            task.delivery_location.lat, task.delivery_location.lng
+        )
+    except (AttributeError, TypeError):
+        return None
 
 
 def angular_difference(bearing1: float, bearing2: float) -> float:
@@ -924,11 +965,11 @@ def trigger_proximity_broadcast(
     
     if agents_incompatible:
         names = [f"{a['agent_name']}({a['reason']})" for a in agents_incompatible]
-        log_event(f"[ProximityBroadcast] 🧭 Skipping {len(agents_incompatible)} agents with incompatible pending direction for {task.restaurant_name}: {names}")
+        log_event(f"[ProximityBroadcast] 🧭 Skipping {len(agents_incompatible)} agents with incompatible direction for {task.restaurant_name}: {names}")
     
     if not agents_compatible:
-        log_event(f"[ProximityBroadcast] ⚠️ All agents have incompatible pending directions for {task.restaurant_name} (bearing {round(task_bearing)}°)")
-        return {'success': False, 'error': 'All agents have incompatible pending directions', 'task_bearing': round(task_bearing), 'agents_incompatible': agents_incompatible, 'radius_km': search_radius}
+        log_event(f"[ProximityBroadcast] ⚠️ All agents have incompatible directions for {task.restaurant_name} (bearing {round(task_bearing)}°)")
+        return {'success': False, 'error': 'All agents have incompatible directions (current tasks or pending)', 'task_bearing': round(task_bearing), 'agents_incompatible': agents_incompatible, 'radius_km': search_radius}
     
     # Filter out agents who already declined this task (Tookan won't push to them)
     agents_not_declined = []
@@ -1294,10 +1335,10 @@ def trigger_batched_proximity_broadcast(
     is_compatible, reason = is_task_directionally_compatible_with_pending(batch_bearing, agent_id)
     
     if not is_compatible:
-        log_event(f"[ProximityBroadcast] 🧭 Batched: {agent_name} has pending broadcasts in different direction. {primary_task.restaurant_name} {reason}")
+        log_event(f"[ProximityBroadcast] 🧭 Batched: {agent_name} has current/pending tasks in different direction. {primary_task.restaurant_name} {reason}")
         return {
             'success': False, 
-            'error': 'Batch incompatible with pending broadcasts',
+            'error': 'Batch incompatible with current tasks or pending broadcasts',
             'agent_id': agent_id,
             'batch_bearing': round(batch_bearing),
             'reason': reason

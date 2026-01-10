@@ -170,6 +170,7 @@
         .agent-status.idle { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
         .agent-status.busy { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
         .agent-status.at-capacity { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+        .agent-status.offline { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
         
         /* Task Item */
         .task-item {
@@ -720,8 +721,11 @@
             const name = data.name || 'Unknown';
             
             if (status === 'offline') {
-                // Remove agent from local list
-                agents = agents.filter(a => String(a.id) !== String(agentId));
+                // Mark agent as offline (don't remove - show OFFLINE badge)
+                const existingIdx = agents.findIndex(a => String(a.id) === String(agentId));
+                if (existingIdx >= 0) {
+                    agents[existingIdx].is_online = false;
+                }
                 addLog('warning', `🔴 Agent offline: ${name}`);
             } else if (status === 'online') {
                 // Add/update agent in local list
@@ -737,7 +741,7 @@
                     is_online: true
                 };
                 if (existingIdx >= 0) {
-                    agents[existingIdx] = newAgent;
+                    agents[existingIdx] = { ...agents[existingIdx], ...newAgent };
                 } else {
                     agents.push(newAgent);
                 }
@@ -1116,8 +1120,23 @@
             list.innerHTML = sorted.map(a => {
                 const taskCount = a.current_tasks || 0;
                 const maxCap = a.max_capacity || 2;
-                const status = taskCount >= maxCap ? 'at-capacity' : (taskCount > 0 ? 'busy' : 'idle');
-                const statusLabel = status === 'at-capacity' ? 'AT_CAPACITY' : status.toUpperCase();
+                const isOnline = a.is_online !== false;  // Default to true if not set
+                let status, statusLabel;
+                
+                if (!isOnline) {
+                    status = 'offline';
+                    statusLabel = 'OFFLINE';
+                } else if (taskCount >= maxCap) {
+                    status = 'at-capacity';
+                    statusLabel = 'AT_CAPACITY';
+                } else if (taskCount > 0) {
+                    status = 'busy';
+                    statusLabel = 'BUSY';
+                } else {
+                    status = 'idle';
+                    statusLabel = 'IDLE';
+                }
+                
                 const lat = a.current_location?.lat || 0;
                 const lng = a.current_location?.lng || 0;
                 
