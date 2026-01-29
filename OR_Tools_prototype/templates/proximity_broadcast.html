@@ -562,6 +562,7 @@
         let taskTimeout = 120;
         let defaultRadius = 3.0;
         let maxBroadcastsPerAgent = 3;
+        let agentCounts = { online: 0, count: 0 };
         
         // Stale data detection
         let lastDataReceived = Date.now();
@@ -578,7 +579,15 @@
                     fetch('/fleet-state/health')
                 ]);
                 
-                agents = (await agentsRes.json()).agents || [];
+                const agentsPayload = await agentsRes.json();
+                agents = (agentsPayload.agents || []).map(agent => ({
+                    ...agent,
+                    is_online: agent.is_online ?? (agent.status !== 'offline')
+                }));
+                agentCounts = {
+                    online: agentsPayload.online || 0,
+                    count: agentsPayload.count || agents.length
+                };
                 const tasksData = await tasksRes.json();
                 tasks = tasksData.tasks || tasksData.unassigned_tasks || [];
                 const proximityData = await proximityRes.json();
@@ -725,6 +734,7 @@
                 const existingIdx = agents.findIndex(a => String(a.id) === String(agentId));
                 if (existingIdx >= 0) {
                     agents[existingIdx].is_online = false;
+                    agents[existingIdx].status = 'offline';
                 }
                 addLog('warning', `🔴 Agent offline: ${name}`);
             } else if (status === 'online') {
@@ -738,7 +748,8 @@
                     current_tasks: data.current_tasks || 0,
                     tags: data.tags || [],
                     priority: data.priority,
-                    is_online: true
+                    is_online: true,
+                    status: 'online'
                 };
                 if (existingIdx >= 0) {
                     agents[existingIdx] = { ...agents[existingIdx], ...newAgent };
@@ -748,6 +759,8 @@
                 addLog('success', `🟢 Agent online: ${name}${data.priority ? ' ⭐' : ''}`);
             }
             
+            agentCounts.online = agents.filter(a => a.status !== 'offline' && a.is_online !== false).length;
+            agentCounts.count = agents.length;
             updateAllUI();  // Refresh the agent list display
         });
         
@@ -1063,7 +1076,8 @@
         }
         
         function updateStatsUI() {
-            document.getElementById('onlineAgents').textContent = agents.length;
+            const onlineAgents = agents.filter(a => a.is_online !== false && a.status !== 'offline');
+            document.getElementById('onlineAgents').textContent = agentCounts.online || onlineAgents.length;
             document.getElementById('unassignedTasks').textContent = tasks.length;
             document.getElementById('activeBroadcasts').textContent = activeBroadcasts.size;
             
@@ -1102,7 +1116,8 @@
         
         function updateAgentsUI() {
             const list = document.getElementById('agentList');
-            document.getElementById('agentCount').textContent = `${agents.length} total`;
+            const totalAgents = agentCounts.count || agents.length;
+            document.getElementById('agentCount').textContent = `${totalAgents} total`;
             
             if (agents.length === 0) {
                 list.innerHTML = '<div class="empty-state warning">⚠️ No agents - click Sync button</div>';
@@ -1120,7 +1135,7 @@
             list.innerHTML = sorted.map(a => {
                 const taskCount = a.current_tasks || 0;
                 const maxCap = a.max_capacity || 2;
-                const isOnline = a.is_online !== false;  // Default to true if not set
+                const isOnline = a.status ? a.status !== 'offline' : (a.is_online !== false);
                 let status, statusLabel;
                 
                 if (!isOnline) {
