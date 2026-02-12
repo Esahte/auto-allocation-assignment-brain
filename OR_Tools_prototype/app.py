@@ -147,7 +147,7 @@ def get_async_mode():
         return 'gevent'
     # Check if gevent is available
     try:
-        import gevent
+        import gevent  # type: ignore[import-not-found]
         # If explicitly requested
         if os.environ.get('ASYNC_MODE') == 'gevent':
             return 'gevent'
