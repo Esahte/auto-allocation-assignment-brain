@@ -228,15 +228,25 @@ class GeofenceRegion:
     polygon: List[Tuple[float, float]]  # List of (lat, lng) vertices
     fleet_ids: List[str] = field(default_factory=list)
     
+    @property
+    def is_scooter(self) -> bool:
+        """Scooter regions are identified by 'scooter' in the region name."""
+        return 'scooter' in self.region_name.lower()
+    
     @classmethod
     def from_dict(cls, data: dict) -> 'GeofenceRegion':
-        """Parse geofence from API response"""
+        """Parse geofence from API response.
+        
+        Supports both formats:
+        - Old: { region_id, region_name, polygon, fleet_ids }
+        - New: { id, name, polygon, agent_ids }
+        """
         polygon = [(p[0], p[1]) for p in data.get('polygon', [])]
         return cls(
-            region_id=data.get('region_id', 0),
-            region_name=data.get('region_name', ''),
+            region_id=data.get('region_id', data.get('id', 0)),
+            region_name=data.get('region_name', data.get('name', '')),
             polygon=polygon,
-            fleet_ids=data.get('fleet_ids', [])
+            fleet_ids=data.get('fleet_ids', [str(a) for a in data.get('agent_ids', [])])
         )
 
 
@@ -381,8 +391,75 @@ class CompatibilityChecker:
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
         
+        # Build lookup for geofence by ID (for non-scooter region logic)
+        self.geofence_by_id = {str(g.region_id): g for g in self.geofence_regions}
+        
         if not prefilter_distance:
             print(f"[CompatibilityChecker] THOROUGH mode - max_distance_km={max_distance_km}km still enforced as hard constraint")
+    
+    def _get_task_region(self, task: Task) -> Optional[GeofenceRegion]:
+        """
+        Determine which non-scooter geofence region a task belongs to.
+        
+        Checks BOTH pickup and delivery locations.
+        - If both are in different non-scooter regions, pickup region takes priority.
+        - If only one location is in a non-scooter region, use that.
+        - If neither is in any region, return None.
+        - Scooter regions are excluded (handled separately by scooter rule).
+        """
+        if not self.geofence_regions:
+            return None
+        
+        pickup_region = None
+        delivery_region = None
+        
+        for gf in self.geofence_regions:
+            if not gf.polygon:
+                continue
+            
+            # Check pickup
+            if pickup_region is None and point_in_polygon(
+                task.restaurant_location.to_tuple(), gf.polygon
+            ):
+                pickup_region = gf
+            
+            # Check delivery
+            if delivery_region is None and point_in_polygon(
+                task.delivery_location.to_tuple(), gf.polygon
+            ):
+                delivery_region = gf
+        
+        # Priority: non-scooter pickup region first, then non-scooter delivery region
+        if pickup_region and not pickup_region.is_scooter:
+            return pickup_region
+        if delivery_region and not delivery_region.is_scooter:
+            return delivery_region
+        return None
+    
+    def _get_online_region_agent_ids(self, region: GeofenceRegion, agents: List[Agent]) -> List[str]:
+        """Get IDs of agents in this region that are in the solver's agent list."""
+        region_ids = set(str(fid) for fid in region.fleet_ids)
+        return [str(a.id) for a in agents if str(a.id) in region_ids]
+    
+    def _get_agent_regions(self, agent: Agent) -> List[GeofenceRegion]:
+        """
+        Get list of non-scooter geofence regions this agent is assigned to.
+        
+        Checks all geofences' fleet_ids to find which regions include this agent.
+        Returns list of GeofenceRegion for non-scooter regions only.
+        Returns empty list if agent is not in any non-scooter region.
+        """
+        if not self.geofence_regions:
+            return []
+        
+        regions = []
+        agent_id_str = str(agent.id)
+        for gf in self.geofence_regions:
+            if gf.is_scooter:
+                continue
+            if agent_id_str in [str(fid) for fid in gf.fleet_ids]:
+                regions.append(gf)
+        return regions
     
     def _get_agent_projected_location(self, agent: Agent) -> Location:
         """
@@ -552,11 +629,47 @@ class CompatibilityChecker:
                     if not (pickup_in and delivery_in):
                         return False, "outside_scooter_geofence"
         
+        # Rule 5b: Non-scooter Geofence Region Restriction
+        # If task is in a non-scooter region AND at least one region agent is in the solver:
+        #   - Only agents assigned to that region may be considered
+        #   - Distance constraints are bypassed for region-matched agents
+        # If no region agents in solver, or task in no region: fallback to global rules
+        region_distance_bypass = False
+        task_region = self._get_task_region(task)
+        if task_region and not task_region.is_scooter:
+            all_agents = getattr(self, '_all_agents', [])
+            region_agent_ids = self._get_online_region_agent_ids(task_region, all_agents)
+            if region_agent_ids:
+                agent_id_str = str(agent.id)
+                if agent_id_str not in region_agent_ids:
+                    return False, f"not_in_task_region ({task_region.region_name})"
+                else:
+                    region_distance_bypass = True
+        
+        # Rule 5c: Reverse geofence - Region agents can ONLY get tasks in their region
+        # If an agent is assigned to a non-scooter geofence region, they must only
+        # receive tasks that are within that region. This prevents region-locked agents
+        # from being assigned tasks outside their designated area.
+        if not region_distance_bypass:
+            agent_regions = self._get_agent_regions(agent)
+            if agent_regions:
+                task_in_agent_region = False
+                if task_region and not task_region.is_scooter:
+                    for ar in agent_regions:
+                        if str(ar.region_id) == str(task_region.region_id):
+                            task_in_agent_region = True
+                            break
+                
+                if not task_in_agent_region:
+                    region_names = ', '.join(ar.region_name for ar in agent_regions)
+                    return False, f"agent_restricted_to_region ({region_names})"
+        
         # Rule 6: Max Distance - Agent must be within maxDistanceKm of pickup location
         # Uses MINIMUM of current and projected distance (opportunistic pickup + chaining)
         # ALWAYS enforce max_distance_km as a HARD constraint (even in THOROUGH mode)
         # SKIP for Priority 1 agents on premium tasks (they bypass distance)
-        bypass_distance = (agent.priority == 1 and task.is_premium_task)
+        # SKIP for region-matched agents (they bypass distance)
+        bypass_distance = (agent.priority == 1 and task.is_premium_task) or region_distance_bypass
         
         if self.max_distance_km is not None and not bypass_distance:
             # Check cache first (uses MIN of current and projected)
@@ -700,6 +813,9 @@ class CompatibilityChecker:
         Returns:
             {agent_id: {task_id: (is_compatible, reason)}}
         """
+        # Store agents list for region checks in is_compatible
+        self._all_agents = agents
+        
         # Precompute OSRM distances for maxDistanceKm check
         if self.max_distance_km is not None and tasks:
             self.precompute_distances(agents, tasks)

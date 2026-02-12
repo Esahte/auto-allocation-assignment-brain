@@ -252,6 +252,27 @@ _last_batch_signature = {}  # Track last batch signature: {agent_id: (timestamp,
 _task_agent_broadcast_counts = {}  # Track broadcast counts: {task_id: {agent_id: count}}
 
 
+def _export_geofence_data() -> list:
+    """
+    Export geofence data from fleet_state in the format expected by the optimizer.
+    
+    Translates from fleet_state format { id, name, polygon, agent_ids }
+    to optimizer format { region_id, region_name, polygon, fleet_ids }.
+    Returns empty list if no geofences are stored.
+    """
+    if not fleet_state or not fleet_state._geofences:
+        return []
+    return [
+        {
+            'region_id': gf['id'],
+            'region_name': gf['name'],
+            'polygon': gf['polygon'],
+            'fleet_ids': list(gf['agent_ids'])
+        }
+        for gf in fleet_state._geofences.values()
+    ]
+
+
 def get_agent_broadcast_capacity(agent_id: str) -> int:
     """
     Get how many more tasks can be broadcast to this agent.
@@ -938,6 +959,12 @@ def trigger_proximity_broadcast(
     eligible_agents = [a for a in nearby_agents if a['eligibility_reason'] is None]
     ineligible_agents = [a for a in nearby_agents if a['eligibility_reason'] is not None]
     
+    # Log geofence region decisions (non-trivial cases only)
+    geofence_blocked = [a for a in ineligible_agents if 'not_in_task_region' in str(a.get('eligibility_reason', ''))]
+    if geofence_blocked:
+        blocked_names = [f"{a['agent'].name}" for a in geofence_blocked]
+        log_event(f"[ProximityBroadcast] [Geofence] Task {task.id[:20]} - {len(geofence_blocked)} agent(s) blocked by region restriction: {blocked_names}")
+    
     if not eligible_agents:
         reasons = {a['eligibility_reason'] for a in ineligible_agents}
         log_event(f"[ProximityBroadcast] ⚠️ No eligible agents for {task.restaurant_name}. Reasons: {reasons}")
@@ -1128,7 +1155,7 @@ def trigger_proximity_broadcast(
                     'priority': agent.priority
                 }
             }],
-            'geofence_data': [],
+            'geofence_data': _export_geofence_data(),
             'settings_used': {
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
                 'maxDistanceKm': search_radius  # Use current search radius
@@ -1479,6 +1506,21 @@ def trigger_batched_proximity_broadcast(
     
     log_event(f"[ProximityBroadcast] 📦 Batched check for {agent_name}: {len(valid_tasks)} tasks (capacity: {broadcast_capacity})")
     
+    # Log geofence region decisions for batched tasks (non-trivial cases only)
+    if fleet_state and fleet_state._geofences and valid_tasks:
+        for vt in valid_tasks:
+            task_region = fleet_state._get_task_region(vt)
+            if task_region and not task_region['is_scooter']:
+                region_id = task_region['id']
+                online_region_agents = fleet_state._get_online_region_agents(region_id)
+                agent_in_region = str(agent_id) in online_region_agents
+                log_event(
+                    f"[ProximityBroadcast] [Geofence] Batched: task={vt.id[:20]} "
+                    f"region={task_region['name']} region_agents_online={len(online_region_agents)} "
+                    f"agent={agent_name} in_region={agent_in_region} "
+                    f"{'distance_bypass=True' if agent_in_region else 'BLOCKED'}"
+                )
+    
     # Debounce batched broadcast per agent
     now = time.time()
     batch_key = f"batch_{agent_id}"
@@ -1544,7 +1586,7 @@ def trigger_batched_proximity_broadcast(
                 'priority': agent.priority
             }
         }],
-        'geofence_data': [],
+        'geofence_data': _export_geofence_data(),
         'settings_used': {
             'walletNoCashThreshold': fleet_state.wallet_threshold,
             'maxDistanceKm': fleet_state.max_distance_km
@@ -2519,7 +2561,7 @@ def trigger_incremental_optimization(
                     'is_scooter_agent': 'scooter' in [t.lower() for t in agent.tags]
                 }
             }],
-            'geofence_data': [],
+            'geofence_data': _export_geofence_data(),
             'settings_used': {
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
                 'maxDistanceKm': fleet_state.max_distance_km
