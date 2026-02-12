@@ -4033,23 +4033,50 @@ def handle_task_updated(data):
             existing_task.tags = new_tags
             changes.append('tags')
     
+    # CRITICAL: For PAIRED tasks, the dashboard sends TWO task:updated events -
+    # one for the pickup job (correct payment/fee/tips) and one for the delivery
+    # job which has different/zeroed values (e.g. delivery_fee=0, tips=0, and a
+    # different payment_method).  We must NOT let the delivery job's stale values
+    # overwrite the real ones set by task:created.
     if 'payment_method' in data:
         new_payment = data['payment_method'] or 'card'
         if existing_task.payment_method != new_payment:
-            existing_task.payment_method = new_payment
-            changes.append('payment_method')
+            # Guard: never overwrite "cash" with a non-cash value from delivery job update
+            # The task:created event is the source of truth for payment_method
+            if existing_task.payment_method == 'cash' and new_payment != 'cash':
+                app.logger.info(
+                    f"[FleetState] 🔒 Ignoring payment_method overwrite: "
+                    f"'cash' → '{new_payment}' (delivery job update)"
+                )
+            else:
+                existing_task.payment_method = new_payment
+                changes.append('payment_method')
     
     if 'delivery_fee' in data:
         new_fee = float(data['delivery_fee'] or 0)
         if existing_task.delivery_fee != new_fee:
-            existing_task.delivery_fee = new_fee
-            changes.append('delivery_fee')
+            # Guard: never zero out delivery_fee from delivery job update
+            if new_fee == 0 and existing_task.delivery_fee > 0:
+                app.logger.info(
+                    f"[FleetState] 🔒 Ignoring delivery_fee overwrite: "
+                    f"${existing_task.delivery_fee:.2f} → $0 (delivery job update)"
+                )
+            else:
+                existing_task.delivery_fee = new_fee
+                changes.append('delivery_fee')
     
     if 'tips' in data:
         new_tips = float(data['tips'] or 0)
         if existing_task.tips != new_tips:
-            existing_task.tips = new_tips
-            changes.append('tips')
+            # Guard: never zero out tips from delivery job update
+            if new_tips == 0 and existing_task.tips > 0:
+                app.logger.info(
+                    f"[FleetState] 🔒 Ignoring tips overwrite: "
+                    f"${existing_task.tips:.2f} → $0 (delivery job update)"
+                )
+            else:
+                existing_task.tips = new_tips
+                changes.append('tips')
     
     if 'max_distance_km' in data and data['max_distance_km'] is not None:
         new_dist = float(data['max_distance_km'])
