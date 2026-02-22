@@ -100,6 +100,7 @@ class Task:
     pickup_completed: bool = False
     assigned_driver: Optional[str] = None
     payment_type: str = "CARD"
+    job_type: str = "PAIRED"  # "PAIRED", "PICKUP", "DELIVERY"
     tags: List[str] = field(default_factory=list)
     declined_by: List[str] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
@@ -151,6 +152,7 @@ class Task:
             pickup_completed=data.get('pickup_completed', False),
             assigned_driver=data.get('assigned_driver'),
             payment_type=meta.get('payment_type', 'CARD'),
+            job_type=data.get('job_type', 'PAIRED'),
             tags=meta.get('tags', []),
             declined_by=declined_by,
             meta=meta,
@@ -380,13 +382,15 @@ class CompatibilityChecker:
                  max_distance_km: float = None,
                  prefilter_distance: bool = True,
                  max_lateness_minutes: int = DEFAULT_MAX_LATENESS_MINUTES,
-                 max_pickup_delay_minutes: int = DEFAULT_MAX_PICKUP_DELAY_MINUTES):
+                 max_pickup_delay_minutes: int = DEFAULT_MAX_PICKUP_DELAY_MINUTES,
+                 direction_coherence_mode: str = "prefilter"):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
         self.max_distance_km = max_distance_km  # Max distance for assignment
         self.prefilter_distance = prefilter_distance  # Whether to pre-filter by distance
         self.max_lateness_minutes = max_lateness_minutes  # Max allowed delivery lateness
         self.max_pickup_delay_minutes = max_pickup_delay_minutes  # Max delay after food ready
+        self.direction_coherence_mode = direction_coherence_mode  # "prefilter" or "solver"
         self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
@@ -701,7 +705,8 @@ class CompatibilityChecker:
         
         # Rule 7: Delivery Direction Coherence - New task's delivery should be in same direction as existing tasks
         # This prevents inefficient zig-zag routes where agent has to go north then south
-        if agent.current_tasks and len(agent.current_tasks) > 0:
+        # When mode is "solver", skip the hard block — the OR-Tools solver will handle it via penalty
+        if self.direction_coherence_mode == "prefilter" and agent.current_tasks and len(agent.current_tasks) > 0:
             direction_check = self._check_delivery_direction_coherence(agent, task)
             if not direction_check[0]:
                 return direction_check
@@ -714,15 +719,17 @@ class CompatibilityChecker:
     
     def _check_delivery_direction_coherence(self, agent: Agent, new_task: Task) -> Tuple[bool, str]:
         """
-        Check if the new task's delivery is in a coherent direction with agent's existing route.
+        Check if the new task's delivery direction (pickup→delivery) is coherent
+        with the agent's existing tasks' delivery directions.
         
-        This prevents assigning tasks where the agent would have to zig-zag:
-        - Agent has existing delivery going NORTH
-        - New task delivery goes SOUTH (opposite direction = inefficient)
+        Direction is measured from each task's PICKUP to its DELIVERY, not from
+        the agent's location.  This correctly answers "are these tasks heading
+        in the same general direction?" regardless of where the agent currently is.
         
-        Uses agent's current location as reference point and compares:
-        1. Direction from agent to existing delivery locations
-        2. Direction from agent to new task's delivery
+        Skipped when direction comparison is meaningless:
+        - New task is delivery-only (no pickup→delivery vector)
+        - New task's pickup is already completed
+        - Existing task is delivery-only or has pickup completed
         
         Returns:
             (is_coherent, reason) tuple
@@ -730,55 +737,58 @@ class CompatibilityChecker:
         if not agent.current_tasks:
             return True, "no_existing_tasks"
         
-        # Use agent's current location as the reference point
-        # This gives us the overall route direction from where the agent is NOW
-        agent_lat = agent.current_location.lat
-        agent_lng = agent.current_location.lng
+        if getattr(new_task, 'job_type', 'PAIRED') == 'DELIVERY':
+            return True, "delivery_only_skip"
+        if new_task.pickup_completed:
+            return True, "pickup_completed_skip"
         
-        # Calculate direction vector for new task's delivery (from agent to new delivery)
-        new_delivery_lat = new_task.delivery_location.lat
-        new_delivery_lng = new_task.delivery_location.lng
-        new_delta_lat = new_delivery_lat - agent_lat
-        new_delta_lng = new_delivery_lng - agent_lng
+        # New task direction: pickup → delivery
+        new_delta_lat = new_task.delivery_location.lat - new_task.restaurant_location.lat
+        new_delta_lng = new_task.delivery_location.lng - new_task.restaurant_location.lng
         
         new_magnitude = (new_delta_lat**2 + new_delta_lng**2) ** 0.5
         if new_magnitude < 0.001:
-            return True, "delivery_at_agent_location"  # New delivery is where agent is
+            return True, "delivery_at_pickup"
         
-        # Check against each existing task's delivery direction
         for existing_task in agent.current_tasks:
-            # Calculate direction vector for existing task's delivery (from agent)
-            existing_delivery_lat = existing_task.delivery_location.lat
-            existing_delivery_lng = existing_task.delivery_location.lng
-            existing_delta_lat = existing_delivery_lat - agent_lat
-            existing_delta_lng = existing_delivery_lng - agent_lng
+            if getattr(existing_task, 'job_type', 'PAIRED') == 'DELIVERY':
+                continue
+            if existing_task.pickup_completed:
+                continue
             
-            existing_magnitude = (existing_delta_lat**2 + existing_delta_lng**2) ** 0.5
-            if existing_magnitude < 0.001:
-                continue  # Existing delivery is where agent is (about to deliver)
+            # Existing task direction: pickup → delivery
+            ex_delta_lat = existing_task.delivery_location.lat - existing_task.restaurant_location.lat
+            ex_delta_lng = existing_task.delivery_location.lng - existing_task.restaurant_location.lng
             
-            # Calculate dot product to determine if directions are aligned
-            # dot > 0 means same direction, dot < 0 means opposite
-            dot_product = (new_delta_lat * existing_delta_lat) + (new_delta_lng * existing_delta_lng)
+            ex_magnitude = (ex_delta_lat**2 + ex_delta_lng**2) ** 0.5
+            if ex_magnitude < 0.001:
+                continue
             
-            # Calculate cosine of angle between directions
-            cos_angle = dot_product / (new_magnitude * existing_magnitude)
+            dot_product = (new_delta_lat * ex_delta_lat) + (new_delta_lng * ex_delta_lng)
+            cos_angle = dot_product / (new_magnitude * ex_magnitude)
             
-            # If cos_angle < -0.3 (angle > ~107 degrees), deliveries are in opposite directions
-            # This threshold allows some flexibility but rejects clearly opposite routes
+            # cos < -0.3  ≈  angle > 107°  →  opposite directions
             if cos_angle < -0.3:
-                # Calculate actual distances for logging
-                new_dist = _haversine_km(agent_lat, agent_lng, new_delivery_lat, new_delivery_lng)
-                existing_dist = _haversine_km(agent_lat, agent_lng, existing_delivery_lat, existing_delivery_lng)
+                # Before blocking, check for interlocking stops.  Tasks with
+                # opposite direction vectors can still form an efficient route
+                # when their stops spatially overlap (e.g. new delivery is at
+                # the existing pickup, so the agent passes through it anyway).
+                OVERLAP_THRESHOLD_KM = 1.0
+                nd = new_task.delivery_location
+                np = new_task.restaurant_location
+                ep = existing_task.restaurant_location
+                ed = existing_task.delivery_location
+                if (_haversine_km(nd.lat, nd.lng, ep.lat, ep.lng) < OVERLAP_THRESHOLD_KM
+                        or _haversine_km(np.lat, np.lng, ed.lat, ed.lng) < OVERLAP_THRESHOLD_KM
+                        or _haversine_km(nd.lat, nd.lng, ed.lat, ed.lng) < OVERLAP_THRESHOLD_KM):
+                    continue  # Interlocking stops — not a zig-zag
                 
-                # Determine cardinal directions for clearer logging
                 new_dir = self._get_cardinal_direction(new_delta_lat, new_delta_lng)
-                existing_dir = self._get_cardinal_direction(existing_delta_lat, existing_delta_lng)
+                existing_dir = self._get_cardinal_direction(ex_delta_lat, ex_delta_lng)
                 
-                logger.info(f"[FleetOptimizer] ⛔ DIRECTION BLOCK: {agent.name} has delivery going "
-                          f"{existing_dir} ({existing_dist:.1f}km from agent), "
-                          f"new task goes {new_dir} ({new_dist:.1f}km) - OPPOSITE DIRECTION (cos={cos_angle:.2f})")
-                return False, f"opposite_delivery_direction"
+                logger.info(f"[FleetOptimizer] ⛔ DIRECTION BLOCK: {agent.name} has task going "
+                          f"{existing_dir}, new task goes {new_dir} - OPPOSITE DIRECTION (cos={cos_angle:.2f})")
+                return False, "opposite_delivery_direction"
         
         return True, "direction_coherent"
     
@@ -1028,6 +1038,9 @@ class FleetOptimizer:
         self.compatibility_checker = compatibility_checker
         self.current_time = current_time or datetime.now(timezone.utc)
         self.prefilter_distance = prefilter_distance
+        
+        # Direction coherence mode: "prefilter" (hard block) or "solver" (penalty in cost function)
+        self.direction_coherence_mode = getattr(compatibility_checker, 'direction_coherence_mode', 'prefilter')
         
         # Store max distance for chain-aware filtering
         # ALWAYS enforce max_distance_km as a hard constraint in ALL modes
@@ -1356,6 +1369,85 @@ class FleetOptimizer:
         if mandatory_nodes:
             print(f"[FleetOptimizer] Mandatory nodes (no distance penalty): {len(mandatory_nodes)} nodes from existing tasks/agents")
         
+        # =================================================================
+        # DIRECTION COHERENCE PENALTY (solver mode)
+        # =================================================================
+        # When direction_coherence_mode="solver", we add a soft penalty for
+        # transitions between tasks with opposing delivery directions instead
+        # of hard-blocking them in the compatibility pre-filter.
+        # Max 15min penalty for perfectly opposite tasks (cos=-1.0), scaling
+        # down to 0 at the threshold (cos=-0.3).
+        DIRECTION_PENALTY_MAX_SECONDS = 900
+        DIRECTION_COS_THRESHOLD = -0.3
+        
+        direction_penalty_lookup = {}
+        use_direction_penalty = (self.direction_coherence_mode == "solver")
+        
+        if use_direction_penalty:
+            all_tasks = list(self.routable_tasks) + [t for a in self.agents for t in a.current_tasks]
+            
+            task_directions = {}
+            for task in all_tasks:
+                if getattr(task, 'job_type', 'PAIRED') == 'DELIVERY':
+                    continue
+                if task.pickup_completed:
+                    continue
+                dlat = task.delivery_location.lat - task.restaurant_location.lat
+                dlng = task.delivery_location.lng - task.restaurant_location.lng
+                mag = (dlat**2 + dlng**2) ** 0.5
+                if mag < 0.001:
+                    continue
+                task_directions[task.id] = (dlat, dlng, mag, task)
+            
+            node_to_task_id = {}
+            for task in all_tasks:
+                pidx = index_map['pickups'].get(task.id)
+                didx = index_map['deliveries'].get(task.id)
+                if pidx is not None:
+                    node_to_task_id[pidx] = task.id
+                if didx is not None:
+                    node_to_task_id[didx] = task.id
+            
+            task_ids_with_dir = list(task_directions.keys())
+            direction_penalties_applied = 0
+            for i, tid_a in enumerate(task_ids_with_dir):
+                da_lat, da_lng, da_mag, task_a = task_directions[tid_a]
+                for tid_b in task_ids_with_dir[i+1:]:
+                    db_lat, db_lng, db_mag, task_b = task_directions[tid_b]
+                    
+                    dot = (da_lat * db_lat) + (da_lng * db_lng)
+                    cos_angle = dot / (da_mag * db_mag)
+                    
+                    if cos_angle >= DIRECTION_COS_THRESHOLD:
+                        continue
+                    
+                    OVERLAP_KM = 1.0
+                    nd = task_b.delivery_location
+                    np_ = task_b.restaurant_location
+                    ep = task_a.restaurant_location
+                    ed = task_a.delivery_location
+                    if (_haversine_km(nd.lat, nd.lng, ep.lat, ep.lng) < OVERLAP_KM
+                            or _haversine_km(np_.lat, np_.lng, ed.lat, ed.lng) < OVERLAP_KM
+                            or _haversine_km(nd.lat, nd.lng, ed.lat, ed.lng) < OVERLAP_KM):
+                        continue
+                    
+                    severity = ((-cos_angle - 0.3) / 0.7) ** 1.5
+                    penalty_secs = int(severity * DIRECTION_PENALTY_MAX_SECONDS)
+                    
+                    direction_penalty_lookup[(tid_a, tid_b)] = penalty_secs
+                    direction_penalty_lookup[(tid_b, tid_a)] = penalty_secs
+                    direction_penalties_applied += 1
+            
+            print(f"[FleetOptimizer] 🧭 Direction coherence mode: SOLVER PENALTY")
+            print(f"[FleetOptimizer] 🧭 {direction_penalties_applied} opposing task pairs detected (max penalty {DIRECTION_PENALTY_MAX_SECONDS}s)")
+            if direction_penalties_applied > 0:
+                sample = list(direction_penalty_lookup.items())[:3]
+                for (ta, tb), pen in sample:
+                    logger.info(f"[FleetOptimizer] 🧭 Direction penalty: {ta[:15]}... ↔ {tb[:15]}... = {pen}s ({pen/60:.1f}min)")
+        else:
+            node_to_task_id = {}
+            print(f"[FleetOptimizer] 🧭 Direction coherence mode: PRE-FILTER (hard block)")
+        
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
@@ -1369,18 +1461,22 @@ class FleetOptimizer:
             if distance_matrix is not None and max_distance_km is not None:
                 # Skip if either endpoint is mandatory
                 if from_node in mandatory_nodes or to_node in mandatory_nodes:
-                    return base_time
-                
-                # Skip if this is same-task pickup→delivery (inherent distance)
-                if same_task_deliveries.get(from_node) == to_node:
-                    return base_time
-                
-                # Apply penalty only for cross-task routes (delivery_A → pickup_B)
-                hop_distance_km = distance_matrix[from_node][to_node]
-                if hop_distance_km > max_distance_km:
-                    excess_km = hop_distance_km - max_distance_km
-                    penalty = int((excess_km ** 2) * BASE_PENALTY_PER_KM)
-                    return base_time + penalty
+                    pass  # Don't return yet — still apply direction penalty below
+                elif same_task_deliveries.get(from_node) == to_node:
+                    pass  # Same-task — skip distance penalty but still check direction
+                else:
+                    hop_distance_km = distance_matrix[from_node][to_node]
+                    if hop_distance_km > max_distance_km:
+                        excess_km = hop_distance_km - max_distance_km
+                        base_time += int((excess_km ** 2) * BASE_PENALTY_PER_KM)
+            
+            # Direction coherence penalty (solver mode only)
+            if use_direction_penalty and direction_penalty_lookup:
+                from_task = node_to_task_id.get(from_node)
+                to_task = node_to_task_id.get(to_node)
+                if from_task and to_task and from_task != to_task:
+                    dir_penalty = direction_penalty_lookup.get((from_task, to_task), 0)
+                    base_time += dir_penalty
             
             return base_time
         
@@ -2243,7 +2339,8 @@ class FleetOptimizer:
                 'max_lateness_minutes_setting': self.max_lateness_minutes,
                 'total_lateness_seconds': int(total_lateness),
                 'optimization_time_seconds': round(solve_time, 3),
-                'solver': 'or_tools_vrp'
+                'solver': 'or_tools_vrp',
+                'direction_coherence_mode': self.direction_coherence_mode
             },
             'compatibility': {
                 'total_agent_task_pairs': compat_stats.get('total_pairs', 0),
@@ -2347,7 +2444,8 @@ class FleetOptimizer:
 # MAIN OPTIMIZATION FUNCTION
 # =============================================================================
 
-def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True) -> Dict:
+def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True,
+                              direction_coherence_mode: str = "prefilter") -> Dict:
     """
     Wrapper around optimize_fleet that implements gradual agent elimination on ROUTING_FAIL.
     
@@ -2362,6 +2460,7 @@ def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_dis
         agents_data: Response from /api/test/or-tools/agents endpoint
         tasks_data: Response from /api/test/or-tools/unassigned-tasks endpoint
         prefilter_distance: Whether to pre-filter by distance
+        direction_coherence_mode: "prefilter" for hard block, "solver" for OR-Tools penalty
     
     Returns:
         Optimization results with routes for each agent
@@ -2372,10 +2471,10 @@ def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_dis
     
     if len(original_agents) <= 1:
         # Single agent - no point in elimination
-        return optimize_fleet(agents_data, tasks_data, prefilter_distance)
+        return optimize_fleet(agents_data, tasks_data, prefilter_distance, direction_coherence_mode)
     
     # First attempt: Try with ALL agents
-    result = optimize_fleet(agents_data, tasks_data, prefilter_distance)
+    result = optimize_fleet(agents_data, tasks_data, prefilter_distance, direction_coherence_mode)
     
     # Check if we need to retry
     if result.get('success', False):
@@ -2463,7 +2562,7 @@ def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_dis
         retry_agents_data['agents'] = remaining_agents
         
         # Retry optimization
-        retry_result = optimize_fleet(retry_agents_data, tasks_data, prefilter_distance)
+        retry_result = optimize_fleet(retry_agents_data, tasks_data, prefilter_distance, direction_coherence_mode)
         
         if retry_result.get('success', False):
             assigned = retry_result.get('metadata', {}).get('tasks_assigned', 0)
@@ -2492,7 +2591,7 @@ def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_dis
         final_agents_data = agents_data.copy()
         final_agents_data['agents'] = clean_agents
         
-        final_result = optimize_fleet(final_agents_data, tasks_data, prefilter_distance)
+        final_result = optimize_fleet(final_agents_data, tasks_data, prefilter_distance, direction_coherence_mode)
         
         if final_result.get('success', False):
             assigned = final_result.get('metadata', {}).get('tasks_assigned', 0)
@@ -2506,7 +2605,8 @@ def optimize_fleet_with_retry(agents_data: Dict, tasks_data: Dict, prefilter_dis
     return result  # Return original failure
 
 
-def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True) -> Dict:
+def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool = True,
+                   direction_coherence_mode: str = "prefilter") -> Dict:
     """
     Main entry point for fleet optimization.
     
@@ -2515,6 +2615,7 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         tasks_data: Response from /api/test/or-tools/unassigned-tasks endpoint
         prefilter_distance: Whether to pre-filter by distance (True for fast proximity,
                            False for thorough event-based where solver handles distance)
+        direction_coherence_mode: "prefilter" for hard block, "solver" for OR-Tools penalty
     
     Returns:
         Optimization results with routes for each agent
@@ -2522,7 +2623,7 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     start_time = time.time()
     
     mode = "PROXIMITY (fast pre-filter)" if prefilter_distance else "EVENT-BASED (max_distance enforced)"
-    print(f"[optimize_fleet] Mode: {mode}")
+    print(f"[optimize_fleet] Mode: {mode}, direction_coherence: {direction_coherence_mode}")
     
     # Parse agents
     agents = [Agent.from_dict(a) for a in agents_data.get('agents', [])]
@@ -2553,7 +2654,8 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         max_distance_km=max_distance_km,
         prefilter_distance=prefilter_distance,
         max_lateness_minutes=max_lateness_minutes,
-        max_pickup_delay_minutes=max_pickup_delay_minutes
+        max_pickup_delay_minutes=max_pickup_delay_minutes,
+        direction_coherence_mode=direction_coherence_mode
     )
     
     # Run optimizer
@@ -2568,6 +2670,7 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     
     # Add total execution time
     result['total_execution_time_seconds'] = round(time.time() - start_time, 3)
+    result['direction_coherence_mode'] = direction_coherence_mode
     
     return result
 

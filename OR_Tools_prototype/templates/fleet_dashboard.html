@@ -31,6 +31,17 @@
             margin-bottom: 2rem;
         }
         
+        .coherence-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-top: 8px;
+        }
+        .coherence-badge.prefilter { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+        .coherence-badge.solver { background: rgba(163, 113, 247, 0.2); color: #a371f7; }
+        
         h1 {
             font-size: 2.5rem;
             font-weight: 700;
@@ -341,6 +352,7 @@
         <header>
             <h1>🚚 Fleet Optimizer</h1>
             <p class="subtitle">Many-to-Many Route Optimization</p>
+            <span class="coherence-badge" id="coherenceBadge" style="display: none;"></span>
         </header>
         
         <div class="controls">
@@ -439,10 +451,30 @@
             `;
         }
         
+        function updateCoherenceBadge(mode) {
+            const badge = document.getElementById('coherenceBadge');
+            if (mode) {
+                const label = mode === 'solver' ? '🧭 SOLVER PENALTY' : '🧭 PRE-FILTER';
+                badge.textContent = label;
+                badge.className = 'coherence-badge ' + mode;
+                badge.style.display = 'inline-block';
+            }
+        }
+        
+        // Fetch initial config on page load
+        fetch('/fleet-state/config')
+            .then(r => r.json())
+            .then(c => updateCoherenceBadge(c.direction_coherence_mode))
+            .catch(() => {});
+        
         function renderResults(data) {
             // Show stats
             const statsGrid = document.getElementById('statsGrid');
             statsGrid.style.display = 'grid';
+            
+            // Update coherence badge from result metadata
+            const dirMode = (data.metadata && data.metadata.direction_coherence_mode) || data.direction_coherence_mode;
+            updateCoherenceBadge(dirMode);
             
             document.getElementById('agentCount').textContent = data.metadata.total_agents;
             document.getElementById('taskCount').textContent = data.metadata.total_unassigned_tasks;

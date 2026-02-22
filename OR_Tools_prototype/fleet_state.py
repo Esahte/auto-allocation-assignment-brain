@@ -368,6 +368,7 @@ class FleetState:
         self.max_pickup_delay_minutes = max_pickup_delay_minutes
         self.wallet_threshold = 500.0  # Minimum wallet balance for cash orders
         self.default_max_capacity = 2  # Default max tasks per agent
+        self.direction_coherence_mode = "prefilter"  # "prefilter" = hard block, "solver" = OR-Tools penalty
         
         # State storage
         self._agents: Dict[str, AgentState] = {}
@@ -1386,7 +1387,8 @@ class FleetState:
         # 8. Direction Coherence - New task delivery should be in same direction as existing tasks
         # Prevents inefficient zig-zag routes
         # NOTE: This applies to ALL agents including Priority 1 - we don't want zig-zag routes!
-        if agent.current_tasks:
+        # When mode is "solver", skip the hard block — the OR-Tools solver will handle it via penalty
+        if self.direction_coherence_mode == "prefilter" and agent.current_tasks:
             direction_result = self._check_delivery_direction_coherence(agent, task)
             if direction_result:
                 return direction_result
@@ -1395,67 +1397,79 @@ class FleetState:
     
     def _check_delivery_direction_coherence(self, agent: 'AgentState', task: 'TaskState') -> Optional[str]:
         """
-        Check if the new task's delivery is in a coherent direction with agent's existing route.
+        Check if the new task's delivery direction (pickup→delivery) is coherent
+        with the agent's existing tasks' delivery directions.
         
-        This prevents assigning tasks where the agent would have to zig-zag:
-        - Agent has existing delivery going NORTH
-        - New task delivery goes SOUTH (opposite direction = inefficient)
+        Direction is measured from each task's PICKUP to its DELIVERY, not from
+        the agent's location.  This correctly answers "are these tasks heading
+        in the same general direction on the island?" regardless of where the
+        agent currently sits.
+        
+        Skipped when direction comparison is meaningless:
+        - New task is delivery-only (no pickup→delivery vector)
+        - New task's pickup is already completed (agent just needs to deliver)
+        - Existing task is delivery-only or has pickup completed
         
         Returns None if coherent, or reason string if not.
         """
-        import math
-        
         if not agent.current_tasks:
-            return None  # No existing tasks, any direction is fine
+            return None
         
-        # Use agent's current location as the reference point
-        agent_lat = agent.current_location.lat if agent.current_location else 0
-        agent_lng = agent.current_location.lng if agent.current_location else 0
+        # Skip for delivery-only tasks or tasks whose pickup is done
+        if getattr(task, 'job_type', 'PAIRED') == 'DELIVERY':
+            return None
+        if task.pickup_completed:
+            return None
         
-        if agent_lat == 0 and agent_lng == 0:
-            return None  # No location data, can't check direction
-        
-        # Calculate direction vector for new task's delivery (from agent to new delivery)
-        new_delivery_lat = task.delivery_location.lat
-        new_delivery_lng = task.delivery_location.lng
-        new_delta_lat = new_delivery_lat - agent_lat
-        new_delta_lng = new_delivery_lng - agent_lng
+        # New task direction: pickup → delivery
+        if not task.restaurant_location or not task.delivery_location:
+            return None
+        new_pickup_lat = task.restaurant_location.lat
+        new_pickup_lng = task.restaurant_location.lng
+        new_delta_lat = task.delivery_location.lat - new_pickup_lat
+        new_delta_lng = task.delivery_location.lng - new_pickup_lng
         
         new_magnitude = (new_delta_lat**2 + new_delta_lng**2) ** 0.5
         if new_magnitude < 0.001:
-            return None  # New delivery is where agent is
+            return None  # Pickup and delivery are the same spot
         
-        # Check against each existing task's delivery direction
         for existing_task in agent.current_tasks:
-            # existing_task is a CurrentTask object, use it directly
-            if not existing_task.delivery_location:
+            if not existing_task.delivery_location or not existing_task.restaurant_location:
+                continue
+            # Skip delivery-only or pickup-completed existing tasks
+            if getattr(existing_task, 'job_type', 'PAIRED') == 'DELIVERY':
+                continue
+            if existing_task.pickup_completed:
                 continue
             
-            # Calculate direction vector for existing task's delivery (from agent)
-            existing_delivery_lat = existing_task.delivery_location.lat
-            existing_delivery_lng = existing_task.delivery_location.lng
-            existing_delta_lat = existing_delivery_lat - agent_lat
-            existing_delta_lng = existing_delivery_lng - agent_lng
+            # Existing task direction: pickup → delivery
+            ex_delta_lat = existing_task.delivery_location.lat - existing_task.restaurant_location.lat
+            ex_delta_lng = existing_task.delivery_location.lng - existing_task.restaurant_location.lng
             
-            existing_magnitude = (existing_delta_lat**2 + existing_delta_lng**2) ** 0.5
-            if existing_magnitude < 0.001:
-                continue  # Existing delivery is where agent is (about to deliver)
+            ex_magnitude = (ex_delta_lat**2 + ex_delta_lng**2) ** 0.5
+            if ex_magnitude < 0.001:
+                continue
             
-            # Calculate dot product to determine if directions are aligned
-            # dot > 0 means same direction, dot < 0 means opposite
-            dot_product = (new_delta_lat * existing_delta_lat) + (new_delta_lng * existing_delta_lng)
+            dot_product = (new_delta_lat * ex_delta_lat) + (new_delta_lng * ex_delta_lng)
+            cos_angle = dot_product / (new_magnitude * ex_magnitude)
             
-            # Calculate cosine of angle between directions
-            cos_angle = dot_product / (new_magnitude * existing_magnitude)
-            
-            # If cos_angle < -0.3 (angle > ~107 degrees), deliveries are in opposite directions
+            # cos < -0.3  ≈  angle > 107°  →  opposite directions
             if cos_angle < -0.3:
-                # Determine cardinal directions for clearer reason
+                # Before blocking, check for interlocking stops.  Tasks with
+                # opposite direction vectors can still form an efficient route
+                # when their stops spatially overlap (e.g. new delivery is at
+                # the existing pickup, so the agent passes through it anyway).
+                OVERLAP_THRESHOLD_KM = 1.0
+                if (task.delivery_location.distance_to(existing_task.restaurant_location) < OVERLAP_THRESHOLD_KM
+                        or task.restaurant_location.distance_to(existing_task.delivery_location) < OVERLAP_THRESHOLD_KM
+                        or task.delivery_location.distance_to(existing_task.delivery_location) < OVERLAP_THRESHOLD_KM):
+                    continue  # Interlocking stops — not a zig-zag
+                
                 new_dir = self._get_cardinal_direction(new_delta_lat, new_delta_lng)
-                existing_dir = self._get_cardinal_direction(existing_delta_lat, existing_delta_lng)
+                existing_dir = self._get_cardinal_direction(ex_delta_lat, ex_delta_lng)
                 return f"opposite_direction ({existing_dir}→{new_dir})"
         
-        return None  # Direction is coherent
+        return None
     
     def _get_cardinal_direction(self, delta_lat: float, delta_lng: float) -> str:
         """Get cardinal direction string from lat/lng deltas."""

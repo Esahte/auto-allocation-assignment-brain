@@ -61,6 +61,8 @@
         .status-badge.disconnected { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
         .status-badge.enabled { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
         .status-badge.disabled { background: rgba(139, 148, 158, 0.2); color: var(--text-secondary); }
+        .status-badge.prefilter { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); }
+        .status-badge.solver { background: rgba(163, 113, 247, 0.2); color: var(--accent-purple); }
         
         .stats-grid {
             display: grid;
@@ -415,6 +417,7 @@
         <h1>📡 Proximity Broadcast Debug</h1>
         <div style="display: flex; gap: 12px; align-items: center;">
             <span class="status-badge" id="modeBadge">LOADING</span>
+            <span class="status-badge" id="coherenceBadge" title="Direction coherence mode">🧭 LOADING</span>
             <span class="status-badge" id="connectionBadge">Connecting...</span>
             <button class="btn btn-primary" onclick="requestSync()" title="Request full state sync from main dashboard">🔄 Sync</button>
         </div>
@@ -532,6 +535,13 @@
                 <label>Max Broadcasts/Agent</label>
                 <input type="number" id="maxBroadcastsInput" value="3" min="1" max="10" step="1" title="Max times a task can be broadcast to the same agent">
             </div>
+            <div class="config-item">
+                <label>Direction Coherence</label>
+                <select id="coherenceSelect" title="How opposing delivery directions are handled">
+                    <option value="prefilter">Pre-Filter (Hard Block)</option>
+                    <option value="solver">Solver Penalty (Soft)</option>
+                </select>
+            </div>
             <div class="config-item" style="justify-content: flex-end;">
                 <button class="btn btn-primary" onclick="applySettings()">Apply Settings</button>
             </div>
@@ -562,6 +572,7 @@
         let taskTimeout = 120;
         let defaultRadius = 3.0;
         let maxBroadcastsPerAgent = 3;
+        let directionCoherenceMode = 'prefilter';
         let agentCounts = { online: 0, count: 0 };
         
         // Stale data detection
@@ -598,6 +609,7 @@
                 taskTimeout = config.proximity_task_timeout_seconds || 120;
                 defaultRadius = config.proximity_default_radius_km || 3.0;
                 maxBroadcastsPerAgent = config.proximity_max_broadcasts_per_agent || 3;
+                directionCoherenceMode = config.direction_coherence_mode || 'prefilter';
                 
                 // Check health for stale data warning (event-driven, so only warn if no events for 5+ min)
                 const health = await healthRes.json();
@@ -977,8 +989,9 @@
                 taskTimeout = data.config_applied.proximity_task_timeout_seconds ?? taskTimeout;
                 defaultRadius = data.config_applied.proximity_default_radius_km ?? defaultRadius;
                 maxBroadcastsPerAgent = data.config_applied.proximity_max_broadcasts_per_agent ?? maxBroadcastsPerAgent;
+                directionCoherenceMode = data.config_applied.direction_coherence_mode ?? directionCoherenceMode;
                 updateSettingsUI();
-                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, timeout=${taskTimeout}s, radius=${defaultRadius}km, maxBcast=${maxBroadcastsPerAgent}`);
+                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, coherence=${directionCoherenceMode}, timeout=${taskTimeout}s, radius=${defaultRadius}km, maxBcast=${maxBroadcastsPerAgent}`);
             } else if (!data.success) {
                 addLog('error', `❌ Settings update failed: ${data.error}`);
             }
@@ -999,9 +1012,17 @@
                     addLog('broadcast', `🔄 ${broadcast.task_name} re-broadcast to ${broadcastCount} agents (timer reset)`);
                     updateAllUI();
                 }
+            } else if (data.success && broadcastCount === 0 && !data.error) {
+                // Debounced or skipped (agents exist but broadcast was suppressed) - reset timer to retry
+                const broadcast = activeBroadcasts.get(taskId);
+                if (broadcast) {
+                    broadcast.first_offered_at = Date.now() / 1000;
+                    autoTriggeredTasks.delete(taskId);
+                    addLog('warning', `⏰ Timeout: ${broadcast.task_name} → agents still pending, will retry`);
+                    updateAllUI();
+                }
             } else {
-                // NO agents found OR timeout failed - move to blocked
-                // This handles: success=true+count=0, success=false (capacity, no agents, etc.)
+                // Genuine failure: no agents found, all at capacity, or error
                 const broadcast = activeBroadcasts.get(taskId);
                 if (broadcast && taskId) {
                     const reason = data.error || 'no agents available';
@@ -1392,16 +1413,21 @@
             document.getElementById('timeoutInput').value = taskTimeout;
             document.getElementById('radiusInput').value = defaultRadius;
             document.getElementById('maxBroadcastsInput').value = maxBroadcastsPerAgent;
+            
+            const coherenceLabel = directionCoherenceMode === 'solver' ? '🧭 SOLVER PENALTY' : '🧭 PRE-FILTER';
+            document.getElementById('coherenceBadge').textContent = coherenceLabel;
+            document.getElementById('coherenceBadge').className = 'status-badge ' + directionCoherenceMode;
+            document.getElementById('coherenceSelect').value = directionCoherenceMode;
         }
         
         function applySettings() {
-            // Use existing config:update event
             socket.emit('config:update', {
                 config: {
                     proximity_broadcast_enabled: document.getElementById('modeSelect').value === 'true',
                     proximity_task_timeout_seconds: parseInt(document.getElementById('timeoutInput').value),
                     proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value),
-                    proximity_max_broadcasts_per_agent: parseInt(document.getElementById('maxBroadcastsInput').value)
+                    proximity_max_broadcasts_per_agent: parseInt(document.getElementById('maxBroadcastsInput').value),
+                    direction_coherence_mode: document.getElementById('coherenceSelect').value
                 },
                 dashboard_url: window.location.origin
             });

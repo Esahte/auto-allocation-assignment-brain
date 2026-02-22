@@ -586,3 +586,43 @@ curl -X POST https://or-tools-recommender-95621826490.us-central1.run.app/recomm
 - ✅ **Distance-based scoring** prioritizes nearby agents automatically 
 
 **⚠️ Important**: The fixed-optimized algorithm has been **disabled** due to fundamental architectural flaws causing 3+ minute response times. Use batch-optimized for all scenarios. 
+
+---
+
+## 🧭 **Direction Coherence Modes (January 2026)**
+
+The system prevents zig-zag routes by ensuring an agent's tasks go in a coherent direction. Two modes are available, switchable live via the config API:
+
+| Mode | Behavior | Trade-off |
+|------|----------|-----------|
+| `prefilter` (default) | **Hard block** — agent-task pairs with opposing delivery directions (>107°) are excluded before the solver ever sees them | Strict, never allows zig-zag. May occasionally block a globally optimal assignment. |
+| `solver` | **Soft penalty** — opposing directions add a cost penalty (up to 15min) inside the OR-Tools solver, which can still assign them if the overall route is worthwhile | Flexible, lets the solver weigh direction against urgency/distance/deadlines. |
+
+### Switching Modes Live
+
+```bash
+# Switch to solver penalty mode
+curl -X POST http://localhost:8080/fleet-state/config \
+  -H "Content-Type: application/json" \
+  -d '{"direction_coherence_mode": "solver"}'
+
+# Switch back to pre-filter (hard block)
+curl -X POST http://localhost:8080/fleet-state/config \
+  -H "Content-Type: application/json" \
+  -d '{"direction_coherence_mode": "prefilter"}'
+
+# Check current mode
+curl http://localhost:8080/fleet-state/config
+```
+
+### How the Solver Penalty Works
+
+1. For every pair of tasks, the system computes the delivery direction vector (pickup → delivery)
+2. If two tasks have a cosine angle < -0.3 (>107° apart) and their stops don't spatially overlap, a penalty is added to the solver's cost function
+3. The penalty scales with severity: 0s at threshold, up to 900s (15min) for perfectly opposite directions (cos = -1.0)
+4. The solver can still assign opposing tasks if the total route cost is lower than alternatives — unlike the hard block, this is a preference, not a rule
+
+### When to Use Each Mode
+
+- **`prefilter`**: When you want zero tolerance for zig-zag routes and have enough agents to cover all directions
+- **`solver`**: When agents are scarce and you'd rather the solver make a globally optimal decision, even if it occasionally means a slightly less direct route

@@ -588,7 +588,7 @@ def get_all_agent_proximity_locations(agent_id: str) -> list:
     return locations
 
 
-def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id: str, tolerance_degrees: float = None) -> tuple:
+def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id: str, tolerance_degrees: float = None, new_task=None) -> tuple:
     """
     Check if a task's direction is compatible with an agent's CURRENT TASKS and pending broadcasts.
     
@@ -596,10 +596,16 @@ def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id:
     1. Already has accepted/assigned tasks going a certain direction
     2. Has pending broadcasts going a certain direction
     
+    When directions ARE opposite, a spatial-overlap fallback checks whether the
+    tasks' stops interleave (e.g. new delivery at existing pickup).  Interlocking
+    tasks are allowed because they form efficient routes despite opposite vectors.
+    
     Args:
         task_bearing: The bearing of the new task (restaurant → delivery)
         agent_id: The agent to check
         tolerance_degrees: Max angular difference (default: PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES)
+        new_task: Optional task object for spatial overlap fallback (needs
+                  restaurant_location and delivery_location attributes)
     
     Returns:
         (is_compatible: bool, reason: str or None)
@@ -612,26 +618,34 @@ def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id:
     if tolerance_degrees is None:
         tolerance_degrees = PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES
     
+    OVERLAP_THRESHOLD_KM = 1.0
     all_bearings = []
     
     # =======================================================================
     # FIRST: Check against CURRENT TASKS (accepted/assigned tasks)
-    # This is critical - we don't want to send opposite-direction tasks
+    # Skip delivery-only tasks and tasks whose pickup is already completed —
+    # those have no meaningful pickup→delivery direction to compare against.
     # =======================================================================
     if fleet_state:
         agent = fleet_state.get_agent(str(agent_id))
         if agent and agent.current_tasks:
             for current_task in agent.current_tasks:
+                if getattr(current_task, 'job_type', 'PAIRED') == 'DELIVERY':
+                    continue
+                if getattr(current_task, 'pickup_completed', False):
+                    continue
                 try:
                     current_bearing = get_task_delivery_bearing(current_task)
                     if current_bearing is not None:
-                        # Check individual compatibility with each current task
                         diff = angular_difference(task_bearing, current_bearing)
                         if diff > tolerance_degrees:
+                            # Before blocking, check spatial overlap
+                            if new_task and _stops_overlap(new_task, current_task, OVERLAP_THRESHOLD_KM):
+                                all_bearings.append(current_bearing)
+                                continue  # Interlocking stops — not a zig-zag
                             return (False, f"conflicts with current task (bearing {round(task_bearing)}° vs {round(current_bearing)}°, diff {round(diff)}°)")
                         all_bearings.append(current_bearing)
                 except Exception as e:
-                    # Log but don't fail - skip this task's direction check
                     print(f"[DirectionCheck] Warning: Could not get bearing for current task: {e}")
     
     # =======================================================================
@@ -641,27 +655,52 @@ def is_task_directionally_compatible_with_pending(task_bearing: float, agent_id:
     if pending_directions:
         for task_id, pending_bearing in pending_directions.items():
             if pending_bearing is not None:
-                # Check individual compatibility with each pending broadcast
                 diff = angular_difference(task_bearing, pending_bearing)
                 if diff > tolerance_degrees:
+                    # Check spatial overlap with the pending task
+                    if new_task and fleet_state:
+                        pending_task = fleet_state.get_task(task_id)
+                        if pending_task and _stops_overlap(new_task, pending_task, OVERLAP_THRESHOLD_KM):
+                            all_bearings.append(pending_bearing)
+                            continue  # Interlocking stops — not a zig-zag
                     return (False, f"bearing {round(task_bearing)}° differs {round(diff)}° from pending broadcast {round(pending_bearing)}°")
                 all_bearings.append(pending_bearing)
     
     # If we have any bearings, also check against the average direction
     if all_bearings:
-        # Calculate circular mean for all bearings (handles wrap-around at 0/360)
         sin_sum = sum(math.sin(math.radians(b)) for b in all_bearings)
         cos_sum = sum(math.cos(math.radians(b)) for b in all_bearings)
         avg_bearing = math.degrees(math.atan2(sin_sum, cos_sum))
         avg_bearing = (avg_bearing + 360) % 360
         
-        # Check if new task is within tolerance of average direction
         diff = angular_difference(task_bearing, avg_bearing)
         if diff > tolerance_degrees:
             source = "current+pending" if pending_directions else "current tasks"
             return (False, f"bearing {round(task_bearing)}° differs {round(diff)}° from {source} avg {round(avg_bearing)}°")
     
-    return (True, None)  # Compatible or no existing direction constraints
+    return (True, None)
+
+
+def _stops_overlap(task_a, task_b, threshold_km: float) -> bool:
+    """
+    Check if any stops between two tasks are within threshold_km of each other.
+    Returns True if tasks interlock spatially (delivery near pickup, etc.).
+    """
+    try:
+        a_del = getattr(task_a, 'delivery_location', None)
+        a_pick = getattr(task_a, 'restaurant_location', None)
+        b_del = getattr(task_b, 'delivery_location', None)
+        b_pick = getattr(task_b, 'restaurant_location', None)
+        
+        if a_del and b_pick and a_del.distance_to(b_pick) < threshold_km:
+            return True
+        if a_pick and b_del and a_pick.distance_to(b_del) < threshold_km:
+            return True
+        if a_del and b_del and a_del.distance_to(b_del) < threshold_km:
+            return True
+    except (AttributeError, TypeError):
+        pass
+    return False
 
 
 def get_task_broadcast_count_for_agent(task_id: str, agent_id: str) -> int:
@@ -861,11 +900,11 @@ def trigger_proximity_broadcast(
     # Tookan won't push to agents who declined, but WILL push to other agents
     task_declined_by = set(str(d) for d in (task.declined_by or []))
     
-    # Debounce per-task broadcasts
+    # Debounce per-task broadcasts (skip debounce for forced events like timeout/expand/decline)
     now = time.time()
     with _proximity_lock:
         last_broadcast = _last_proximity_broadcast.get(task_id, 0)
-        if (now - last_broadcast) * 1000 < PROXIMITY_DEBOUNCE_MS:
+        if not force and (now - last_broadcast) * 1000 < PROXIMITY_DEBOUNCE_MS:
             return {'success': True, 'debounced': True}
         _last_proximity_broadcast[task_id] = now
     
@@ -1040,22 +1079,30 @@ def trigger_proximity_broadcast(
             log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK: No P1 agents available for {task.restaurant_name}, allowing regular agents")
     
     # Calculate this task's bearing for directional compatibility check
+    # Skip direction filter entirely for delivery-only or pickup-completed tasks
     task_bearing = get_task_delivery_bearing(task)
+    skip_direction = (
+        getattr(task, 'job_type', 'PAIRED') == 'DELIVERY'
+        or getattr(task, 'pickup_completed', False)
+    )
     
     # Filter agents by directional compatibility with their pending broadcasts
     agents_compatible = []
     agents_incompatible = []
     for agent_info in agents_under_limit:
         agent = agent_info['agent']
-        is_compatible, reason = is_task_directionally_compatible_with_pending(task_bearing, agent.id)
-        if is_compatible:
+        if skip_direction or task_bearing is None:
             agents_compatible.append(agent_info)
         else:
-            agents_incompatible.append({
-                'agent_id': agent.id,
-                'agent_name': agent.name,
-                'reason': reason
-            })
+            is_compatible, reason = is_task_directionally_compatible_with_pending(task_bearing, agent.id, new_task=task)
+            if is_compatible:
+                agents_compatible.append(agent_info)
+            else:
+                agents_incompatible.append({
+                    'agent_id': agent.id,
+                    'agent_name': agent.name,
+                    'reason': reason
+                })
     
     if agents_incompatible:
         names = [f"{a['agent_name']}({a['reason']})" for a in agents_incompatible]
@@ -1187,7 +1234,8 @@ def trigger_proximity_broadcast(
         
         try:
             # Run solver for this agent + this task
-            result = optimize_fleet(agents_data, task_export, prefilter_distance=False)
+            dir_mode = getattr(fleet_state, 'direction_coherence_mode', 'prefilter') if fleet_state else 'prefilter'
+            result = optimize_fleet(agents_data, task_export, prefilter_distance=False, direction_coherence_mode=dir_mode)
             
             if result.get('success') and result.get('metadata', {}).get('tasks_assigned', 0) > 0:
                 # Solver says this agent can complete the task on time
@@ -1492,7 +1540,7 @@ def trigger_batched_proximity_broadcast(
     # Use the first task's bearing as the batch direction
     primary_task = valid_tasks[0]
     batch_bearing = get_task_delivery_bearing(primary_task)
-    is_compatible, reason = is_task_directionally_compatible_with_pending(batch_bearing, agent_id)
+    is_compatible, reason = is_task_directionally_compatible_with_pending(batch_bearing, agent_id, new_task=primary_task)
     
     if not is_compatible:
         log_event(f"[ProximityBroadcast] 🧭 Batched: {agent_name} has current/pending tasks in different direction. {primary_task.restaurant_name} {reason}")
@@ -1622,7 +1670,8 @@ def trigger_batched_proximity_broadcast(
     
     try:
         # Run solver with ALL tasks at once
-        result = optimize_fleet(agents_data, task_export, prefilter_distance=False)
+        dir_mode = getattr(fleet_state, 'direction_coherence_mode', 'prefilter') if fleet_state else 'prefilter'
+        result = optimize_fleet(agents_data, task_export, prefilter_distance=False, direction_coherence_mode=dir_mode)
         
         if not result.get('success'):
             return {
@@ -2230,13 +2279,16 @@ def process_fleet_optimization(data: dict, prefilter_distance: bool = True) -> d
             agents_data = future_agents.result(timeout=30)
             tasks_data = future_tasks.result(timeout=30)
     
+    # Get direction coherence mode from fleet_state config (live-switchable)
+    dir_mode = getattr(fleet_state, 'direction_coherence_mode', 'prefilter') if fleet_state else 'prefilter'
+    
     # Use retry version for THOROUGH mode (event-based) to handle ROUTING_FAIL gracefully
     # PROXIMITY mode (prefilter_distance=True) uses regular optimize_fleet for speed
     if prefilter_distance:
-        result = optimize_fleet(agents_data, tasks_data, prefilter_distance=True)
+        result = optimize_fleet(agents_data, tasks_data, prefilter_distance=True, direction_coherence_mode=dir_mode)
     else:
         # THOROUGH mode: Use gradual elimination on ROUTING_FAIL
-        result = optimize_fleet_with_retry(agents_data, tasks_data, prefilter_distance=False)
+        result = optimize_fleet_with_retry(agents_data, tasks_data, prefilter_distance=False, direction_coherence_mode=dir_mode)
     
     performance_stats["fleet_optimizer_requests"] += 1
     performance_stats["total_requests"] += 1
@@ -2599,7 +2651,8 @@ def trigger_incremental_optimization(
                 print(f"[FleetState] Task: {task_name} | pickup: {pickup_before} | delivery: {delivery_before}")
         
         # PROXIMITY: Use FAST mode - pre-filter by distance for quick response
-        result = optimize_fleet(agents_data, tasks_data, prefilter_distance=True)
+        dir_mode = getattr(fleet_state, 'direction_coherence_mode', 'prefilter') if fleet_state else 'prefilter'
+        result = optimize_fleet(agents_data, tasks_data, prefilter_distance=True, direction_coherence_mode=dir_mode)
         
         execution_time = time.time() - start_time
         
@@ -3009,6 +3062,13 @@ def handle_config_update(data):
             update_proximity_broadcast_settings({'proximity_max_broadcasts_per_agent': config['proximity_max_broadcasts_per_agent']})
             changes.append(f"proximity_max_broadcasts_per_agent: {old_val} → {PROXIMITY_MAX_BROADCASTS_PER_AGENT}")
         
+        if 'direction_coherence_mode' in config:
+            mode = str(config['direction_coherence_mode']).lower()
+            if mode in ('prefilter', 'solver'):
+                old_val = fleet_state.direction_coherence_mode
+                fleet_state.direction_coherence_mode = mode
+                changes.append(f"direction_coherence_mode: {old_val} → {mode}")
+        
         # Log changes
         if changes:
             print(f"[FleetState] ✅ Config updated:")
@@ -3031,7 +3091,8 @@ def handle_config_update(data):
                 'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
                 'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
                 'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
-                'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT
+                'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+                'direction_coherence_mode': fleet_state.direction_coherence_mode
             }
         })
         
@@ -5038,6 +5099,7 @@ def fleet_state_config():
             'max_tasks_per_agent': fleet_state.default_max_capacity,  # Agent capacity limit
             'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
             'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds,
+            'direction_coherence_mode': fleet_state.direction_coherence_mode,  # "prefilter" or "solver"
             # Proximity broadcast settings
             'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
             'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
@@ -5073,6 +5135,11 @@ def fleet_state_config():
         fleet_state.chain_lookahead_radius_km = float(data['chain_lookahead_radius_km'])
     if 'optimization_cooldown_seconds' in data:
         fleet_state.optimization_cooldown_seconds = float(data['optimization_cooldown_seconds'])
+    if 'direction_coherence_mode' in data:
+        mode = str(data['direction_coherence_mode']).lower()
+        if mode in ('prefilter', 'solver'):
+            fleet_state.direction_coherence_mode = mode
+            print(f"[Config] Direction coherence mode changed to: {mode}")
     
     # Proximity broadcast settings
     if 'proximity_broadcast_enabled' in data or 'proximity_task_timeout_seconds' in data:
@@ -5087,6 +5154,7 @@ def fleet_state_config():
         'max_tasks_per_agent': fleet_state.default_max_capacity,
         'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
         'optimization_cooldown_seconds': fleet_state.optimization_cooldown_seconds,
+        'direction_coherence_mode': fleet_state.direction_coherence_mode,
         'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
         'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
         'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
