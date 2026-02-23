@@ -1075,8 +1075,31 @@ def trigger_proximity_broadcast(
                 log_event(f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE: {task.restaurant_name} going to P1 agents only: {p1_names}")
             agents_under_limit = p1_agents
         else:
-            # No P1 agents available - fall back to regular agents
-            log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK: No P1 agents available for {task.restaurant_name}, allowing regular agents")
+            # No P1 agents in the filtered list — but check if a P1 agent already
+            # has this task as a pending broadcast (at capacity because of THIS task).
+            # If so, the task is already with the P1 agent; don't leak to regular agents.
+            p1_already_has_task = False
+            for a in eligible_agents:
+                if a['agent'].priority == 1:
+                    pending = get_agent_pending_tasks(a['agent'].id)
+                    if task_id in pending:
+                        p1_already_has_task = True
+                        log_event(f"[ProximityBroadcast] ⭐ PREMIUM HELD: {task.restaurant_name} already pending for P1 agent {a['agent'].name}. Not leaking to regular agents.")
+                        break
+            
+            if p1_already_has_task:
+                # Task is already with a P1 agent — only broadcast to new regular agents
+                # if this was a forced re-broadcast, otherwise skip entirely
+                agents_under_limit = []
+            else:
+                # No P1 agents available at all - fall back to regular agents
+                log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK: No P1 agents available for {task.restaurant_name}, allowing regular agents")
+    
+    if is_premium_task and not agents_under_limit and any(
+        a['agent'].priority == 1 and task_id in get_agent_pending_tasks(a['agent'].id)
+        for a in eligible_agents
+    ):
+        return {'success': True, 'held_for_p1': True, 'reason': 'Already pending for P1 agent', 'radius_km': search_radius}
     
     # Calculate this task's bearing for directional compatibility check
     # Skip direction filter entirely for delivery-only or pickup-completed tasks
@@ -1505,21 +1528,38 @@ def trigger_batched_proximity_broadcast(
         # Regular agent - check if we should exclude premium tasks
         premium_tasks = [t for t in valid_tasks if t.is_premium_task]
         if premium_tasks:
-            # Check if there are P1 agents online with capacity
             all_agents = fleet_state.get_all_agents()
+            # Check if P1 agents are online with capacity
             p1_agents_available = [
                 a for a in all_agents 
                 if a.priority == 1 and a.is_online and a.has_capacity and a.id != agent_id
             ]
+            # Also check if any P1 agent already has these premium tasks pending
+            # (they may be at capacity BECAUSE of these pending tasks)
+            p1_agents_with_pending = []
+            if not p1_agents_available:
+                for a in all_agents:
+                    if a.priority == 1 and a.is_online and a.id != agent_id:
+                        pending = get_agent_pending_tasks(a.id)
+                        held_tasks = [t for t in premium_tasks if t.id in pending]
+                        if held_tasks:
+                            p1_agents_with_pending.append((a, held_tasks))
             
             if p1_agents_available:
-                # P1 agents available - exclude premium tasks from this regular agent
+                # P1 agents available with capacity - exclude premium tasks from this regular agent
                 premium_names = [t.restaurant_name for t in premium_tasks]
                 p1_names = [a.name for a in p1_agents_available]
                 log_event(f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE (Batched): Excluding premium tasks from {agent_name}: {premium_names}. Reserved for P1: {p1_names}")
                 valid_tasks = [t for t in valid_tasks if not t.is_premium_task]
+            elif p1_agents_with_pending:
+                # P1 agents at capacity but already have these tasks pending — don't leak
+                held_names = [t.restaurant_name for a, tasks in p1_agents_with_pending for t in tasks]
+                p1_names = [a.name for a, _ in p1_agents_with_pending]
+                log_event(f"[ProximityBroadcast] ⭐ PREMIUM HELD (Batched): {held_names} already pending for P1 {p1_names}. Excluding from {agent_name}.")
+                held_task_ids = {t.id for _, tasks in p1_agents_with_pending for t in tasks}
+                valid_tasks = [t for t in valid_tasks if t.id not in held_task_ids]
             else:
-                # No P1 agents available - allow regular agent to take premium tasks
+                # No P1 agents available at all - allow regular agent to take premium tasks
                 premium_names = [t.restaurant_name for t in premium_tasks]
                 log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK (Batched): No P1 agents available, {agent_name} can take premium tasks: {premium_names}")
     
