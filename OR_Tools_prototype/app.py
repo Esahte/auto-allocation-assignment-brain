@@ -4416,14 +4416,12 @@ def handle_task_accepted(data):
     agent_name = data.get('agent_name', 'Unknown')
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
-    print(f"[WebSocket] task:accepted: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+    log_event(f"[WebSocket] task:accepted: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
     
     # Update fleet state
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
         task = fleet_state.accept_task(task_id, str(agent_id))
         if task:
-            print(f"[FleetState] Task {task.restaurant_name} accepted by {agent_name}")
-            
             # PROXIMITY BROADCAST: Clean up tracking after acceptance
             if PROXIMITY_BROADCAST_ENABLED:
                 handle_proximity_acceptance(task_id, str(agent_id), agent_name, dashboard_url)
