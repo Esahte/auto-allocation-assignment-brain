@@ -1590,6 +1590,13 @@ class FleetOptimizer:
                         print(f"[FleetOptimizer]     📊 DELIVERY LATENESS PENALTY: {lateness_penalty}/sec")
                     else:
                         delivery_max = int(raw_delivery_delta) + self.max_lateness_minutes * 60
+
+                        # Soft incentive: deliver existing tasks ASAP (same as delivery-only case)
+                        EXISTING_DELIVERY_URGENCY_PENALTY = 20
+                        delivery_index_for_urgency = manager.NodeToIndex(delivery_idx)
+                        time_dimension.SetCumulVarSoftUpperBound(
+                            delivery_index_for_urgency, 0, EXISTING_DELIVERY_URGENCY_PENALTY)
+                        print(f"[FleetOptimizer]     📊 EXISTING DELIVERY URGENCY: {EXISTING_DELIVERY_URGENCY_PENALTY}/sec")
                     
                     time_dimension.CumulVar(pickup_index).SetMax(pickup_max)
                     time_dimension.CumulVar(delivery_index).SetMax(delivery_max)
@@ -1627,6 +1634,19 @@ class FleetOptimizer:
                     else:
                         deadline_seconds = int(raw_deadline_delta)
                         time_dimension.CumulVar(delivery_index).SetMax(deadline_seconds + 1800)  # +30min grace
+
+                        # Soft incentive: prefer delivering existing tasks ASAP
+                        # Pickup delays only affect the restaurant (food sits a bit longer),
+                        # but delivery delays directly degrade customer experience.
+                        # Without this, the solver may detour for new pickups before
+                        # completing existing deliveries, since both routes have similar
+                        # total cost but very different customer impact.
+                        # Penalty of 20/sec means each minute of delay costs 1200 in objective,
+                        # enough to outweigh minor travel-time savings from reordering.
+                        EXISTING_DELIVERY_URGENCY_PENALTY = 20
+                        time_dimension.SetCumulVarSoftUpperBound(
+                            delivery_index, 0, EXISTING_DELIVERY_URGENCY_PENALTY)
+                        print(f"[FleetOptimizer]     📊 EXISTING DELIVERY URGENCY: {EXISTING_DELIVERY_URGENCY_PENALTY}/sec (deliver before new pickups)")
                 else:
                     print(f"[FleetOptimizer]   WARNING: No indices found for existing task!")
         

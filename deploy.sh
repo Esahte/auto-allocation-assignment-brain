@@ -73,9 +73,10 @@ echo "⬆️  Pushing image to Artifact Registry..."
 docker push ${IMAGE_NAME}:latest
 
 # Build environment variables string
-ENV_VARS=""
+# DIRECTION_COHERENCE_MODE: "solver" uses OR-Tools penalty, "prefilter" uses hard block
+ENV_VARS="--set-env-vars DIRECTION_COHERENCE_MODE=solver"
 if [ -n "$DASHBOARD_URL" ]; then
-    ENV_VARS="--set-env-vars DASHBOARD_URL=${DASHBOARD_URL}"
+    ENV_VARS="--set-env-vars DASHBOARD_URL=${DASHBOARD_URL},DIRECTION_COHERENCE_MODE=solver"
 fi
 
 # Deploy to Cloud Run

@@ -129,6 +129,7 @@ try:
     fleet_optimizer_logger.addHandler(important_handler)
     
     print("[FleetState] Loggers connected to file handlers")
+    print(f"[FleetState] Direction coherence default: {fleet_state.direction_coherence_mode}")
 except ImportError as e:
     FLEET_STATE_AVAILABLE = False
     fleet_state = None
@@ -2941,6 +2942,15 @@ def handle_fleet_sync(data):
             if 'wallet_threshold' in config:
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
             
+            # Direction coherence mode - apply if dashboard sends it, otherwise preserve current value
+            if 'direction_coherence_mode' in config:
+                mode = str(config['direction_coherence_mode']).lower()
+                if mode in ('prefilter', 'solver'):
+                    old_mode = fleet_state.direction_coherence_mode
+                    fleet_state.direction_coherence_mode = mode
+                    if old_mode != mode:
+                        log_event(f"[FleetState] → direction_coherence_mode: {old_mode} → {mode} (from fleet:sync)")
+            
             # Proximity broadcast settings - ONLY update timeout/radius/limit, NOT the mode
             # Mode should only change via explicit config:update to prevent sync from resetting user's toggle
             proximity_config_keys = ['proximity_task_timeout_seconds', 'proximity_default_radius_km', 'proximity_max_broadcasts_per_agent']
@@ -5177,7 +5187,7 @@ def fleet_state_config():
         mode = str(data['direction_coherence_mode']).lower()
         if mode in ('prefilter', 'solver'):
             fleet_state.direction_coherence_mode = mode
-            print(f"[Config] Direction coherence mode changed to: {mode}")
+            log_event(f"[Config] Direction coherence mode changed to: {mode}")
     
     # Proximity broadcast settings
     if 'proximity_broadcast_enabled' in data or 'proximity_task_timeout_seconds' in data:

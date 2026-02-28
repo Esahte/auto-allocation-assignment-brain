@@ -22,6 +22,7 @@ import threading
 import math
 import time
 import logging
+import os
 import re
 
 
@@ -368,7 +369,7 @@ class FleetState:
         self.max_pickup_delay_minutes = max_pickup_delay_minutes
         self.wallet_threshold = 500.0  # Minimum wallet balance for cash orders
         self.default_max_capacity = 2  # Default max tasks per agent
-        self.direction_coherence_mode = "prefilter"  # "prefilter" = hard block, "solver" = OR-Tools penalty
+        self.direction_coherence_mode = os.environ.get('DIRECTION_COHERENCE_MODE', 'solver').lower()  # "prefilter" = hard block, "solver" = OR-Tools penalty
         
         # State storage
         self._agents: Dict[str, AgentState] = {}
