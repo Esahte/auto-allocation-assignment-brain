@@ -251,6 +251,46 @@ _agent_pending_routes = {}  # Track pending route availability: {agent_id: {task
 _last_broadcast_signature = {}  # Track last broadcast signature: {task_id: (timestamp, set(agent_ids))}
 _last_batch_signature = {}  # Track last batch signature: {agent_id: (timestamp, set(task_ids))}
 _task_agent_broadcast_counts = {}  # Track broadcast counts: {task_id: {agent_id: count}}
+_idle_priority_tasks = {}  # Track tasks in idle-priority window: {task_id: {'start_time': float, 'idle_agent_ids': set}}
+
+
+def _is_agent_exempt_from_idle_priority(agent) -> bool:
+    """Check if an agent is exempt from the idle-priority rule (P1 or region-based)."""
+    if agent.priority == 1:
+        return True
+    if fleet_state:
+        regions = fleet_state._get_agent_regions(agent)
+        if regions:
+            return True
+    return False
+
+
+def _is_task_in_idle_priority(task_id: str) -> bool:
+    """Check if a task is currently in its idle-priority window."""
+    with _proximity_lock:
+        entry = _idle_priority_tasks.get(task_id)
+        if not entry:
+            return False
+        elapsed = time.time() - entry['start_time']
+        if elapsed >= PROXIMITY_TASK_TIMEOUT_SECONDS:
+            del _idle_priority_tasks[task_id]
+            return False
+        return True
+
+
+def _set_idle_priority(task_id: str, idle_agent_ids: set):
+    """Mark a task as in idle-priority window with the set of idle agents it was broadcast to."""
+    with _proximity_lock:
+        _idle_priority_tasks[task_id] = {
+            'start_time': time.time(),
+            'idle_agent_ids': idle_agent_ids
+        }
+
+
+def _clear_idle_priority(task_id: str):
+    """Clear idle-priority status for a task (called on accept, timeout fallback, etc.)."""
+    with _proximity_lock:
+        _idle_priority_tasks.pop(task_id, None)
 
 
 def _export_geofence_data() -> list:
@@ -901,6 +941,11 @@ def trigger_proximity_broadcast(
     # Tookan won't push to agents who declined, but WILL push to other agents
     task_declined_by = set(str(d) for d in (task.declined_by or []))
     
+    # Suppress non-forced broadcasts for tasks in idle-priority window
+    # (idle agents have exclusive access until timeout)
+    if not force and _is_task_in_idle_priority(task_id):
+        return {'success': True, 'idle_priority_active': True}
+
     # Debounce per-task broadcasts (skip debounce for forced events like timeout/expand/decline)
     now = time.time()
     with _proximity_lock:
@@ -1363,6 +1408,48 @@ def trigger_proximity_broadcast(
             _task_offer_times[task_id] = now
         first_offered_at = _task_offer_times[task_id]
     
+    # =========================================================================
+    # IDLE AGENT PRIORITY: On first broadcast, give idle agents exclusive access
+    # for the timeout duration before falling back to all agents.
+    # Exempt: P1 agents and region-based agents (always included).
+    # =========================================================================
+    is_first_broadcast = not previous_agents
+    task_in_idle_priority = _is_task_in_idle_priority(task_id)
+
+    if task_in_idle_priority and force:
+        # Task was in idle-priority and this is a forced re-broadcast (timeout/expand)
+        # → clear idle-priority, let all agents through (normal fallback)
+        _clear_idle_priority(task_id)
+        log_event(f"[ProximityBroadcast] ⏰ IDLE PRIORITY EXPIRED: {task.restaurant_name} → falling back to all agents")
+    elif is_first_broadcast and not task_in_idle_priority:
+        # First broadcast for this task — check for idle regular/scooter agents
+        idle_agents = []
+        busy_agents = []
+        exempt_agents = []
+        for a in feasible_agents:
+            agent_obj = fleet_state.get_agent(a['agent_id']) if fleet_state else None
+            if agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
+                exempt_agents.append(a)
+            elif a.get('current_task_count', 0) == 0:
+                idle_agents.append(a)
+            else:
+                busy_agents.append(a)
+
+        if idle_agents:
+            idle_names = [a['agent_name'] for a in idle_agents]
+            busy_names = [a['agent_name'] for a in busy_agents]
+            exempt_names = [a['agent_name'] for a in exempt_agents]
+            feasible_agents = idle_agents + exempt_agents
+            idle_agent_ids = set(a['agent_id'] for a in idle_agents)
+            _set_idle_priority(task_id, idle_agent_ids)
+            log_event(
+                f"[ProximityBroadcast] 💤 IDLE PRIORITY: {task.restaurant_name} → "
+                f"{len(idle_agents)} idle agents: {idle_names}"
+                + (f", {len(exempt_agents)} exempt: {exempt_names}" if exempt_agents else "")
+                + (f" | {len(busy_agents)} busy agents deferred: {busy_names}" if busy_agents else "")
+                + f" | timeout: {PROXIMITY_TASK_TIMEOUT_SECONDS}s"
+            )
+
     # Build and emit task:proximity payload
     proximity_payload = {
         'event': 'task:proximity',
@@ -1493,9 +1580,20 @@ def trigger_batched_proximity_broadcast(
     valid_tasks = []
     skipped_at_limit = []
     skipped_declined = []
+    skipped_idle_priority = []
+    is_exempt = _is_agent_exempt_from_idle_priority(agent)
     for task_id in task_ids:
         task = fleet_state.get_task(task_id)
         if task and task.status == TaskStatus.UNASSIGNED:
+            # Skip tasks in idle-priority window (unless this agent is exempt or was one of the idle agents)
+            if _is_task_in_idle_priority(task_id) and not is_exempt:
+                with _proximity_lock:
+                    entry = _idle_priority_tasks.get(task_id)
+                    idle_ids = entry['idle_agent_ids'] if entry else set()
+                if str(agent_id) not in idle_ids:
+                    skipped_idle_priority.append(task.restaurant_name)
+                    continue
+
             # Skip if THIS AGENT already declined this task (Tookan won't push to them)
             task_declined_by = set(str(d) for d in (task.declined_by or []))
             if str(agent_id) in task_declined_by:
@@ -1512,6 +1610,9 @@ def trigger_batched_proximity_broadcast(
             # Stop when we hit broadcast capacity limit
             if len(valid_tasks) >= broadcast_capacity:
                 break
+    
+    if skipped_idle_priority:
+        log_event(f"[ProximityBroadcast] 💤 Batched: Skipping {len(skipped_idle_priority)} idle-priority tasks for {agent_name} (busy agent): {skipped_idle_priority}")
     
     if skipped_declined:
         log_event(f"[ProximityBroadcast] 🚫 Batched: Skipping {len(skipped_declined)} declined tasks for {agent_name}: {skipped_declined}")
@@ -2046,12 +2147,13 @@ def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -
 def clean_task_tracking(task_id: str, clear_broadcast_counts: bool = True):
     """Clean up tracking data when a task is assigned/completed."""
     global _task_offer_times, _task_expanded_radius, _last_proximity_broadcast, _task_current_agents
-    
+
     with _proximity_lock:
         _task_offer_times.pop(task_id, None)
         _task_expanded_radius.pop(task_id, None)
         _last_proximity_broadcast.pop(task_id, None)
         _task_current_agents.pop(task_id, None)
+        _idle_priority_tasks.pop(task_id, None)
     
     # Clear from ALL agents' pending broadcasts
     clear_task_from_all_pending(task_id)
