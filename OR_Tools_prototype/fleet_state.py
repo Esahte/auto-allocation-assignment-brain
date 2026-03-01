@@ -16,7 +16,7 @@ The abstract map enables:
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import threading
 import math
@@ -698,7 +698,33 @@ class FleetState:
             agent_id = str(agent_id) if agent_id else ''
             
             if task_id not in self._tasks:
-                logger.warning(f"[FleetState] Cannot assign - task {task_id[:20]}... not found")
+                # Task not in fleet state (missed task:created event)
+                # Still link to agent so capacity tracking stays accurate
+                if agent_id in self._agents:
+                    agent = self._agents[agent_id]
+                    if not any(t.id == task_id for t in agent.current_tasks):
+                        placeholder = Location(0, 0)
+                        now = datetime.now(timezone.utc)
+                        current_task = CurrentTask(
+                            id=task_id,
+                            job_type="PAIRED",
+                            restaurant_location=placeholder,
+                            delivery_location=placeholder,
+                            pickup_before=now + timedelta(hours=1),
+                            delivery_before=now + timedelta(hours=2),
+                        )
+                        agent.current_tasks.append(current_task)
+                        if len(agent.current_tasks) >= agent.max_capacity:
+                            agent.status = AgentStatus.AT_CAPACITY
+                        else:
+                            agent.status = AgentStatus.BUSY
+                        name = agent_name or agent.name
+                        logger.warning(
+                            f"[FleetState] Task {task_id[:20]}... not found but linked to {name} "
+                            f"for capacity tracking (tasks: {len(agent.current_tasks)})"
+                        )
+                else:
+                    logger.warning(f"[FleetState] Cannot assign - task {task_id[:20]}... not found, agent {agent_id} not in state")
                 return None
             
             task = self._tasks[task_id]
@@ -797,6 +823,31 @@ class FleetState:
                     logger.info(f"[FleetState] Task {task.restaurant_name} accepted by {self._agents[agent_id].name}")
                 
                 return task
+
+            # Task not in fleet state (missed task:created event)
+            # Still link to agent so capacity tracking stays accurate
+            if agent_id in self._agents:
+                agent = self._agents[agent_id]
+                if not any(t.id == task_id for t in agent.current_tasks):
+                    placeholder = Location(0, 0)
+                    now = datetime.now(timezone.utc)
+                    current_task = CurrentTask(
+                        id=task_id,
+                        job_type="PAIRED",
+                        restaurant_location=placeholder,
+                        delivery_location=placeholder,
+                        pickup_before=now + timedelta(hours=1),
+                        delivery_before=now + timedelta(hours=2),
+                    )
+                    agent.current_tasks.append(current_task)
+                    if len(agent.current_tasks) >= agent.max_capacity:
+                        agent.status = AgentStatus.AT_CAPACITY
+                    else:
+                        agent.status = AgentStatus.BUSY
+                    logger.warning(
+                        f"[FleetState] Task {task_id[:20]}... not found but linked to {agent.name} "
+                        f"on accept for capacity tracking (tasks: {len(agent.current_tasks)})"
+                    )
             return None
     
     def get_agent(self, agent_id: str) -> Optional[AgentState]:
@@ -1362,6 +1413,27 @@ class FleetState:
                     )
                     return f"agent_restricted_to_region ({region_names})"
         
+        # 6c. Scooter region restriction: Scooter agents can only take tasks where
+        # BOTH pickup AND delivery are fully within their scooter region.
+        # Unlike traditional regions, scooter regions don't block other agents —
+        # they only prevent scooter agents from leaving their designated area.
+        scooter_regions = self._get_agent_scooter_regions(agent)
+        if scooter_regions:
+            task_fully_in_scooter_region = False
+            for sr in scooter_regions:
+                if self._is_task_fully_within_scooter_region(task, sr['id']):
+                    task_fully_in_scooter_region = True
+                    break
+            
+            if not task_fully_in_scooter_region:
+                region_names = ', '.join(sr['name'] for sr in scooter_regions)
+                logger.info(
+                    f"[Geofence] SCOOTER BLOCK: agent={agent.name} ({agent.id}) "
+                    f"is assigned to scooter region(s) [{region_names}] but task={task.id[:20]} "
+                    f"pickup and/or delivery is outside those regions"
+                )
+                return f"agent_restricted_to_scooter_region ({region_names})"
+        
         # 7. Check max distance (using current or projected location)
         # Priority 1 agents BYPASS distance for premium tasks (but NOT direction check!)
         # Region-matched agents also BYPASS distance
@@ -1538,9 +1610,32 @@ class FleetState:
             return pickup_region
         if delivery_region and not delivery_region['is_scooter']:
             return delivery_region
-        # If only scooter regions matched, return None (scooter handled by optimizer)
+        # If only scooter regions matched, return None for non-scooter logic
         return None
-    
+
+    def _is_task_fully_within_scooter_region(self, task: 'TaskState', region_id: str) -> bool:
+        """
+        Check if BOTH pickup and delivery locations are within the given scooter region.
+        Scooter agents can only take tasks where the entire trip stays in their region.
+        """
+        gf = self._geofences.get(region_id)
+        if not gf:
+            return False
+        polygon = gf.get('polygon', [])
+        if not polygon:
+            return False
+        
+        pickup_inside = (
+            task.restaurant_location and
+            self._point_in_polygon(task.restaurant_location.lat, task.restaurant_location.lng, polygon)
+        )
+        delivery_inside = (
+            task.delivery_location and
+            self._point_in_polygon(task.delivery_location.lat, task.delivery_location.lng, polygon)
+        )
+        
+        return pickup_inside and delivery_inside
+
     def _get_online_region_agents(self, region_id: str) -> List[str]:
         """
         Get list of online agent IDs assigned to the given region.
@@ -1563,7 +1658,7 @@ class FleetState:
     def _get_agent_regions(self, agent: 'AgentState') -> List[Dict[str, Any]]:
         """
         Get list of non-scooter geofence regions this agent is assigned to.
-        
+
         Checks all geofences' agent_ids to find which regions include this agent.
         Returns list of {'id': str, 'name': str} for non-scooter regions only.
         Returns empty list if agent is not in any non-scooter region.
@@ -1576,6 +1671,24 @@ class FleetState:
         for gf_id, gf in self._geofences.items():
             region_name = gf.get('name', '')
             if 'scooter' in region_name.lower():
+                continue
+            if agent_id_str in gf.get('agent_ids', set()):
+                regions.append({'id': gf_id, 'name': region_name})
+        return regions
+
+    def _get_agent_scooter_regions(self, agent: 'AgentState') -> List[Dict[str, Any]]:
+        """
+        Get list of scooter geofence regions this agent is assigned to.
+        Returns list of {'id': str, 'name': str} for scooter regions only.
+        """
+        if not self._geofences:
+            return []
+        
+        regions = []
+        agent_id_str = str(agent.id)
+        for gf_id, gf in self._geofences.items():
+            region_name = gf.get('name', '')
+            if 'scooter' not in region_name.lower():
                 continue
             if agent_id_str in gf.get('agent_ids', set()):
                 regions.append({'id': gf_id, 'name': region_name})
