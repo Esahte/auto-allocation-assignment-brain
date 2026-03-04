@@ -598,6 +598,12 @@ class FleetState:
                 if isinstance(delivery_before, str):
                     delivery_before = _parse_datetime(delivery_before)
                 
+                task_meta = dict(t.get('_meta', {}))
+                if 'restaurant_name' not in task_meta and t.get('restaurant_name'):
+                    task_meta['restaurant_name'] = t['restaurant_name']
+                if 'customer_name' not in task_meta and t.get('customer_name'):
+                    task_meta['customer_name'] = t['customer_name']
+
                 current_task = CurrentTask(
                     id=t.get('id', ''),
                     job_type=t.get('job_type', 'PAIRED'),
@@ -606,7 +612,7 @@ class FleetState:
                     pickup_before=pickup_before or datetime.now(timezone.utc),
                     delivery_before=delivery_before or datetime.now(timezone.utc),
                     pickup_completed=t.get('pickup_completed', False),
-                    meta=t.get('_meta', {})
+                    meta=task_meta
                 )
                 agent.current_tasks.append(current_task)
             
@@ -808,7 +814,8 @@ class FleetState:
                                 delivery_location=task.delivery_location,
                                 pickup_before=task.pickup_before,
                                 delivery_before=task.delivery_before,
-                                pickup_completed=task.pickup_completed
+                                pickup_completed=task.pickup_completed,
+                                meta=task.meta
                             )
                             agent.current_tasks.append(current_task)
                             # Update agent status
@@ -880,6 +887,15 @@ class FleetState:
         with self._lock:
             # Convert task_id to string for consistent lookup
             task_id = str(task_data.get('id', ''))
+
+            # Build meta: prefer _meta from payload, but fall back to top-level fields.
+            # Dashboard fleet:sync in_progress_tasks may send restaurant_name/customer_name
+            # at the top level without wrapping them in _meta.
+            meta = dict(task_data.get('_meta', {}))
+            if 'restaurant_name' not in meta and task_data.get('restaurant_name'):
+                meta['restaurant_name'] = task_data['restaurant_name']
+            if 'customer_name' not in meta and task_data.get('customer_name'):
+                meta['customer_name'] = task_data['customer_name']
             
             # Parse locations with validation
             restaurant_loc = task_data.get('restaurant_location') or [0, 0]
@@ -990,7 +1006,7 @@ class FleetState:
                 task.delivery_fee = delivery_fee
                 task.tips = tips
                 task.max_distance_km = max_distance_km if max_distance_km is not None else task.max_distance_km
-                task.meta = task_data.get('_meta', task.meta)
+                task.meta = meta if meta else task.meta
                 task.last_updated = datetime.now(timezone.utc)
                 
                 # Handle declined_by based on whether this is an admin reset
@@ -1052,7 +1068,7 @@ class FleetState:
                     delivery_fee=delivery_fee,
                     tips=tips,
                     max_distance_km=max_distance_km,
-                    meta=task_data.get('_meta', {}),
+                    meta=meta,
                     declined_by=task_declined_by
                 )
                 self._tasks[task_id] = task

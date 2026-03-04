@@ -4137,8 +4137,12 @@ def handle_task_updated(data):
     status_changed_to_unassigned = False
     declined_by_cleared_by_admin = False  # Track if we cleared declined_by due to admin reset
     
-    # Update task fields
-    meta = data.get('_meta', {})
+    # Update task fields — prefer _meta, fall back to top-level fields
+    meta = dict(data.get('_meta', {}))
+    if 'restaurant_name' not in meta and data.get('restaurant_name'):
+        meta['restaurant_name'] = data['restaurant_name']
+    if 'customer_name' not in meta and data.get('customer_name'):
+        meta['customer_name'] = data['customer_name']
     restaurant_name = meta.get('restaurant_name', existing_task.restaurant_name)
     
     # CRITICAL: Handle status changes first (before other field updates)
@@ -4332,13 +4336,14 @@ def handle_task_updated(data):
             existing_task.pickup_completed = new_pickup
             changes.append('pickup_completed')
     
-    # Meta updates
+    # Meta updates (restaurant_name and customer_name are read-only properties
+    # derived from self.meta, so update the meta dict directly)
     if meta.get('restaurant_name') and existing_task.restaurant_name != meta['restaurant_name']:
-        existing_task.restaurant_name = meta['restaurant_name']
+        existing_task.meta['restaurant_name'] = meta['restaurant_name']
         changes.append('restaurant_name')
-    
-    # Note: customer_name is a read-only property derived from _meta, skip update
-    # The customer_name comes from _meta which we can update via update_task()
+    if meta.get('customer_name') and existing_task.customer_name != meta['customer_name']:
+        existing_task.meta['customer_name'] = meta['customer_name']
+        changes.append('customer_name')
     
     # Update timestamp
     existing_task.last_updated = datetime.now(timezone.utc)
