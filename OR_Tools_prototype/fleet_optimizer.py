@@ -18,7 +18,7 @@ logger = logging.getLogger('fleet_optimizer')
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, ClassVar
 from dataclasses import dataclass, field
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
@@ -37,6 +37,8 @@ DEFAULT_MAX_LATENESS_MINUTES = 45
 # Maximum allowed delay for pickups (in minutes)
 # How long after food is ready can the agent arrive before the task is considered infeasible
 DEFAULT_MAX_PICKUP_DELAY_MINUTES = 60
+DEFAULT_PREMIUM_TIP_THRESHOLD = 5.0
+DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD = 18.0
 
 # =============================================================================
 # HTTP SESSION WITH RETRY LOGIC
@@ -91,6 +93,8 @@ class Location:
 
 @dataclass
 class Task:
+    PREMIUM_TIP_THRESHOLD: ClassVar[float] = DEFAULT_PREMIUM_TIP_THRESHOLD
+    PREMIUM_DELIVERY_FEE_THRESHOLD: ClassVar[float] = DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD
     """Represents a delivery task (pickup + delivery pair)"""
     id: str
     restaurant_location: Location
@@ -109,8 +113,11 @@ class Task:
     
     @property
     def is_premium_task(self) -> bool:
-        """Check if this is a premium task (tips >= $5 OR delivery_fee >= $18)"""
-        return self.tips >= 5.0 or self.delivery_fee >= 18.0
+        """Check if this is a premium task using configured thresholds."""
+        return (
+            self.tips >= type(self).PREMIUM_TIP_THRESHOLD
+            or self.delivery_fee >= type(self).PREMIUM_DELIVERY_FEE_THRESHOLD
+        )
     
     @classmethod
     def from_dict(cls, data: dict) -> 'Task':
@@ -383,7 +390,9 @@ class CompatibilityChecker:
                  prefilter_distance: bool = True,
                  max_lateness_minutes: int = DEFAULT_MAX_LATENESS_MINUTES,
                  max_pickup_delay_minutes: int = DEFAULT_MAX_PICKUP_DELAY_MINUTES,
-                 direction_coherence_mode: str = "prefilter"):
+                 direction_coherence_mode: str = "prefilter",
+                 premium_tip_threshold: float = DEFAULT_PREMIUM_TIP_THRESHOLD,
+                 premium_delivery_fee_threshold: float = DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
         self.max_distance_km = max_distance_km  # Max distance for assignment
@@ -391,6 +400,8 @@ class CompatibilityChecker:
         self.max_lateness_minutes = max_lateness_minutes  # Max allowed delivery lateness
         self.max_pickup_delay_minutes = max_pickup_delay_minutes  # Max delay after food ready
         self.direction_coherence_mode = direction_coherence_mode  # "prefilter" or "solver"
+        self.premium_tip_threshold = premium_tip_threshold
+        self.premium_delivery_fee_threshold = premium_delivery_fee_threshold
         self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
@@ -553,7 +564,7 @@ class CompatibilityChecker:
         # =================================================================
         # PRIORITY AGENT RULES (Check second)
         # =================================================================
-        # Priority 1 agents ONLY get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        # Priority 1 agents ONLY get premium tasks (configurable thresholds)
         # They bypass distance constraints for qualifying tasks
         if agent.priority == 1:
             if not task.is_premium_task:
@@ -2663,9 +2674,16 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     max_distance_km = settings.get('maxDistanceKm', None)  # Max distance for assignment
     max_lateness_minutes = settings.get('maxLatenessMinutes', DEFAULT_MAX_LATENESS_MINUTES)  # Max allowed delivery lateness
     max_pickup_delay_minutes = settings.get('maxPickupDelayMinutes', DEFAULT_MAX_PICKUP_DELAY_MINUTES)  # Max delay after food ready
+    premium_tip_threshold = settings.get('premiumTipThreshold', DEFAULT_PREMIUM_TIP_THRESHOLD)
+    premium_delivery_fee_threshold = settings.get('premiumDeliveryFeeThreshold', DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD)
+
+    # Apply thresholds globally to parsed Task objects for this optimization call.
+    Task.PREMIUM_TIP_THRESHOLD = float(premium_tip_threshold)
+    Task.PREMIUM_DELIVERY_FEE_THRESHOLD = float(premium_delivery_fee_threshold)
     
     print(f"[optimize_fleet] Settings: wallet_threshold={wallet_threshold}, max_distance_km={max_distance_km}, "
-          f"max_lateness={max_lateness_minutes}min, max_pickup_delay={max_pickup_delay_minutes}min")
+          f"max_lateness={max_lateness_minutes}min, max_pickup_delay={max_pickup_delay_minutes}min, "
+          f"premium_tip_threshold={Task.PREMIUM_TIP_THRESHOLD}, premium_delivery_fee_threshold={Task.PREMIUM_DELIVERY_FEE_THRESHOLD}")
     
     # Build compatibility checker
     compatibility_checker = CompatibilityChecker(
@@ -2675,7 +2693,9 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         prefilter_distance=prefilter_distance,
         max_lateness_minutes=max_lateness_minutes,
         max_pickup_delay_minutes=max_pickup_delay_minutes,
-        direction_coherence_mode=direction_coherence_mode
+        direction_coherence_mode=direction_coherence_mode,
+        premium_tip_threshold=Task.PREMIUM_TIP_THRESHOLD,
+        premium_delivery_fee_threshold=Task.PREMIUM_DELIVERY_FEE_THRESHOLD
     )
     
     # Run optimizer

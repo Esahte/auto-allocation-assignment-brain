@@ -15,7 +15,7 @@ The abstract map enables:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any, ClassVar
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import threading
@@ -117,6 +117,8 @@ class Location:
 
 @dataclass
 class TaskState:
+    PREMIUM_TIP_THRESHOLD: ClassVar[float] = 5.0
+    PREMIUM_DELIVERY_FEE_THRESHOLD: ClassVar[float] = 18.0
     id: str
     job_type: str  # "PAIRED", "PICKUP", "DELIVERY"
     restaurant_location: Location
@@ -193,8 +195,11 @@ class TaskState:
     
     @property
     def is_premium_task(self) -> bool:
-        """Check if this is a premium task (tips >= $5 OR delivery_fee >= $18)"""
-        return self.tips >= 5.0 or self.delivery_fee >= 18.0
+        """Check if this is a premium task using configured thresholds."""
+        return (
+            self.tips >= type(self).PREMIUM_TIP_THRESHOLD
+            or self.delivery_fee >= type(self).PREMIUM_DELIVERY_FEE_THRESHOLD
+        )
     
     @property
     def total_earnings(self) -> float:
@@ -368,6 +373,8 @@ class FleetState:
         self.max_lateness_minutes = max_lateness_minutes
         self.max_pickup_delay_minutes = max_pickup_delay_minutes
         self.wallet_threshold = 500.0  # Minimum wallet balance for cash orders
+        self.premium_tip_threshold = TaskState.PREMIUM_TIP_THRESHOLD
+        self.premium_delivery_fee_threshold = TaskState.PREMIUM_DELIVERY_FEE_THRESHOLD
         self.default_max_capacity = 2  # Default max tasks per agent
         self.direction_coherence_mode = os.environ.get('DIRECTION_COHERENCE_MODE', 'solver').lower()  # "prefilter" = hard block, "solver" = OR-Tools penalty
         
@@ -1314,7 +1321,7 @@ class FleetState:
                                       (used when radius is expanded in proximity broadcast)
         
         Business Rules Checked:
-        0. Priority - Priority 1 agents only get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        0. Priority - Priority 1 agents only get premium tasks (configurable thresholds)
         0b. Tag Matching - TEST agents only get TEST tasks, tagged tasks go to matching agents
         1. Declined - Agent hasn't declined this task
         2. Capacity - Agent has room for more tasks
@@ -1325,7 +1332,7 @@ class FleetState:
         7. Max Distance - Agent is within allowed distance (bypassed for Priority 1 on premium tasks)
         """
         # 0. PRIORITY AGENT RULES
-        # Priority 1 agents ONLY get premium tasks (tips >= $5 OR delivery_fee >= $18)
+        # Priority 1 agents ONLY get premium tasks (configurable thresholds)
         if agent.priority == 1:
             if not task.is_premium_task:
                 return "priority1_non_premium"

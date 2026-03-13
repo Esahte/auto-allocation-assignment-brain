@@ -112,7 +112,7 @@ print(f"[Logging] Important events: important_events.log")
 
 # Import Fleet State (Abstract Map)
 try:
-    from fleet_state import fleet_state, AgentStatus, TaskStatus
+    from fleet_state import fleet_state, AgentStatus, TaskStatus, TaskState
     FLEET_STATE_AVAILABLE = True
     print("[FleetState] Abstract Map loaded successfully")
     
@@ -1276,7 +1276,9 @@ def trigger_proximity_broadcast(
             'geofence_data': _export_geofence_data(),
             'settings_used': {
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
-                'maxDistanceKm': search_radius  # Use current search radius
+                'maxDistanceKm': search_radius,  # Use current search radius
+                'premiumTipThreshold': fleet_state.premium_tip_threshold,
+                'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold
             }
         }
         
@@ -1835,7 +1837,9 @@ def trigger_batched_proximity_broadcast(
         'geofence_data': _export_geofence_data(),
         'settings_used': {
             'walletNoCashThreshold': fleet_state.wallet_threshold,
-            'maxDistanceKm': fleet_state.max_distance_km
+            'maxDistanceKm': fleet_state.max_distance_km,
+            'premiumTipThreshold': fleet_state.premium_tip_threshold,
+            'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold
         }
     }
     
@@ -2815,7 +2819,9 @@ def trigger_incremental_optimization(
             'geofence_data': _export_geofence_data(),
             'settings_used': {
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
-                'maxDistanceKm': fleet_state.max_distance_km
+                'maxDistanceKm': fleet_state.max_distance_km,
+                'premiumTipThreshold': fleet_state.premium_tip_threshold,
+                'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold
             }
         }
         
@@ -3087,6 +3093,16 @@ def handle_fleet_sync(data):
             if 'wallet_threshold' in config:
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
                 print(f"[FleetState] → wallet_threshold = ${fleet_state.wallet_threshold}")
+
+            if 'premium_tip_threshold' in config:
+                fleet_state.premium_tip_threshold = float(config['premium_tip_threshold'])
+                TaskState.PREMIUM_TIP_THRESHOLD = fleet_state.premium_tip_threshold
+                print(f"[FleetState] → premium_tip_threshold = {fleet_state.premium_tip_threshold}")
+
+            if 'premium_delivery_fee_threshold' in config:
+                fleet_state.premium_delivery_fee_threshold = float(config['premium_delivery_fee_threshold'])
+                TaskState.PREMIUM_DELIVERY_FEE_THRESHOLD = fleet_state.premium_delivery_fee_threshold
+                print(f"[FleetState] → premium_delivery_fee_threshold = {fleet_state.premium_delivery_fee_threshold}")
             
             if 'max_tasks_per_agent' in config:
                 new_capacity = int(config['max_tasks_per_agent'])
@@ -3137,6 +3153,8 @@ def handle_fleet_sync(data):
                 'max_lateness_minutes': fleet_state.max_lateness_minutes,
                 'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
                 'wallet_threshold': fleet_state.wallet_threshold,
+                'premium_tip_threshold': fleet_state.premium_tip_threshold,
+                'premium_delivery_fee_threshold': fleet_state.premium_delivery_fee_threshold,
                 'max_tasks_per_agent': fleet_state.default_max_capacity,
                 'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
                 'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
@@ -3155,7 +3173,11 @@ def handle_fleet_sync(data):
         })
         
         log_event(f"[FleetState] ✅ SYNC COMPLETE: {stats['online_agents']} agents, {stats['unassigned_tasks']} unassigned tasks")
-        print(f"[FleetState] Config: max_dist={fleet_state.max_distance_km}km, max_lateness={fleet_state.max_lateness_minutes}min, wallet=${fleet_state.wallet_threshold}")
+        print(
+            f"[FleetState] Config: max_dist={fleet_state.max_distance_km}km, "
+            f"max_lateness={fleet_state.max_lateness_minutes}min, wallet=${fleet_state.wallet_threshold}, "
+            f"premium_tip={fleet_state.premium_tip_threshold}, premium_fee={fleet_state.premium_delivery_fee_threshold}"
+        )
         
     except Exception as e:
         log_event(f"[FleetState] ❌ SYNC FAILED: {e}", 'error')
@@ -3182,6 +3204,8 @@ def handle_config_update(data):
             "max_lateness_minutes": 45,
             "max_pickup_delay_minutes": 35,
             "wallet_threshold": 2500,
+            "premium_tip_threshold": 5,
+            "premium_delivery_fee_threshold": 19.99,
             "max_tasks_per_agent": 2,
             "chain_lookahead_radius_km": 5.0
         },
@@ -3235,6 +3259,18 @@ def handle_config_update(data):
             old_val = fleet_state.wallet_threshold
             fleet_state.wallet_threshold = float(config['wallet_threshold'])
             changes.append(f"wallet_threshold: {old_val} → {fleet_state.wallet_threshold}")
+
+        if 'premium_tip_threshold' in config:
+            old_val = fleet_state.premium_tip_threshold
+            fleet_state.premium_tip_threshold = float(config['premium_tip_threshold'])
+            TaskState.PREMIUM_TIP_THRESHOLD = fleet_state.premium_tip_threshold
+            changes.append(f"premium_tip_threshold: {old_val} → {fleet_state.premium_tip_threshold}")
+
+        if 'premium_delivery_fee_threshold' in config:
+            old_val = fleet_state.premium_delivery_fee_threshold
+            fleet_state.premium_delivery_fee_threshold = float(config['premium_delivery_fee_threshold'])
+            TaskState.PREMIUM_DELIVERY_FEE_THRESHOLD = fleet_state.premium_delivery_fee_threshold
+            changes.append(f"premium_delivery_fee_threshold: {old_val} → {fleet_state.premium_delivery_fee_threshold}")
         
         if 'max_tasks_per_agent' in config:
             old_val = fleet_state.default_max_capacity
@@ -3294,6 +3330,8 @@ def handle_config_update(data):
                 'max_lateness_minutes': fleet_state.max_lateness_minutes,
                 'max_pickup_delay_minutes': fleet_state.max_pickup_delay_minutes,
                 'wallet_threshold': fleet_state.wallet_threshold,
+                'premium_tip_threshold': fleet_state.premium_tip_threshold,
+                'premium_delivery_fee_threshold': fleet_state.premium_delivery_fee_threshold,
                 'max_tasks_per_agent': fleet_state.default_max_capacity,
                 'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
                 'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
@@ -3627,7 +3665,13 @@ def handle_task_created(data):
     log_payload('task:created', data)
     delivery_fee = task_data.get('delivery_fee', 0)
     tips = task_data.get('tips', 0)
-    is_premium = (float(delivery_fee) >= 18.0 or float(tips) >= 5.0)
+    tip_threshold = fleet_state.premium_tip_threshold if (FLEET_STATE_AVAILABLE and fleet_state) else TaskState.PREMIUM_TIP_THRESHOLD
+    fee_threshold = (
+        fleet_state.premium_delivery_fee_threshold
+        if (FLEET_STATE_AVAILABLE and fleet_state)
+        else TaskState.PREMIUM_DELIVERY_FEE_THRESHOLD
+    )
+    is_premium = (float(delivery_fee) >= float(fee_threshold) or float(tips) >= float(tip_threshold))
     premium_indicator = "⭐ PREMIUM" if is_premium else "regular"
     log_event(f"[WebSocket] task:created: {str(task_id)[:20]}... | fee=${delivery_fee}, tips=${tips} [{premium_indicator}]")
     if is_premium:
