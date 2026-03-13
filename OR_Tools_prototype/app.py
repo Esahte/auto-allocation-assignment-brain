@@ -251,7 +251,7 @@ _agent_pending_routes = {}  # Track pending route availability: {agent_id: {task
 _last_broadcast_signature = {}  # Track last broadcast signature: {task_id: (timestamp, set(agent_ids))}
 _last_batch_signature = {}  # Track last batch signature: {agent_id: (timestamp, set(task_ids))}
 _task_agent_broadcast_counts = {}  # Track broadcast counts: {task_id: {agent_id: count}}
-_idle_priority_tasks = {}  # Track tasks in idle-priority window: {task_id: {'start_time': float, 'idle_agent_ids': set}}
+_idle_priority_tasks = {}  # Track P2+ priority rollout: {task_id: {'start_time': float, 'allowed_agent_ids': set, 'priority_levels': [int], 'rollout_level': int}}
 
 
 def _is_agent_exempt_from_idle_priority(agent) -> bool:
@@ -278,12 +278,14 @@ def _is_task_in_idle_priority(task_id: str) -> bool:
         return True
 
 
-def _set_idle_priority(task_id: str, idle_agent_ids: set):
-    """Mark a task as in idle-priority window with the set of idle agents it was broadcast to."""
+def _set_idle_priority(task_id: str, allowed_agent_ids: set, priority_levels: list, rollout_level: int):
+    """Track active P2+ rollout state for a task."""
     with _proximity_lock:
         _idle_priority_tasks[task_id] = {
             'start_time': time.time(),
-            'idle_agent_ids': idle_agent_ids
+            'allowed_agent_ids': allowed_agent_ids,
+            'priority_levels': priority_levels,
+            'rollout_level': rollout_level
         }
 
 
@@ -1409,44 +1411,96 @@ def trigger_proximity_broadcast(
         first_offered_at = _task_offer_times[task_id]
     
     # =========================================================================
-    # IDLE AGENT PRIORITY: On first broadcast, give idle agents exclusive access
-    # for the timeout duration before falling back to all agents.
-    # Exempt: P1 agents and region-based agents (always included).
+    # PRIORITY ROLLOUT (P2+ ONLY):
+    # - First push: idle agents in the highest available priority tier (lowest number >= 2)
+    # - Each forced re-broadcast widens to include the next idle priority tier
+    # - After all tiers are exhausted, fallback to all feasible agents
+    # Exempt: P1 and region-based agents stay included as before.
     # =========================================================================
     is_first_broadcast = not previous_agents
     task_in_idle_priority = _is_task_in_idle_priority(task_id)
 
     if task_in_idle_priority and force:
-        # Task was in idle-priority and this is a forced re-broadcast (timeout/expand)
-        # → clear idle-priority, let all agents through (normal fallback)
-        _clear_idle_priority(task_id)
-        log_event(f"[ProximityBroadcast] ⏰ IDLE PRIORITY EXPIRED: {task.restaurant_name} → falling back to all agents")
+        # Forced rebroadcast while rollout is active -> widen to next priority tier.
+        with _proximity_lock:
+            entry = _idle_priority_tasks.get(task_id, {})
+            priority_levels = list(entry.get('priority_levels') or [])
+            current_level = int(entry.get('rollout_level', 0))
+
+        next_level = current_level + 1
+        if priority_levels and next_level < len(priority_levels):
+            unlocked_priorities = set(priority_levels[:next_level + 1])
+            rollout_agents = []
+            deferred_agents = []
+            exempt_agents = []
+            for a in feasible_agents:
+                agent_obj = fleet_state.get_agent(a['agent_id']) if fleet_state else None
+                if agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
+                    exempt_agents.append(a)
+                    continue
+                priority_val = a.get('priority')
+                is_idle = a.get('current_task_count', 0) == 0
+                if is_idle and isinstance(priority_val, int) and priority_val >= 2 and priority_val in unlocked_priorities:
+                    rollout_agents.append(a)
+                else:
+                    deferred_agents.append(a)
+
+            if rollout_agents:
+                feasible_agents = sorted(rollout_agents, key=lambda x: (x.get('priority') or 999, x['distance_km'])) + exempt_agents
+                allowed_agent_ids = set(a['agent_id'] for a in rollout_agents)
+                _set_idle_priority(task_id, allowed_agent_ids, priority_levels, next_level)
+                log_event(
+                    f"[ProximityBroadcast] 🔓 PRIORITY ROLLOUT: {task.restaurant_name} "
+                    f"→ unlocked idle priorities {sorted(unlocked_priorities)} "
+                    f"(agents: {[a['agent_name'] for a in rollout_agents]})"
+                    + (f" | deferred: {[a['agent_name'] for a in deferred_agents]}" if deferred_agents else "")
+                )
+            else:
+                # Nothing left to rollout in this phase, fallback now.
+                _clear_idle_priority(task_id)
+                log_event(f"[ProximityBroadcast] ⏰ PRIORITY ROLLOUT EMPTY: {task.restaurant_name} → falling back to all agents")
+        else:
+            _clear_idle_priority(task_id)
+            log_event(f"[ProximityBroadcast] ⏰ PRIORITY ROLLOUT COMPLETE: {task.restaurant_name} → falling back to all agents")
     elif is_first_broadcast and not task_in_idle_priority:
-        # First broadcast for this task — check for idle regular/scooter agents
-        idle_agents = []
-        busy_agents = []
+        # First broadcast for this task: start with highest-priority idle P2+ tier only.
+        first_wave = []
+        deferred_agents = []
         exempt_agents = []
+        priority_levels = set()
         for a in feasible_agents:
             agent_obj = fleet_state.get_agent(a['agent_id']) if fleet_state else None
             if agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
                 exempt_agents.append(a)
-            elif a.get('current_task_count', 0) == 0:
-                idle_agents.append(a)
             else:
-                busy_agents.append(a)
+                priority_val = a.get('priority')
+                is_idle = a.get('current_task_count', 0) == 0
+                if is_idle and isinstance(priority_val, int) and priority_val >= 2:
+                    priority_levels.add(priority_val)
 
-        if idle_agents:
-            idle_names = [a['agent_name'] for a in idle_agents]
-            busy_names = [a['agent_name'] for a in busy_agents]
+        sorted_levels = sorted(priority_levels)
+        if sorted_levels:
+            first_priority = sorted_levels[0]
+            for a in feasible_agents:
+                agent_obj = fleet_state.get_agent(a['agent_id']) if fleet_state else None
+                if agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
+                    continue
+                if a.get('current_task_count', 0) == 0 and a.get('priority') == first_priority:
+                    first_wave.append(a)
+                else:
+                    deferred_agents.append(a)
+
+        if first_wave:
+            first_wave = sorted(first_wave, key=lambda x: x['distance_km'])
+            feasible_agents = first_wave + exempt_agents
+            allowed_agent_ids = set(a['agent_id'] for a in first_wave)
+            _set_idle_priority(task_id, allowed_agent_ids, sorted_levels, 0)
             exempt_names = [a['agent_name'] for a in exempt_agents]
-            feasible_agents = idle_agents + exempt_agents
-            idle_agent_ids = set(a['agent_id'] for a in idle_agents)
-            _set_idle_priority(task_id, idle_agent_ids)
             log_event(
-                f"[ProximityBroadcast] 💤 IDLE PRIORITY: {task.restaurant_name} → "
-                f"{len(idle_agents)} idle agents: {idle_names}"
+                f"[ProximityBroadcast] 💤 PRIORITY ROLLOUT START: {task.restaurant_name} → "
+                f"idle P{first_priority} agents: {[a['agent_name'] for a in first_wave]}"
                 + (f", {len(exempt_agents)} exempt: {exempt_names}" if exempt_agents else "")
-                + (f" | {len(busy_agents)} busy agents deferred: {busy_names}" if busy_agents else "")
+                + (f" | deferred: {[a['agent_name'] for a in deferred_agents]}" if deferred_agents else "")
                 + f" | timeout: {PROXIMITY_TASK_TIMEOUT_SECONDS}s"
             )
 
@@ -1589,8 +1643,10 @@ def trigger_batched_proximity_broadcast(
             if _is_task_in_idle_priority(task_id) and not is_exempt:
                 with _proximity_lock:
                     entry = _idle_priority_tasks.get(task_id)
-                    idle_ids = entry['idle_agent_ids'] if entry else set()
-                if str(agent_id) not in idle_ids:
+                    allowed_ids = set()
+                    if entry:
+                        allowed_ids = set(entry.get('allowed_agent_ids') or entry.get('idle_agent_ids') or [])
+                if str(agent_id) not in allowed_ids:
                     skipped_idle_priority.append(task.restaurant_name)
                     continue
 
