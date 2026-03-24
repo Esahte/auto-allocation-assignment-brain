@@ -4962,14 +4962,16 @@ def handle_agent_location_update(data):
                     if result.get('success') and result.get('broadcast_count', 0) > 0:
                         print(f"[ProximityBroadcast] ✅ Batched {result.get('broadcast_count')} tasks to {name}")
                     elif not result.get('debounced'):
-                        # Batched failed, fall back to single-task broadcast for closest
-                        print(f"[ProximityBroadcast] ⚠️ Batch failed, falling back to single task")
-                        best_trigger = eligible_triggers[0]
-                        trigger_proximity_broadcast(
-                            task_id=best_trigger.task.id,
-                            triggered_by_agent=name,
-                            dashboard_url=dashboard_url
-                        )
+                        # Batched checks are agent-specific. If this one agent fails
+                        # (e.g., direction conflict), still run normal proximity
+                        # broadcasts so other nearby eligible agents can get offers.
+                        print(f"[ProximityBroadcast] ⚠️ Batch failed for {name}, falling back to task-level proximity broadcasts")
+                        for trigger in eligible_triggers:
+                            trigger_proximity_broadcast(
+                                task_id=trigger.task.id,
+                                triggered_by_agent=name,
+                                dashboard_url=dashboard_url
+                            )
                 else:
                     # Single task - use original single-task broadcast
                     best_trigger = eligible_triggers[0]
