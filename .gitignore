@@ -5,6 +5,8 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
+OR_Tools_prototype/.venv/
 env/
 ENV/
 
