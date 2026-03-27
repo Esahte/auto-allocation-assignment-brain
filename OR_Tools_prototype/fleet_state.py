@@ -692,6 +692,15 @@ class FleetState:
                     logger.info(f"[FleetState] Task {task_id[:20]}... declined by {agent_name} (total: {len(task.declined_by)} agents)")
                 else:
                     logger.info(f"[FleetState] Task {task_id[:20]}... has {len(task.declined_by)} declines")
+            else:
+                # Defensive cleanup for race: decline can arrive when task:create
+                # was missed and the task only exists as placeholder capacity load.
+                removed = self._remove_task_from_all_agents(task_id)
+                if removed > 0:
+                    logger.warning(
+                        f"[FleetState] Decline for unknown task {task_id[:20]}... "
+                        f"cleaned placeholder from {removed} agent(s)"
+                    )
     
     def assign_task(self, task_id: str, agent_id: str, agent_name: Optional[str] = None) -> Optional[TaskState]:
         """
