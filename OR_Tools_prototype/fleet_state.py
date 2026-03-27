@@ -1125,6 +1125,35 @@ class FleetState:
                 task.last_updated = datetime.now(timezone.utc)
                 return task
             return None
+
+    def _remove_task_from_all_agents(self, task_id: str) -> int:
+        """
+        Remove a task ID from every agent's current_tasks list.
+        Returns how many agents were cleaned.
+        """
+        removed_from_agents = 0
+        for agent in self._agents.values():
+            before = len(agent.current_tasks)
+            if before == 0:
+                continue
+
+            agent.current_tasks = [t for t in agent.current_tasks if t.id != task_id]
+            after = len(agent.current_tasks)
+            if after == before:
+                continue
+
+            removed_from_agents += 1
+
+            # Keep OFFLINE status untouched, otherwise recalculate by task load.
+            if agent.status != AgentStatus.OFFLINE:
+                if after == 0:
+                    agent.status = AgentStatus.IDLE
+                elif after >= agent.max_capacity:
+                    agent.status = AgentStatus.AT_CAPACITY
+                else:
+                    agent.status = AgentStatus.BUSY
+
+        return removed_from_agents
     
     def mark_pickup_complete(self, task_id: str) -> Optional[TaskState]:
         """
@@ -1158,20 +1187,21 @@ class FleetState:
                 task = self._tasks[task_id]
                 task.status = TaskStatus.COMPLETED
                 task.last_updated = datetime.now(timezone.utc)
-                
-                # Remove from agent's current tasks
-                if task.assigned_agent_id and task.assigned_agent_id in self._agents:
-                    agent = self._agents[task.assigned_agent_id]
-                    agent.current_tasks = [t for t in agent.current_tasks if t.id != task_id]
-                    
-                    # Update agent status
-                    if len(agent.current_tasks) == 0 and agent.status != AgentStatus.OFFLINE:
-                        agent.status = AgentStatus.IDLE
-                    elif len(agent.current_tasks) < agent.max_capacity:
-                        agent.status = AgentStatus.BUSY
-                
+
+                # Always remove globally to clean duplicates/placeholders.
+                self._remove_task_from_all_agents(task_id)
+
                 logger.info(f"[FleetState] Task completed: {task_id[:20]}...")
                 return task
+
+            # Defensive cleanup for race: completion can arrive before task:create.
+            # In that case the task may only exist as a placeholder in agent lists.
+            removed = self._remove_task_from_all_agents(task_id)
+            if removed > 0:
+                logger.warning(
+                    f"[FleetState] Completion for unknown task {task_id[:20]}... "
+                    f"cleaned placeholder from {removed} agent(s)"
+                )
             return None
     
     def cancel_task(self, task_id: str) -> Optional[TaskState]:
@@ -1182,14 +1212,20 @@ class FleetState:
                 task = self._tasks[task_id]
                 task.status = TaskStatus.CANCELLED
                 task.last_updated = datetime.now(timezone.utc)
-                
-                # Remove from agent's current tasks if assigned
-                if task.assigned_agent_id and task.assigned_agent_id in self._agents:
-                    agent = self._agents[task.assigned_agent_id]
-                    agent.current_tasks = [t for t in agent.current_tasks if t.id != task_id]
-                
+
+                # Always remove globally to clean duplicates/placeholders.
+                self._remove_task_from_all_agents(task_id)
+
                 logger.info(f"[FleetState] Task cancelled: {task_id[:20]}...")
                 return task
+
+            # Defensive cleanup for race: cancellation can arrive before task:create.
+            removed = self._remove_task_from_all_agents(task_id)
+            if removed > 0:
+                logger.warning(
+                    f"[FleetState] Cancellation for unknown task {task_id[:20]}... "
+                    f"cleaned placeholder from {removed} agent(s)"
+                )
             return None
     
     def get_task(self, task_id: str) -> Optional[TaskState]:
