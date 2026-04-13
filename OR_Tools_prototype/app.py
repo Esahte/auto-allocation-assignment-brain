@@ -3684,7 +3684,7 @@ def handle_task_created(data):
         existing_task = fleet_state.get_task(str(task_id))
         if existing_task:
             print(f"[FleetState] ⚠️ Duplicate task:created event for {existing_task.restaurant_name} - skipping")
-            emit('task:created_ack', {'id': task_id, 'duplicate': True})
+            emit('task:created_ack', {'id': task_id, 'duplicate': True, 'event_id': data.get('event_id')})
             return
         
         task = fleet_state.add_task(task_data)
@@ -3735,6 +3735,7 @@ def handle_task_created(data):
             
             emit('task:created_ack', {
                 'id': task_id,
+                'event_id': data.get('event_id'),
                 'received_at': datetime.now().isoformat(),
                 'added_to_fleet_state': True,
                 'proximity_mode': True,
@@ -3793,6 +3794,7 @@ def handle_task_created(data):
     
     emit('task:created_ack', {
         'id': task_id,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'added_to_fleet_state': True,
         'triggered_optimization': triggered_optimization
@@ -3851,6 +3853,7 @@ def handle_task_declined(data):
             emit('task:declined_ack', {
                 'id': task_id,
                 'declined_by': declined_by,
+                'event_id': data.get('event_id'),
                 'received_at': datetime.now().isoformat(),
                 'decline_recorded': True,
                 'proximity_mode': True,
@@ -3910,6 +3913,7 @@ def handle_task_declined(data):
     emit('task:declined_ack', {
         'id': task_id,
         'declined_by': declined_by,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'decline_recorded': True,
         'triggered_optimization': triggered_optimization
@@ -4036,6 +4040,7 @@ def handle_task_completed(data):
         emit('task:completed_ack', {
             'id': task_id,
             'agent_id': agent_id,
+            'event_id': data.get('event_id'),
             'received_at': datetime.now().isoformat(),
             'task_removed': False,
             'pickup_completed': True
@@ -4070,6 +4075,7 @@ def handle_task_completed(data):
         emit('task:completed_ack', {
             'id': task_id,
             'agent_id': agent_id,
+            'event_id': data.get('event_id'),
             'received_at': datetime.now().isoformat(),
             'task_removed': True
         })
@@ -4136,6 +4142,7 @@ def handle_pickup_completed(data):
     emit('pickup:completed_ack', {
         'id': task_id,
         'agent_id': agent_id,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'pickup_completed': True,
         'task_removed': False
@@ -4163,6 +4170,7 @@ def handle_task_cancelled(data):
     emit('task:cancelled_ack', {
         'id': task_id,
         'reason': reason,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'task_removed': True
     })
@@ -4216,6 +4224,7 @@ def handle_task_updated(data):
             'id': task_id,
             'success': False,
             'error': 'Fleet state not available',
+            'event_id': data.get('event_id'),
             'received_at': datetime.now().isoformat()
         })
         return
@@ -4228,6 +4237,7 @@ def handle_task_updated(data):
             'id': task_id,
             'success': False,
             'error': 'Task not found',
+            'event_id': data.get('event_id'),
             'received_at': datetime.now().isoformat()
         })
         return
@@ -4487,6 +4497,7 @@ def handle_task_updated(data):
         'changes': changes,
         'status_changed_to_unassigned': status_changed_to_unassigned,
         'triggered_optimization': should_optimize,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat()
     })
     
@@ -4539,13 +4550,14 @@ def handle_task_updated(data):
 def handle_task_assigned(data):
     """
     Task assigned to agent (manually or via optimization).
-    Payload: { id, agent_id, agent_name, assigned_at, dashboard_url }
+    Payload: { id, agent_id, agent_name, assigned_at, task_snapshot?, event_id?, dashboard_url }
     """
     update_last_event_time('task:assigned')
     performance_stats["websocket_events"] += 1
     task_id = data.get('id', '')
     agent_id = data.get('agent_id')
     agent_name = data.get('agent_name', 'Unknown')
+    task_snapshot = data.get('task_snapshot') if isinstance(data.get('task_snapshot'), dict) else None
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     log_payload('task:assigned', data)
@@ -4554,9 +4566,34 @@ def handle_task_assigned(data):
     task = None
     task_name = 'Unknown'
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
+        # Hydrate unknown assigned tasks from dashboard snapshot before assignment.
+        # This prevents placeholder (0,0) pseudo tasks from polluting capacity.
+        existing_task = fleet_state.get_task(str(task_id))
+        if not existing_task and task_snapshot:
+            try:
+                hydration_payload = dict(task_snapshot)
+                hydration_payload['id'] = str(task_id)
+                hydration_payload['assigned_agent_id'] = str(agent_id)
+                hydration_payload.setdefault('status', 'Assigned')
+                hydrated_task = fleet_state.add_task(hydration_payload)
+                if hydrated_task:
+                    print(
+                        f"[FleetState] Hydrated unknown assigned task {task_id[:20]}... "
+                        f"from task_snapshot before assignment"
+                    )
+            except Exception as hydration_error:
+                app.logger.error(
+                    f"[FleetState] Failed to hydrate task_snapshot for assigned task {task_id[:20]}...: {hydration_error}"
+                )
+
         task = fleet_state.assign_task(task_id, str(agent_id), agent_name)
         if task:
             task_name = task.restaurant_name
+        else:
+            existing = fleet_state.get_task(str(task_id))
+            if existing:
+                task = existing
+                task_name = existing.restaurant_name
     
     log_event(f"[WebSocket] task:assigned: {str(task_id)[:20]}... → {agent_name} ({agent_id})")
     
@@ -4613,6 +4650,7 @@ def handle_task_assigned(data):
         'id': task_id,
         'agent_id': agent_id,
         'agent_name': agent_name,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat()
     })
 
@@ -4624,19 +4662,33 @@ def handle_task_accepted(data):
     In MARKETPLACE MODE: Agent accepted a task from the marketplace.
     Dashboard has already assigned via Tookan - we update our state and re-broadcast.
     
-    Payload: { id, agent_id, agent_name, accepted_at, dashboard_url }
+    Payload: { id, agent_id, agent_name, accepted_at, task_snapshot?, event_id?, dashboard_url }
     """
     update_last_event_time('task:accepted')
     performance_stats["websocket_events"] += 1
     task_id = data.get('id', '')
     agent_id = data.get('agent_id')
     agent_name = data.get('agent_name', 'Unknown')
+    task_snapshot = data.get('task_snapshot') if isinstance(data.get('task_snapshot'), dict) else None
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     log_event(f"[WebSocket] task:accepted: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
     
     # Update fleet state
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
+        if not fleet_state.get_task(str(task_id)) and task_snapshot:
+            try:
+                hydration_payload = dict(task_snapshot)
+                hydration_payload['id'] = str(task_id)
+                hydration_payload['assigned_agent_id'] = str(agent_id)
+                hydration_payload.setdefault('status', 'Assigned')
+                fleet_state.add_task(hydration_payload)
+                print(f"[FleetState] Hydrated unknown accepted task {task_id[:20]}... from task_snapshot")
+            except Exception as hydration_error:
+                app.logger.error(
+                    f"[FleetState] Failed to hydrate task_snapshot for accepted task {task_id[:20]}...: {hydration_error}"
+                )
+
         task = fleet_state.accept_task(task_id, str(agent_id))
         if task:
             # PROXIMITY BROADCAST: Clean up tracking after acceptance
@@ -4656,6 +4708,7 @@ def handle_task_accepted(data):
         'id': task_id,
         'agent_id': agent_id,
         'agent_name': agent_name,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat()
     })
 
@@ -4728,6 +4781,7 @@ def handle_agent_online(data):
     emit('agent:online_ack', {
         'agent_id': agent_id,
         'name': name,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'agent_added': True,
         'triggered_optimization': has_unassigned
@@ -4812,6 +4866,7 @@ def handle_agent_offline(data):
     emit('agent:offline_ack', {
         'agent_id': agent_id,
         'name': name,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'agent_removed': True
     })
@@ -4887,6 +4942,7 @@ def handle_agent_update(data):
     
     emit('agent:update_ack', {
         'agent_id': agent_id,
+        'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
         'updated': updated
     })
