@@ -2182,6 +2182,321 @@ class FleetState:
                 agent.status = AgentStatus.BUSY
             else:
                 agent.status = AgentStatus.IDLE
+
+    def _normalize_datetime_value(self, value: Any) -> Optional[datetime]:
+        """Coerce sync metadata and timestamps into UTC-aware datetimes."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            return _parse_datetime(value)
+        return None
+
+    def _is_local_state_newer_than_snapshot(
+        self,
+        local_updated_at: Optional[datetime],
+        snapshot_started_at: Optional[datetime]
+    ) -> bool:
+        """Return True when local state changed after this snapshot started building."""
+        local_dt = self._normalize_datetime_value(local_updated_at)
+        snapshot_dt = self._normalize_datetime_value(snapshot_started_at)
+        if local_dt is None or snapshot_dt is None:
+            return False
+        return local_dt > snapshot_dt
+
+    def _is_active_task_state(self, task: TaskState) -> bool:
+        """Active tasks remain visible in fleet state and can be preserved across syncs."""
+        return task.status not in (TaskStatus.COMPLETED, TaskStatus.CANCELLED)
+
+    def _agent_to_sync_payload(self, agent: AgentState) -> Dict[str, Any]:
+        """Serialize local agent state using the same shape as dashboard fleet:sync agents."""
+        payload: Dict[str, Any] = {
+            'id': agent.id,
+            'name': agent.name,
+            'location': [agent.current_location.lat, agent.current_location.lng],
+            'status': agent.status.value,
+            'max_capacity': agent.max_capacity,
+            'tags': list(agent.tags),
+            'wallet_balance': agent.wallet_balance
+        }
+        if agent.priority is not None:
+            payload['priority'] = agent.priority
+        return payload
+
+    def _task_to_sync_payload(self, task: TaskState) -> Dict[str, Any]:
+        """Serialize local task state using the same shape as dashboard fleet:sync tasks."""
+        payload: Dict[str, Any] = {
+            'id': task.id,
+            'job_type': task.job_type,
+            'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
+            'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
+            'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
+            'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
+            'tags': list(task.tags),
+            'payment_method': task.payment_method,
+            'delivery_fee': task.delivery_fee,
+            'tips': task.tips,
+            'declined_by': sorted(task.declined_by),
+            '_meta': dict(task.meta)
+        }
+
+        if task.max_distance_km is not None:
+            payload['max_distance_km'] = task.max_distance_km
+
+        if task.assigned_agent_id and self._is_active_task_state(task):
+            payload['assigned_agent_id'] = task.assigned_agent_id
+            payload['pickup_completed'] = task.pickup_completed
+
+        return payload
+
+    def _agent_payload_differs_from_local(self, agent_data: Dict[str, Any], agent: AgentState) -> bool:
+        """Detect whether the incoming sync row would change meaningful agent state."""
+        incoming_location = agent_data.get('location') or [0, 0]
+        if not isinstance(incoming_location, (list, tuple)) or len(incoming_location) < 2:
+            incoming_location = [0, 0]
+
+        incoming_status = str(agent_data.get('status', 'online')).lower()
+        incoming_max_capacity = int(agent_data.get('max_capacity', agent.max_capacity))
+        incoming_wallet = float(agent_data.get('wallet_balance') or 0)
+        incoming_tags = list(agent_data.get('tags', []))
+        incoming_priority = agent_data.get('priority')
+        incoming_name = agent_data.get('name', agent.name)
+
+        return any([
+            incoming_name != agent.name,
+            incoming_status != agent.status.value,
+            float(incoming_location[0] or 0) != agent.current_location.lat,
+            float(incoming_location[1] or 0) != agent.current_location.lng,
+            incoming_max_capacity != agent.max_capacity,
+            incoming_wallet != agent.wallet_balance,
+            incoming_tags != agent.tags,
+            incoming_priority != agent.priority
+        ])
+
+    def _task_payload_differs_from_local(self, task_data: Dict[str, Any], task: TaskState) -> bool:
+        """Detect whether the incoming sync row would regress local task assignment state."""
+        incoming_assigned_raw = (
+            task_data.get('assigned_driver')
+            or task_data.get('assigned_agent_id')
+            or task_data.get('assigned_agent')
+        )
+        incoming_assigned = str(incoming_assigned_raw) if incoming_assigned_raw else None
+        incoming_pickup_completed = bool(task_data.get('pickup_completed', False))
+
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
+            return True
+
+        return (
+            incoming_assigned != task.assigned_agent_id
+            or incoming_pickup_completed != task.pickup_completed
+        )
+
+    def apply_snapshot_sync(
+        self,
+        agents_data: List[Dict[str, Any]],
+        unassigned_tasks: List[Dict[str, Any]],
+        in_progress_tasks: List[Dict[str, Any]],
+        snapshot_started_at: Optional[Any] = None,
+        snapshot_completed_at: Optional[Any] = None,
+        snapshot_generation: Optional[Any] = None,
+        sync_request_id: Optional[str] = None,
+        sync_source: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Apply a fleet snapshot while preserving any newer local realtime state.
+
+        This guards against snapshots that started building before later task/agent
+        events arrived in OR-Tools.
+        """
+        with self._lock:
+            snapshot_started_dt = self._normalize_datetime_value(snapshot_started_at)
+            snapshot_completed_dt = self._normalize_datetime_value(snapshot_completed_at)
+
+            local_agents_by_id = dict(self._agents)
+            local_tasks_by_id = dict(self._tasks)
+            incoming_tasks = [dict(task) for task in (unassigned_tasks or []) + (in_progress_tasks or [])]
+
+            summary: Dict[str, Any] = {
+                'request_id': sync_request_id,
+                'snapshot_generation': snapshot_generation,
+                'snapshot_started_at': snapshot_started_dt.isoformat() if snapshot_started_dt else None,
+                'snapshot_completed_at': snapshot_completed_dt.isoformat() if snapshot_completed_dt else None,
+                'sync_source': sync_source,
+                'incoming_agents': len(agents_data or []),
+                'incoming_unassigned_tasks': len(unassigned_tasks or []),
+                'incoming_in_progress_tasks': len(in_progress_tasks or []),
+                'incoming_tasks': len(incoming_tasks),
+                'effective_agents': 0,
+                'effective_tasks': 0,
+                'protected_seen_agents': 0,
+                'protected_seen_tasks': 0,
+                'skipped_agent_regressions': 0,
+                'skipped_task_regressions': 0,
+                'preserved_agent_omissions': 0,
+                'preserved_task_omissions': 0,
+                'removed_agents': 0,
+                'removed_tasks': 0,
+                'apply_status': 'applied'
+            }
+
+            # Track agents that must survive this sync because newer task state depends on them.
+            protected_agent_ids_from_tasks: Set[str] = set()
+            if snapshot_started_dt is not None:
+                for task in local_tasks_by_id.values():
+                    if (
+                        task.assigned_agent_id
+                        and self._is_active_task_state(task)
+                        and self._is_local_state_newer_than_snapshot(task.last_updated, snapshot_started_dt)
+                    ):
+                        protected_agent_ids_from_tasks.add(task.assigned_agent_id)
+
+            effective_agents: List[Dict[str, Any]] = []
+            seen_agent_ids: Set[str] = set()
+
+            for raw_agent_data in agents_data or []:
+                agent_data = dict(raw_agent_data)
+                agent_id = str(agent_data.get('id', ''))
+                if not agent_id:
+                    continue
+
+                agent_data['id'] = agent_id
+                seen_agent_ids.add(agent_id)
+                local_agent = local_agents_by_id.get(agent_id)
+
+                if local_agent and self._is_local_state_newer_than_snapshot(local_agent.last_updated, snapshot_started_dt):
+                    summary['protected_seen_agents'] += 1
+                    if self._agent_payload_differs_from_local(agent_data, local_agent):
+                        summary['skipped_agent_regressions'] += 1
+                        logger.warning(
+                            f"[FleetState] 🛡️ Preserving newer local agent state for {local_agent.name} ({agent_id}) "
+                            f"during fleet:sync request={sync_request_id or 'unknown'}"
+                        )
+                    effective_agents.append(self._agent_to_sync_payload(local_agent))
+                    continue
+
+                effective_agents.append(agent_data)
+
+            for agent_id, local_agent in local_agents_by_id.items():
+                if agent_id in seen_agent_ids:
+                    continue
+
+                preserve_missing_agent = (
+                    self._is_local_state_newer_than_snapshot(local_agent.last_updated, snapshot_started_dt)
+                    or agent_id in protected_agent_ids_from_tasks
+                )
+
+                if preserve_missing_agent:
+                    summary['preserved_agent_omissions'] += 1
+                    reason = 'newer_local_state'
+                    if agent_id in protected_agent_ids_from_tasks and not self._is_local_state_newer_than_snapshot(local_agent.last_updated, snapshot_started_dt):
+                        reason = 'newer_task_reference'
+                    logger.warning(
+                        f"[FleetState] 🛡️ Preserving omitted agent {local_agent.name} ({agent_id}) during fleet:sync "
+                        f"request={sync_request_id or 'unknown'} reason={reason}"
+                    )
+                    effective_agents.append(self._agent_to_sync_payload(local_agent))
+                else:
+                    summary['removed_agents'] += 1
+
+            effective_tasks: List[Dict[str, Any]] = []
+            seen_task_ids: Set[str] = set()
+
+            for raw_task_data in incoming_tasks:
+                task_data = dict(raw_task_data)
+                task_id = str(task_data.get('id', ''))
+                if not task_id:
+                    continue
+
+                task_data['id'] = task_id
+                seen_task_ids.add(task_id)
+                local_task = local_tasks_by_id.get(task_id)
+
+                if local_task and self._is_local_state_newer_than_snapshot(local_task.last_updated, snapshot_started_dt):
+                    summary['protected_seen_tasks'] += 1
+                    if self._task_payload_differs_from_local(task_data, local_task):
+                        summary['skipped_task_regressions'] += 1
+                        logger.warning(
+                            f"[FleetState] 🛡️ Preserving newer local task state for {task_id[:20]}... "
+                            f"during fleet:sync request={sync_request_id or 'unknown'}"
+                        )
+
+                    if self._is_active_task_state(local_task):
+                        effective_tasks.append(self._task_to_sync_payload(local_task))
+                    continue
+
+                effective_tasks.append(task_data)
+
+            for task_id, local_task in local_tasks_by_id.items():
+                if task_id in seen_task_ids:
+                    continue
+
+                if not self._is_active_task_state(local_task):
+                    continue
+
+                if self._is_local_state_newer_than_snapshot(local_task.last_updated, snapshot_started_dt):
+                    summary['preserved_task_omissions'] += 1
+                    logger.warning(
+                        f"[FleetState] 🛡️ Preserving omitted task {task_id[:20]}... during fleet:sync "
+                        f"request={sync_request_id or 'unknown'} newer_than_snapshot=true"
+                    )
+                    effective_tasks.append(self._task_to_sync_payload(local_task))
+                else:
+                    summary['removed_tasks'] += 1
+
+            effective_unassigned_ids = {
+                str(task.get('id'))
+                for task in effective_tasks
+                if task.get('id')
+                and not (
+                    task.get('assigned_driver')
+                    or task.get('assigned_agent_id')
+                    or task.get('assigned_agent')
+                )
+            }
+
+            summary['effective_agents'] = len(effective_agents)
+            summary['effective_tasks'] = len(effective_tasks)
+
+            # Apply the guarded snapshot using the existing sync code paths.
+            self.sync_agents(effective_agents)
+            self.clear_tasks()
+            self.set_dashboard_unassigned_tasks(effective_unassigned_ids)
+            self.sync_tasks(effective_tasks)
+
+            stale_guard_count = (
+                summary['protected_seen_agents']
+                + summary['protected_seen_tasks']
+                + summary['preserved_agent_omissions']
+                + summary['preserved_task_omissions']
+            )
+            authoritative_agent_changes = max(0, summary['incoming_agents'] - summary['protected_seen_agents']) + summary['removed_agents']
+            authoritative_task_changes = max(0, summary['incoming_tasks'] - summary['protected_seen_tasks']) + summary['removed_tasks']
+
+            if stale_guard_count == 0:
+                summary['apply_status'] = 'applied'
+            elif authoritative_agent_changes == 0 and authoritative_task_changes == 0:
+                summary['apply_status'] = 'rejected_as_stale'
+            else:
+                summary['apply_status'] = 'partially_applied'
+
+            log_level = logging.INFO if summary['apply_status'] == 'applied' else logging.WARNING
+            logger.log(
+                log_level,
+                "[FleetState] Snapshot sync summary "
+                f"request={sync_request_id or 'unknown'} "
+                f"generation={snapshot_generation if snapshot_generation is not None else 'unknown'} "
+                f"status={summary['apply_status']} "
+                f"incoming_agents={summary['incoming_agents']} effective_agents={summary['effective_agents']} "
+                f"incoming_tasks={summary['incoming_tasks']} effective_tasks={summary['effective_tasks']} "
+                f"skipped_agent_regressions={summary['skipped_agent_regressions']} "
+                f"skipped_task_regressions={summary['skipped_task_regressions']} "
+                f"preserved_agent_omissions={summary['preserved_agent_omissions']} "
+                f"preserved_task_omissions={summary['preserved_task_omissions']} "
+                f"removed_agents={summary['removed_agents']} removed_tasks={summary['removed_tasks']}"
+            )
+
+            return summary
     
     # =========================================================================
     # STATISTICS AND DEBUGGING

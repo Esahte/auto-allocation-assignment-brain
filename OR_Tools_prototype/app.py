@@ -3005,9 +3005,21 @@ def handle_fleet_sync(data):
     """
     performance_stats["websocket_events"] += 1
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    sync_request_id = data.get('request_id')
+    snapshot_generation = data.get('snapshot_generation')
+    snapshot_started_at = data.get('snapshot_started_at')
+    snapshot_completed_at = data.get('snapshot_completed_at')
+    sync_source = data.get('snapshot_source') or data.get('sync_source') or data.get('source')
     
     log_event(f"[WebSocket] fleet:sync received from dashboard")
     log_payload('fleet:sync', data)
+    if sync_request_id or snapshot_generation is not None:
+        log_event(
+            f"[FleetState] fleet:sync metadata request={sync_request_id or 'unknown'} "
+            f"generation={snapshot_generation if snapshot_generation is not None else 'unknown'} "
+            f"source={sync_source or 'unknown'} "
+            f"started={snapshot_started_at or 'unknown'} completed={snapshot_completed_at or 'unknown'}"
+        )
     
     # Track sync time for debugging stale data
     update_last_sync_time(source=data.get('dashboard_url', 'unknown'))
@@ -3016,6 +3028,8 @@ def handle_fleet_sync(data):
         emit('fleet:sync_ack', {
             'success': False,
             'error': 'Fleet state not available',
+            'request_id': sync_request_id,
+            'snapshot_generation': snapshot_generation,
             'received_at': datetime.now().isoformat()
         })
         return
@@ -3024,18 +3038,10 @@ def handle_fleet_sync(data):
     set_sync_in_progress(True)
     
     try:
-        # Sync agents
-        agents_data = data.get('agents', None)
-        if agents_data is not None:
-            # Even an empty list should clear prior agent state
-            fleet_state.sync_agents(agents_data)
-            print(f"[FleetState] Synced {len(agents_data)} agents")
-        
-        # Clear existing tasks before full sync
-        fleet_state.clear_tasks()
-        
-        # Sync unassigned tasks
+        agents_data = data.get('agents', [])
         unassigned_tasks = data.get('unassigned_tasks', [])
+        in_progress_tasks = data.get('in_progress_tasks', [])
+
         if unassigned_tasks:
             # DEBUG: Log premium fields for first task to verify dashboard is sending them
             first_task = unassigned_tasks[0]
@@ -3044,20 +3050,17 @@ def handle_fleet_sync(data):
             print(f"[DEBUG] First unassigned task fields: delivery_fee={fee}, tips={tips}")
             if fee == 'NOT_SENT' or tips == 'NOT_SENT':
                 print(f"[DEBUG] ⚠️ Dashboard is NOT sending delivery_fee/tips! Keys present: {list(first_task.keys())}")
-            
-            # Mark these task IDs as explicitly unassigned by dashboard
-            # so we DON'T restore optimistic assignments for them
-            unassigned_task_ids = {t.get('id') for t in unassigned_tasks if t.get('id')}
-            fleet_state.set_dashboard_unassigned_tasks(unassigned_task_ids)
-            
-            fleet_state.sync_tasks(unassigned_tasks)
-            print(f"[FleetState] Synced {len(unassigned_tasks)} unassigned tasks")
-        
-        # Sync in-progress tasks
-        in_progress_tasks = data.get('in_progress_tasks', [])
-        if in_progress_tasks:
-            fleet_state.sync_tasks(in_progress_tasks)
-            print(f"[FleetState] Synced {len(in_progress_tasks)} in-progress tasks")
+
+        sync_merge = fleet_state.apply_snapshot_sync(
+            agents_data=agents_data,
+            unassigned_tasks=unassigned_tasks,
+            in_progress_tasks=in_progress_tasks,
+            snapshot_started_at=snapshot_started_at,
+            snapshot_completed_at=snapshot_completed_at,
+            snapshot_generation=snapshot_generation,
+            sync_request_id=sync_request_id,
+            sync_source=sync_source
+        )
         
         # Store geofences (if provided)
         geofences = data.get('geofences', [])
@@ -3138,9 +3141,23 @@ def handle_fleet_sync(data):
             print(f"[FleetState] Applied config: max_dist={fleet_state.max_distance_km}km, chain_lookahead={fleet_state.chain_lookahead_radius_km}km, capacity={fleet_state.default_max_capacity}, wallet={fleet_state.wallet_threshold}")
         
         stats = fleet_state.get_stats()
+        sync_status = sync_merge.get('apply_status', 'applied')
+        sync_log_message = (
+            f"[FleetState] ✅ SYNC {sync_status.upper()}: "
+            f"request={sync_request_id or 'unknown'} "
+            f"generation={snapshot_generation if snapshot_generation is not None else 'unknown'} "
+            f"{stats['online_agents']} agents, {stats['unassigned_tasks']} unassigned tasks"
+        )
+        log_event(sync_log_message, 'warning' if sync_status != 'applied' else 'info')
         
         emit('fleet:sync_ack', {
             'success': True,
+            'request_id': sync_request_id,
+            'snapshot_generation': snapshot_generation,
+            'snapshot_started_at': snapshot_started_at,
+            'snapshot_completed_at': snapshot_completed_at,
+            'sync_source': sync_source,
+            'apply_status': sync_status,
             'received_at': datetime.now().isoformat(),
             'synced': {
                 'agents': len(agents_data),
@@ -3148,6 +3165,7 @@ def handle_fleet_sync(data):
                 'in_progress_tasks': len(in_progress_tasks),
                 'geofences': len(geofences)
             },
+            'sync_merge': sync_merge,
             'config_applied': {
                 'max_distance_km': fleet_state.max_distance_km,
                 'max_lateness_minutes': fleet_state.max_lateness_minutes,
@@ -3171,8 +3189,6 @@ def handle_fleet_sync(data):
             'unassigned_tasks': stats['unassigned_tasks'],
             'timestamp': datetime.now().isoformat()
         })
-        
-        log_event(f"[FleetState] ✅ SYNC COMPLETE: {stats['online_agents']} agents, {stats['unassigned_tasks']} unassigned tasks")
         print(
             f"[FleetState] Config: max_dist={fleet_state.max_distance_km}km, "
             f"max_lateness={fleet_state.max_lateness_minutes}min, wallet=${fleet_state.wallet_threshold}, "
@@ -3186,6 +3202,8 @@ def handle_fleet_sync(data):
         emit('fleet:sync_ack', {
             'success': False,
             'error': str(e),
+            'request_id': sync_request_id,
+            'snapshot_generation': snapshot_generation,
             'received_at': datetime.now().isoformat()
         })
     finally:
@@ -5484,15 +5502,40 @@ def sync_fleet_state():
     
     data = request.get_json() or {}
     
-    if 'agents' in data:
+    if 'agents' in data and 'tasks' in data:
+        task_payload = data.get('tasks', [])
+        unassigned_tasks = []
+        in_progress_tasks = []
+        for task in task_payload:
+            assigned_agent = task.get('assigned_driver') or task.get('assigned_agent_id') or task.get('assigned_agent')
+            if assigned_agent:
+                in_progress_tasks.append(task)
+            else:
+                unassigned_tasks.append(task)
+
+        sync_summary = fleet_state.apply_snapshot_sync(
+            agents_data=data.get('agents', []),
+            unassigned_tasks=unassigned_tasks,
+            in_progress_tasks=in_progress_tasks,
+            snapshot_started_at=data.get('snapshot_started_at'),
+            snapshot_completed_at=data.get('snapshot_completed_at'),
+            snapshot_generation=data.get('snapshot_generation'),
+            sync_request_id=data.get('request_id'),
+            sync_source=data.get('snapshot_source') or data.get('sync_source') or 'http_sync'
+        )
+    elif 'agents' in data:
         fleet_state.sync_agents(data['agents'])
-    
-    if 'tasks' in data:
+        sync_summary = {'apply_status': 'applied'}
+    elif 'tasks' in data:
         fleet_state.clear_tasks()
         fleet_state.sync_tasks(data['tasks'])
+        sync_summary = {'apply_status': 'applied'}
+    else:
+        sync_summary = {'apply_status': 'applied'}
     
     return jsonify({
         'message': 'Fleet state synced',
+        'sync_merge': sync_summary,
         'stats': fleet_state.get_stats()
     }), 200
 
