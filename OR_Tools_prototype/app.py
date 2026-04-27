@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import os
 import time
@@ -227,6 +227,110 @@ _optimization_running_lock = threading.Lock()
 _events_queued_during_optimization = []  # List of event types that arrived during optimization
 _queued_dashboard_url = None  # Dashboard URL to use for queued optimization
 _queued_request_id = None  # Request ID for queued manual optimization
+
+# Lifecycle event reliability.
+# Dashboard should emit completion/cancel events with callback acks and retry
+# using the same event_id until success. OR-Tools keeps a short idempotency
+# cache so retries cannot repeat side effects.
+LIFECYCLE_EVENT_TTL_SECONDS = 6 * 60 * 60
+_lifecycle_event_acks: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_terminal_lifecycle_tasks: Dict[str, Tuple[float, str]] = {}
+_lifecycle_event_lock = threading.Lock()
+
+
+def _lifecycle_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_lifecycle_task_id(data: Dict[str, Any]) -> str:
+    return str(data.get('id') or data.get('task_id') or '')
+
+
+def _derive_lifecycle_event_id(event_type: str, data: Dict[str, Any]) -> str:
+    supplied_event_id = data.get('event_id')
+    if supplied_event_id:
+        return str(supplied_event_id)
+
+    task_id = _normalize_lifecycle_task_id(data)
+    tookan_job_id = str(data.get('tookan_job_id') or data.get('job_id') or '')
+    job_type = str(data.get('job_type') if data.get('job_type') is not None else '')
+    agent_id = str(data.get('agent_id') or '')
+    lifecycle_time = str(
+        data.get('completed_at')
+        or data.get('cancelled_at')
+        or data.get('accepted_at')
+        or data.get('assigned_at')
+        or data.get('timestamp')
+        or ''
+    )
+    return f"{event_type}:{task_id}:{tookan_job_id}:{job_type}:{agent_id}:{lifecycle_time}"
+
+
+def _prune_lifecycle_event_cache(now: Optional[float] = None) -> None:
+    now = now or time.time()
+    expired_event_ids = [
+        event_id
+        for event_id, (seen_at, _) in _lifecycle_event_acks.items()
+        if now - seen_at > LIFECYCLE_EVENT_TTL_SECONDS
+    ]
+    for event_id in expired_event_ids:
+        _lifecycle_event_acks.pop(event_id, None)
+
+    expired_task_ids = [
+        task_id
+        for task_id, (seen_at, _) in _terminal_lifecycle_tasks.items()
+        if now - seen_at > LIFECYCLE_EVENT_TTL_SECONDS
+    ]
+    for task_id in expired_task_ids:
+        _terminal_lifecycle_tasks.pop(task_id, None)
+
+
+def _get_duplicate_lifecycle_ack(event_id: str) -> Optional[Dict[str, Any]]:
+    with _lifecycle_event_lock:
+        _prune_lifecycle_event_cache()
+        cached = _lifecycle_event_acks.get(event_id)
+        if not cached:
+            return None
+
+        _, ack = cached
+        duplicate_ack = dict(ack)
+        duplicate_ack['duplicate'] = True
+        duplicate_ack['received_at'] = _lifecycle_now_iso()
+        return duplicate_ack
+
+
+def _remember_lifecycle_ack(
+    event_id: str,
+    ack: Dict[str, Any],
+    terminal_task_id: Optional[str] = None,
+    terminal_state: Optional[str] = None
+) -> Dict[str, Any]:
+    ack_to_cache = dict(ack)
+    ack_to_cache['duplicate'] = False
+
+    with _lifecycle_event_lock:
+        now = time.time()
+        _prune_lifecycle_event_cache(now)
+        _lifecycle_event_acks[event_id] = (now, ack_to_cache)
+        if terminal_task_id and terminal_state:
+            _terminal_lifecycle_tasks[str(terminal_task_id)] = (now, terminal_state)
+
+    return ack_to_cache
+
+
+def _terminal_lifecycle_state(task_id: str) -> Optional[str]:
+    if not task_id:
+        return None
+
+    with _lifecycle_event_lock:
+        _prune_lifecycle_event_cache()
+        cached = _terminal_lifecycle_tasks.get(str(task_id))
+        return cached[1] if cached else None
+
+
+def _emit_lifecycle_ack(ack_event: str, ack: Dict[str, Any]) -> Dict[str, Any]:
+    emit(ack_event, ack)
+    return ack
 
 # =============================================================================
 # MARKETPLACE BROADCAST SYSTEM
@@ -3678,6 +3782,23 @@ def handle_task_created(data):
     task_data = data.get('task', {})
     task_id = task_data.get('id', data.get('id', ''))
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
+    terminal_state = _terminal_lifecycle_state(str(task_id))
+    if terminal_state:
+        ack = {
+            'id': task_id,
+            'event_id': data.get('event_id'),
+            'success': True,
+            'received_at': _lifecycle_now_iso(),
+            'added_to_fleet_state': False,
+            'ignored_terminal': True,
+            'terminal_state': terminal_state
+        }
+        log_event(
+            f"[WebSocket] task:created ignored for terminal task {str(task_id)[:20]}... "
+            f"(state={terminal_state})"
+        )
+        emit('task:created_ack', ack)
+        return ack
     
     # Log payload and premium-related fields (these go to persistent logs)
     log_payload('task:created', data)
@@ -4031,109 +4152,168 @@ def handle_task_completed(data):
     - job_type=1 (DELIVERY): Full task done - remove from agent, free up capacity
     - job_type not provided: Assume DELIVERY for backward compatibility
     """
+    data = data or {}
     update_last_event_time('task:completed')
     performance_stats["websocket_events"] += 1
-    task_id = data.get('id', '')
+    task_id = _normalize_lifecycle_task_id(data)
     agent_id = data.get('agent_id')
     agent_name = data.get('agent_name', 'Unknown')
     job_type = data.get('job_type')  # 0=pickup, 1=delivery, None=assume delivery
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
-    
+    event_id = _derive_lifecycle_event_id('task:completed', data)
+
+    duplicate_ack = _get_duplicate_lifecycle_ack(event_id)
+    if duplicate_ack:
+        log_event(f"[WebSocket] Duplicate task:completed ignored: event_id={event_id}")
+        return _emit_lifecycle_ack('task:completed_ack', duplicate_ack)
+
     log_payload('task:completed', data)
-    
-    # Determine if this is a pickup or delivery completion
+
+    if not task_id:
+        ack = {
+            'success': False,
+            'error': 'Missing task id',
+            'id': task_id,
+            'task_id': task_id,
+            'agent_id': agent_id,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': False,
+            'task_removed': False
+        }
+        return _emit_lifecycle_ack('task:completed_ack', ack)
+
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        ack = {
+            'success': False,
+            'error': 'Fleet state not available',
+            'id': task_id,
+            'task_id': task_id,
+            'agent_id': agent_id,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': False,
+            'task_removed': False
+        }
+        return _emit_lifecycle_ack('task:completed_ack', ack)
+
+    # Determine if this is a pickup or delivery completion.
     is_pickup_completion = (job_type == 0 or job_type == '0')
-    
+
     if is_pickup_completion:
         log_event(f"[WebSocket] task:pickup_completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
-        
-        # Just mark pickup as complete - DON'T remove task from agent
+
         restaurant_name = None
-        if FLEET_STATE_AVAILABLE and fleet_state and task_id:
-            task = fleet_state.mark_pickup_complete(str(task_id))
-            if task:
-                restaurant_name = task.restaurant_name
-                print(f"[FleetState] Pickup completed: {task.restaurant_name} (agent still busy with delivery)")
-        
-        emit('task:completed_ack', {
+        task = fleet_state.mark_pickup_complete(str(task_id))
+        if task:
+            restaurant_name = task.restaurant_name
+            print(f"[FleetState] Pickup completed: {task.restaurant_name} (agent still busy with delivery)")
+
+        ack = {
+            'success': bool(task),
+            'error': None if task else 'Task not found for pickup completion',
             'id': task_id,
+            'task_id': task_id,
             'agent_id': agent_id,
-            'event_id': data.get('event_id'),
-            'received_at': datetime.now().isoformat(),
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': bool(task),
             'task_removed': False,
-            'pickup_completed': True
-        })
-        
-        # Broadcast pickup completion to all clients
-        socketio.emit('pickup:completed', {
+            'pickup_completed': bool(task),
+            'unknown_task': task is None
+        }
+        if task:
+            ack = _remember_lifecycle_ack(event_id, ack)
+
+        _emit_lifecycle_ack('task:completed_ack', ack)
+
+        if task:
+            socketio.emit('pickup:completed', {
+                'id': task_id,
+                'agent_id': agent_id,
+                'agent_name': agent_name,
+                'restaurant_name': restaurant_name,
+                'completed_at': datetime.now(timezone.utc).isoformat()
+            })
+
+        return ack
+
+    log_event(f"[WebSocket] task:completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+
+    task = fleet_state.complete_task(task_id)
+    if task:
+        print(f"[FleetState] Task completed: {task.restaurant_name}")
+
+    if agent_id:
+        agent = fleet_state.get_agent(str(agent_id))
+        if agent and agent.has_capacity:
+            nearby_tasks = fleet_state.find_tasks_near_agent(str(agent_id))
+            if nearby_tasks:
+                nearest, dist = nearby_tasks[0]
+                print(f"[FleetState] 🎯 {agent_name} now idle, nearest task: {nearest.restaurant_name} ({dist:.2f}km)")
+
+    # Delivery completion is terminal. Even if the task was unknown, complete_task()
+    # defensively cleans any placeholders from agents, so the dashboard can stop
+    # retrying once OR-Tools has acknowledged this event.
+    ack = _remember_lifecycle_ack(
+        event_id,
+        {
+            'success': True,
             'id': task_id,
+            'task_id': task_id,
             'agent_id': agent_id,
-            'agent_name': agent_name,
-            'restaurant_name': restaurant_name,
-            'completed_at': datetime.now(timezone.utc).isoformat()
-        })
-    else:
-        log_event(f"[WebSocket] task:completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
-        
-        # Full task completion - remove from agent
-        if FLEET_STATE_AVAILABLE and fleet_state and task_id:
-            task = fleet_state.complete_task(task_id)
-            if task:
-                print(f"[FleetState] Task completed: {task.restaurant_name}")
-            
-            # Check if agent has nearby tasks to pick up
-            if agent_id:
-                agent = fleet_state.get_agent(str(agent_id))
-                if agent and agent.has_capacity:
-                    nearby_tasks = fleet_state.find_tasks_near_agent(str(agent_id))
-                    if nearby_tasks:
-                        nearest, dist = nearby_tasks[0]
-                        print(f"[FleetState] 🎯 {agent_name} now idle, nearest task: {nearest.restaurant_name} ({dist:.2f}km)")
-        
-        emit('task:completed_ack', {
-            'id': task_id,
-            'agent_id': agent_id,
-            'event_id': data.get('event_id'),
-            'received_at': datetime.now().isoformat(),
-            'task_removed': True
-        })
-        
-        # Broadcast to all clients so dashboards can update
-        socketio.emit('task:completed', {
-            'id': task_id,
-            'agent_id': agent_id,
-            'agent_name': agent_name,
-            'completed_at': datetime.now(timezone.utc).isoformat()
-        })
-        
-        # Clean up any tracking for this task (including pending broadcasts)
-        clean_task_tracking(task_id)
-        
-        # PROXIMITY BROADCAST: Agent now has capacity - proximity will trigger when they're near tasks
-        if PROXIMITY_BROADCAST_ENABLED:
-            unassigned_tasks = fleet_state.get_unassigned_tasks()
-            if len(unassigned_tasks) > 0:
-                print(f"[ProximityBroadcast] {agent_name} completed task, {len(unassigned_tasks)} unassigned tasks - awaiting proximity trigger")
-            return  # Skip legacy optimization - proximity handles assignments
-        
-        # LEGACY: EVENT-BASED optimization (only if marketplace mode disabled)
-        # Note: Proximity triggers may also fire from agent:location_update - debouncing handles dedup
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': True,
+            'task_removed': True,
+            'pickup_completed': False,
+            'unknown_task': task is None
+        },
+        terminal_task_id=task_id,
+        terminal_state='completed'
+    )
+
+    _emit_lifecycle_ack('task:completed_ack', ack)
+
+    socketio.emit('task:completed', {
+        'id': task_id,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'completed_at': datetime.now(timezone.utc).isoformat()
+    })
+
+    # Clean up any tracking for this task (including pending broadcasts).
+    clean_task_tracking(task_id)
+
+    # PROXIMITY BROADCAST: Agent now has capacity - proximity will trigger when they're near tasks.
+    if PROXIMITY_BROADCAST_ENABLED:
         unassigned_tasks = fleet_state.get_unassigned_tasks()
-        unassigned_count = len(unassigned_tasks)
-        if unassigned_count > 0:
-            agent = fleet_state.get_agent(str(agent_id)) if agent_id else None
-            if agent and agent.has_capacity:
-                print(f"[FleetState] {agent_name} completed task, has capacity, {unassigned_count} unassigned tasks - triggering optimization")
-                # Use debounced optimization - will cancel if proximity triggers shortly after
-                trigger_debounced_optimization(
-                    trigger_type='task:completed',
-                    dashboard_url=dashboard_url,
-                    agent_id=str(agent_id)
-                )
-            else:
-                print(f"[FleetState] {agent_name} completed task but at capacity - skipping optimization")
+        if len(unassigned_tasks) > 0:
+            print(f"[ProximityBroadcast] {agent_name} completed task, {len(unassigned_tasks)} unassigned tasks - awaiting proximity trigger")
+        return ack
+
+    # LEGACY: EVENT-BASED optimization (only if marketplace mode disabled).
+    unassigned_tasks = fleet_state.get_unassigned_tasks()
+    unassigned_count = len(unassigned_tasks)
+    if unassigned_count > 0:
+        agent = fleet_state.get_agent(str(agent_id)) if agent_id else None
+        if agent and agent.has_capacity:
+            print(f"[FleetState] {agent_name} completed task, has capacity, {unassigned_count} unassigned tasks - triggering optimization")
+            trigger_debounced_optimization(
+                trigger_type='task:completed',
+                dashboard_url=dashboard_url,
+                agent_id=str(agent_id)
+            )
         else:
-            print(f"[FleetState] {agent_name} completed task - no unassigned tasks to assign")
+            print(f"[FleetState] {agent_name} completed task but at capacity - skipping optimization")
+    else:
+        print(f"[FleetState] {agent_name} completed task - no unassigned tasks to assign")
+
+    return ack
 
 @socketio.on('pickup:completed')
 def handle_pickup_completed(data):
@@ -4144,27 +4324,74 @@ def handle_pickup_completed(data):
     This is important for route optimization - once pickup is done,
     the optimizer only needs to route to the delivery location.
     """
+    data = data or {}
     performance_stats["websocket_events"] += 1
-    task_id = data.get('id', '')
+    task_id = _normalize_lifecycle_task_id(data)
     agent_id = data.get('agent_id')
     agent_name = data.get('agent_name', 'Unknown')
-    
+    event_id = _derive_lifecycle_event_id('pickup:completed', data)
+
+    duplicate_ack = _get_duplicate_lifecycle_ack(event_id)
+    if duplicate_ack:
+        log_event(f"[WebSocket] Duplicate pickup:completed ignored: event_id={event_id}")
+        return _emit_lifecycle_ack('pickup:completed_ack', duplicate_ack)
+
     print(f"[WebSocket] pickup:completed: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
-    
-    # Mark pickup as complete - agent still busy with delivery
-    if FLEET_STATE_AVAILABLE and fleet_state and task_id:
-        task = fleet_state.mark_pickup_complete(str(task_id))
-        if task:
-            print(f"[FleetState] ✓ Pickup done for {task.restaurant_name} → now delivering")
-    
-    emit('pickup:completed_ack', {
+
+    if not task_id:
+        ack = {
+            'success': False,
+            'error': 'Missing task id',
+            'id': task_id,
+            'task_id': task_id,
+            'agent_id': agent_id,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': False,
+            'pickup_completed': False,
+            'task_removed': False
+        }
+        return _emit_lifecycle_ack('pickup:completed_ack', ack)
+
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        ack = {
+            'success': False,
+            'error': 'Fleet state not available',
+            'id': task_id,
+            'task_id': task_id,
+            'agent_id': agent_id,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': False,
+            'pickup_completed': False,
+            'task_removed': False
+        }
+        return _emit_lifecycle_ack('pickup:completed_ack', ack)
+
+    task = fleet_state.mark_pickup_complete(str(task_id))
+    if task:
+        print(f"[FleetState] ✓ Pickup done for {task.restaurant_name} → now delivering")
+
+    ack = {
+        'success': bool(task),
+        'error': None if task else 'Task not found for pickup completion',
         'id': task_id,
+        'task_id': task_id,
         'agent_id': agent_id,
-        'event_id': data.get('event_id'),
-        'received_at': datetime.now().isoformat(),
-        'pickup_completed': True,
-        'task_removed': False
-    })
+        'event_id': event_id,
+        'received_at': _lifecycle_now_iso(),
+        'duplicate': False,
+        'state_applied': bool(task),
+        'pickup_completed': bool(task),
+        'task_removed': False,
+        'unknown_task': task is None
+    }
+    if task:
+        ack = _remember_lifecycle_ack(event_id, ack)
+
+    return _emit_lifecycle_ack('pickup:completed_ack', ack)
 
 @socketio.on('task:cancelled')
 def handle_task_cancelled(data):
@@ -4172,38 +4399,84 @@ def handle_task_cancelled(data):
     Task cancelled → Update state, remove from routes.
     Payload: { id, reason, dashboard_url }
     """
+    data = data or {}
     performance_stats["websocket_events"] += 1
-    task_id = data.get('id', '')
+    task_id = _normalize_lifecycle_task_id(data)
     reason = data.get('reason', 'unknown')
-    dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
-    
+    event_id = _derive_lifecycle_event_id('task:cancelled', data)
+
+    duplicate_ack = _get_duplicate_lifecycle_ack(event_id)
+    if duplicate_ack:
+        log_event(f"[WebSocket] Duplicate task:cancelled ignored: event_id={event_id}")
+        return _emit_lifecycle_ack('task:cancelled_ack', duplicate_ack)
+
     print(f"[WebSocket] task:cancelled: {str(task_id)[:20]}... (reason: {reason})")
-    
-    # Update fleet state
-    if FLEET_STATE_AVAILABLE and fleet_state and task_id:
-        task = fleet_state.cancel_task(task_id)
-        if task:
-            print(f"[FleetState] Task cancelled: {task.restaurant_name}")
-    
-    emit('task:cancelled_ack', {
-        'id': task_id,
-        'reason': reason,
-        'event_id': data.get('event_id'),
-        'received_at': datetime.now().isoformat(),
-        'task_removed': True
-    })
-    
-    # Broadcast to all clients so dashboards can update
+
+    if not task_id:
+        ack = {
+            'success': False,
+            'error': 'Missing task id',
+            'id': task_id,
+            'task_id': task_id,
+            'reason': reason,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': False,
+            'task_removed': False
+        }
+        return _emit_lifecycle_ack('task:cancelled_ack', ack)
+
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        ack = {
+            'success': False,
+            'error': 'Fleet state not available',
+            'id': task_id,
+            'task_id': task_id,
+            'reason': reason,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': False,
+            'task_removed': False
+        }
+        return _emit_lifecycle_ack('task:cancelled_ack', ack)
+
+    task = fleet_state.cancel_task(task_id)
+    if task:
+        print(f"[FleetState] Task cancelled: {task.restaurant_name}")
+
+    ack = _remember_lifecycle_ack(
+        event_id,
+        {
+            'success': True,
+            'id': task_id,
+            'task_id': task_id,
+            'reason': reason,
+            'event_id': event_id,
+            'received_at': _lifecycle_now_iso(),
+            'duplicate': False,
+            'state_applied': True,
+            'task_removed': True,
+            'unknown_task': task is None
+        },
+        terminal_task_id=task_id,
+        terminal_state='cancelled'
+    )
+
+    _emit_lifecycle_ack('task:cancelled_ack', ack)
+
     socketio.emit('task:cancelled', {
         'id': task_id,
         'reason': reason,
         'cancelled_at': datetime.now(timezone.utc).isoformat()
     })
-    
-    # Clean up any tracking for this task (including pending broadcasts)
+
+    # Clean up any tracking for this task (including pending broadcasts).
     clean_task_tracking(task_id)
-    
-    # No auto-optimization - task removed from state
+
+    # No auto-optimization - task removed from state.
+    return ack
 
 @socketio.on('task:updated')
 def handle_task_updated(data):
@@ -4579,6 +4852,24 @@ def handle_task_assigned(data):
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     log_payload('task:assigned', data)
+    terminal_state = _terminal_lifecycle_state(str(task_id))
+    if terminal_state:
+        ack = {
+            'id': task_id,
+            'agent_id': agent_id,
+            'agent_name': agent_name,
+            'event_id': data.get('event_id'),
+            'success': True,
+            'received_at': _lifecycle_now_iso(),
+            'ignored_terminal': True,
+            'terminal_state': terminal_state
+        }
+        log_event(
+            f"[WebSocket] task:assigned ignored for terminal task {str(task_id)[:20]}... "
+            f"(state={terminal_state})"
+        )
+        emit('task:assigned_ack', ack)
+        return ack
     
     # Update fleet state (returns None if already assigned to this agent or task doesn't exist)
     task = None
@@ -4691,6 +4982,24 @@ def handle_task_accepted(data):
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     log_event(f"[WebSocket] task:accepted: {str(task_id)[:20]}... by {agent_name} ({agent_id})")
+    terminal_state = _terminal_lifecycle_state(str(task_id))
+    if terminal_state:
+        ack = {
+            'id': task_id,
+            'agent_id': agent_id,
+            'agent_name': agent_name,
+            'event_id': data.get('event_id'),
+            'success': True,
+            'received_at': _lifecycle_now_iso(),
+            'ignored_terminal': True,
+            'terminal_state': terminal_state
+        }
+        log_event(
+            f"[WebSocket] task:accepted ignored for terminal task {str(task_id)[:20]}... "
+            f"(state={terminal_state})"
+        )
+        emit('task:accepted_ack', ack)
+        return ack
     
     # Update fleet state
     if FLEET_STATE_AVAILABLE and fleet_state and task_id and agent_id:
