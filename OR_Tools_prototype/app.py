@@ -420,23 +420,49 @@ def _export_geofence_data() -> list:
     ]
 
 
-def get_agent_broadcast_capacity(agent_id: str) -> int:
+def _get_agent_broadcast_capacity_unlocked(agent_id: str) -> int:
     """
-    Get how many more tasks can be broadcast to this agent.
+    Get remaining broadcast capacity while _proximity_lock is already held.
     Returns: max_tasks - current_tasks - pending_broadcasts
     """
     if not fleet_state:
         return 0
     
-    agent = fleet_state.get_agent(agent_id)
+    agent_key = str(agent_id)
+    agent = fleet_state.get_agent(agent_key)
     if not agent:
         return 0
     
-    with _proximity_lock:
-        pending = len(_agent_pending_broadcasts.get(agent_id, set()))
-    
+    pending = len(_agent_pending_broadcasts.get(agent_key, set()))
     capacity = agent.max_capacity - len(agent.current_tasks) - pending
     return max(0, capacity)
+
+
+def get_agent_broadcast_capacity(agent_id: str) -> int:
+    """Get how many more tasks can be broadcast to this agent."""
+    with _proximity_lock:
+        return _get_agent_broadcast_capacity_unlocked(agent_id)
+
+
+def _add_pending_broadcast_unlocked(agent_id: str, task_id: str, bearing: float = None, has_route: bool = True):
+    """Track a pending broadcast while _proximity_lock is already held."""
+    agent_key = str(agent_id)
+    task_key = str(task_id)
+
+    if agent_key not in _agent_pending_broadcasts:
+        _agent_pending_broadcasts[agent_key] = set()
+    _agent_pending_broadcasts[agent_key].add(task_key)
+
+    # Store direction if provided
+    if bearing is not None:
+        if agent_key not in _agent_pending_directions:
+            _agent_pending_directions[agent_key] = {}
+        _agent_pending_directions[agent_key][task_key] = bearing
+
+    # Store route availability for multi-offer guard
+    if agent_key not in _agent_pending_routes:
+        _agent_pending_routes[agent_key] = {}
+    _agent_pending_routes[agent_key][task_key] = bool(has_route)
 
 
 def add_pending_broadcast(agent_id: str, task_id: str, bearing: float = None, has_route: bool = True):
@@ -445,20 +471,46 @@ def add_pending_broadcast(agent_id: str, task_id: str, bearing: float = None, ha
     Also stores the task's delivery bearing and route availability for checks.
     """
     with _proximity_lock:
-        if agent_id not in _agent_pending_broadcasts:
-            _agent_pending_broadcasts[agent_id] = set()
-        _agent_pending_broadcasts[agent_id].add(task_id)
-        
-        # Store direction if provided
-        if bearing is not None:
-            if agent_id not in _agent_pending_directions:
-                _agent_pending_directions[agent_id] = {}
-            _agent_pending_directions[agent_id][task_id] = bearing
-        
-        # Store route availability for multi-offer guard
-        if agent_id not in _agent_pending_routes:
-            _agent_pending_routes[agent_id] = {}
-        _agent_pending_routes[agent_id][task_id] = bool(has_route)
+        _add_pending_broadcast_unlocked(agent_id, task_id, bearing, has_route)
+
+
+def reserve_pending_broadcasts(reservations: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Atomically reserve broadcast capacity before emitting recommendations.
+
+    This prevents concurrent task-created timers from each observing the same
+    available slot and over-recommending an agent beyond max_capacity.
+    """
+    reserved = []
+    dropped = []
+
+    with _proximity_lock:
+        for reservation in reservations:
+            agent_id = str(reservation.get('agent_id'))
+            task_id = str(reservation.get('task_id'))
+            pending = _agent_pending_broadcasts.get(agent_id, set())
+
+            normalized = dict(reservation)
+            normalized['agent_id'] = agent_id
+            normalized['task_id'] = task_id
+
+            if task_id in pending:
+                dropped.append({**normalized, 'reason': 'already_pending'})
+                continue
+
+            if _get_agent_broadcast_capacity_unlocked(agent_id) <= 0:
+                dropped.append({**normalized, 'reason': 'at_capacity'})
+                continue
+
+            _add_pending_broadcast_unlocked(
+                agent_id,
+                task_id,
+                reservation.get('bearing'),
+                reservation.get('has_route', True)
+            )
+            reserved.append(normalized)
+
+    return reserved, dropped
 
 
 # Track pending proactive checks to prevent duplicate checks
@@ -580,42 +632,52 @@ def trigger_perceived_projected_check(agent_id: str, broadcast_task_id: str, das
 def remove_pending_broadcast(agent_id: str, task_id: str):
     """Remove a task from agent's pending broadcasts (accepted, declined, or assigned)."""
     with _proximity_lock:
-        if agent_id in _agent_pending_broadcasts:
-            _agent_pending_broadcasts[agent_id].discard(task_id)
+        agent_key = str(agent_id)
+        task_key = str(task_id)
+
+        if agent_key in _agent_pending_broadcasts:
+            _agent_pending_broadcasts[agent_key].discard(task_key)
             # Clean up empty sets
-            if not _agent_pending_broadcasts[agent_id]:
-                del _agent_pending_broadcasts[agent_id]
+            if not _agent_pending_broadcasts[agent_key]:
+                del _agent_pending_broadcasts[agent_key]
         
         # Also clean up direction tracking
-        if agent_id in _agent_pending_directions:
-            _agent_pending_directions[agent_id].pop(task_id, None)
-            if not _agent_pending_directions[agent_id]:
-                del _agent_pending_directions[agent_id]
+        if agent_key in _agent_pending_directions:
+            _agent_pending_directions[agent_key].pop(task_key, None)
+            if not _agent_pending_directions[agent_key]:
+                del _agent_pending_directions[agent_key]
 
         # Also clean up route tracking
-        if agent_id in _agent_pending_routes:
-            _agent_pending_routes[agent_id].pop(task_id, None)
-            if not _agent_pending_routes[agent_id]:
-                del _agent_pending_routes[agent_id]
+        if agent_key in _agent_pending_routes:
+            _agent_pending_routes[agent_key].pop(task_key, None)
+            if not _agent_pending_routes[agent_key]:
+                del _agent_pending_routes[agent_key]
+
+
+def release_pending_broadcasts(reservations: List[Dict[str, Any]]):
+    """Release reservations that were made before an emit failed."""
+    for reservation in reservations:
+        remove_pending_broadcast(reservation.get('agent_id'), reservation.get('task_id'))
 
 
 def clear_task_from_all_pending(task_id: str):
     """Remove a task from ALL agents' pending broadcasts (task assigned/cancelled)."""
+    task_key = str(task_id)
     with _proximity_lock:
         for agent_id in list(_agent_pending_broadcasts.keys()):
-            _agent_pending_broadcasts[agent_id].discard(task_id)
+            _agent_pending_broadcasts[agent_id].discard(task_key)
             if not _agent_pending_broadcasts[agent_id]:
                 del _agent_pending_broadcasts[agent_id]
         
         # Also clean up direction tracking
         for agent_id in list(_agent_pending_directions.keys()):
-            _agent_pending_directions[agent_id].pop(task_id, None)
+            _agent_pending_directions[agent_id].pop(task_key, None)
             if not _agent_pending_directions[agent_id]:
                 del _agent_pending_directions[agent_id]
 
         # Also clean up route tracking
         for agent_id in list(_agent_pending_routes.keys()):
-            _agent_pending_routes[agent_id].pop(task_id, None)
+            _agent_pending_routes[agent_id].pop(task_key, None)
             if not _agent_pending_routes[agent_id]:
                 del _agent_pending_routes[agent_id]
 
@@ -623,19 +685,19 @@ def clear_task_from_all_pending(task_id: str):
 def get_agent_pending_tasks(agent_id: str) -> set:
     """Get the set of task IDs currently pending for an agent."""
     with _proximity_lock:
-        return _agent_pending_broadcasts.get(agent_id, set()).copy()
+        return _agent_pending_broadcasts.get(str(agent_id), set()).copy()
 
 
 def get_agent_pending_directions(agent_id: str) -> dict:
     """Get the pending broadcast directions for an agent: {task_id: bearing}."""
     with _proximity_lock:
-        return _agent_pending_directions.get(agent_id, {}).copy()
+        return _agent_pending_directions.get(str(agent_id), {}).copy()
 
 
 def get_agent_pending_routes(agent_id: str) -> dict:
     """Get pending route availability for an agent: {task_id: has_route}."""
     with _proximity_lock:
-        return _agent_pending_routes.get(agent_id, {}).copy()
+        return _agent_pending_routes.get(str(agent_id), {}).copy()
 
 
 def is_multi_offer_allowed_with_route(task_has_route: bool, agent_id: str) -> tuple:
@@ -853,31 +915,33 @@ def _stops_overlap(task_a, task_b, threshold_km: float) -> bool:
 def get_task_broadcast_count_for_agent(task_id: str, agent_id: str) -> int:
     """Get how many times a task has been broadcast to a specific agent."""
     with _proximity_lock:
-        task_counts = _task_agent_broadcast_counts.get(task_id, {})
-        return task_counts.get(agent_id, 0)
+        task_counts = _task_agent_broadcast_counts.get(str(task_id), {})
+        return task_counts.get(str(agent_id), 0)
 
 
 def increment_task_broadcast_count(task_id: str, agent_id: str) -> int:
     """Increment and return the broadcast count for a task->agent pair."""
     with _proximity_lock:
-        if task_id not in _task_agent_broadcast_counts:
-            _task_agent_broadcast_counts[task_id] = {}
-        if agent_id not in _task_agent_broadcast_counts[task_id]:
-            _task_agent_broadcast_counts[task_id][agent_id] = 0
-        _task_agent_broadcast_counts[task_id][agent_id] += 1
-        return _task_agent_broadcast_counts[task_id][agent_id]
+        task_key = str(task_id)
+        agent_key = str(agent_id)
+        if task_key not in _task_agent_broadcast_counts:
+            _task_agent_broadcast_counts[task_key] = {}
+        if agent_key not in _task_agent_broadcast_counts[task_key]:
+            _task_agent_broadcast_counts[task_key][agent_key] = 0
+        _task_agent_broadcast_counts[task_key][agent_key] += 1
+        return _task_agent_broadcast_counts[task_key][agent_key]
 
 
 def clear_task_broadcast_counts(task_id: str):
     """Clear all broadcast counts for a task (when task is assigned/completed/cancelled)."""
     with _proximity_lock:
-        _task_agent_broadcast_counts.pop(task_id, None)
+        _task_agent_broadcast_counts.pop(str(task_id), None)
 
 
 def get_agents_at_broadcast_limit(task_id: str) -> set:
     """Get set of agent IDs that have hit the broadcast limit for this task."""
     with _proximity_lock:
-        task_counts = _task_agent_broadcast_counts.get(task_id, {})
+        task_counts = _task_agent_broadcast_counts.get(str(task_id), {})
         return {
             agent_id for agent_id, count in task_counts.items()
             if count >= PROXIMITY_MAX_BROADCASTS_PER_AGENT
@@ -1036,6 +1100,7 @@ def trigger_proximity_broadcast(
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         return {'success': False, 'error': 'Fleet state not available'}
     
+    task_id = str(task_id)
     task = fleet_state.get_task(task_id)
     if not task:
         return {'success': False, 'error': 'Task not found'}
@@ -1466,18 +1531,6 @@ def trigger_proximity_broadcast(
         
         feasible_agents = route_allowed
     
-    # Extra guard: block identical broadcasts within debounce window (even if forced)
-    if feasible_agents:
-        now = time.time()
-        agent_ids = set(a['agent_id'] for a in feasible_agents)
-        with _proximity_lock:
-            last_sig = _last_broadcast_signature.get(task_id)
-            if last_sig:
-                last_ts, last_agents = last_sig
-                if last_agents == agent_ids and (now - last_ts) * 1000 < PROXIMITY_DEBOUNCE_MS:
-                    log_event(f"[ProximityBroadcast] ⏭️ Duplicate broadcast suppressed for {task.restaurant_name} (same agents within debounce)")
-                    return {'success': True, 'debounced': True}
-    
     if not feasible_agents:
         log_event(f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} (solver rejected all)")
         return {
@@ -1487,9 +1540,10 @@ def trigger_proximity_broadcast(
         }
     
     # Check if we should skip broadcast (same agents, not forced)
-    current_feasible_ids = set(a['agent_id'] for a in feasible_agents)
+    now = time.time()
+    current_feasible_ids = set(str(a['agent_id']) for a in feasible_agents)
     with _proximity_lock:
-        previous_agents = _task_current_agents.get(task_id, set())
+        previous_agents = set(str(agent_id) for agent_id in _task_current_agents.get(task_id, set()))
         new_agents = current_feasible_ids - previous_agents
         
         if not force and not new_agents and previous_agents:
@@ -1500,14 +1554,10 @@ def trigger_proximity_broadcast(
                 'reason': 'same_agents',
                 'current_agents': list(current_feasible_ids)
             }
-        
-        # Update tracked agents
-        _task_current_agents[task_id] = current_feasible_ids
-        _last_broadcast_signature[task_id] = (now, current_feasible_ids)
-        
+
         # Log if new agent entered
         if new_agents and not force:
-            new_names = [a['agent_name'] for a in feasible_agents if a['agent_id'] in new_agents]
+            new_names = [a['agent_name'] for a in feasible_agents if str(a['agent_id']) in new_agents]
             log_event(f"[ProximityBroadcast] 🆕 New agent(s) for {task.restaurant_name}: {new_names}")
     
     # Track first_offered_at for timer
@@ -1610,6 +1660,59 @@ def trigger_proximity_broadcast(
                 + f" | timeout: {PROXIMITY_TASK_TIMEOUT_SECONDS}s"
             )
 
+    if not feasible_agents:
+        log_event(f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} after priority rollout")
+        return {
+            'success': False,
+            'error': 'No feasible agents after priority rollout',
+            'infeasible': infeasible_agents
+        }
+
+    # Extra guard: block identical broadcasts within debounce window (even if forced)
+    final_agent_ids = set(str(a['agent_id']) for a in feasible_agents)
+    with _proximity_lock:
+        last_sig = _last_broadcast_signature.get(task_id)
+        if last_sig:
+            last_ts, last_agents = last_sig
+            last_agent_ids = set(str(agent_id) for agent_id in last_agents)
+            if last_agent_ids == final_agent_ids and (now - last_ts) * 1000 < PROXIMITY_DEBOUNCE_MS:
+                log_event(f"[ProximityBroadcast] ⏭️ Duplicate broadcast suppressed for {task.restaurant_name} (same agents within debounce)")
+                return {'success': True, 'debounced': True}
+
+    reservation_requests = [
+        {
+            'agent_id': agent['agent_id'],
+            'agent_name': agent['agent_name'],
+            'task_id': task_id,
+            'bearing': task_bearing,
+            'has_route': agent.get('has_route', True)
+        }
+        for agent in feasible_agents
+    ]
+    reserved_recommendations, dropped_reservations = reserve_pending_broadcasts(reservation_requests)
+
+    if dropped_reservations:
+        dropped_details = [
+            f"{d.get('agent_name', d['agent_id'])}({d['reason']})"
+            for d in dropped_reservations
+        ]
+        log_event(f"[ProximityBroadcast] 🚫 Final reservation dropped {len(dropped_reservations)} agent(s) for {task.restaurant_name}: {dropped_details}")
+
+    reserved_agent_ids = {r['agent_id'] for r in reserved_recommendations}
+    feasible_agents = [
+        agent for agent in feasible_agents
+        if str(agent['agent_id']) in reserved_agent_ids
+    ]
+
+    if not feasible_agents:
+        log_event(f"[ProximityBroadcast] ⚠️ No agents with reserved capacity for {task.restaurant_name}; recommendation not emitted")
+        return {
+            'success': False,
+            'error': 'No agents with reserved broadcast capacity',
+            'reservation_drops': dropped_reservations,
+            'radius_km': search_radius
+        }
+
     # Build and emit task:proximity payload
     proximity_payload = {
         'event': 'task:proximity',
@@ -1645,12 +1748,25 @@ def trigger_proximity_broadcast(
         'dashboard_url': dashboard_url
     }
     
-    socketio.emit('task:proximity', proximity_payload)
-    
-    # Track pending broadcasts and increment broadcast counts for each agent
-    # Pass task_bearing so future broadcasts can check directional compatibility
+    try:
+        socketio.emit('task:proximity', proximity_payload)
+    except Exception as e:
+        release_pending_broadcasts(reserved_recommendations)
+        log_event(f"[ProximityBroadcast] ❌ Emit failed for {task.restaurant_name}; released reserved capacity: {e}", level='error')
+        return {
+            'success': False,
+            'error': f'proximity_emit_failed: {str(e)}',
+            'task_id': task_id,
+            'radius_km': search_radius
+        }
+
+    with _proximity_lock:
+        final_agent_ids = set(str(a['agent_id']) for a in feasible_agents)
+        _task_current_agents[task_id] = final_agent_ids
+        _last_broadcast_signature[task_id] = (now, final_agent_ids)
+
+    # Pending broadcasts were reserved before emit; now count the emitted recommendations.
     for agent in feasible_agents:
-        add_pending_broadcast(agent['agent_id'], task_id, task_bearing, agent.get('has_route', True))
         increment_task_broadcast_count(task_id, agent['agent_id'])
     
     # Build detailed log with agent capacity and broadcast count info
@@ -1715,7 +1831,8 @@ def trigger_batched_proximity_broadcast(
     if not FLEET_STATE_AVAILABLE or not fleet_state:
         return {'success': False, 'error': 'Fleet state not available'}
     
-    agent = fleet_state.get_agent(str(agent_id))
+    agent_id = str(agent_id)
+    agent = fleet_state.get_agent(agent_id)
     if not agent:
         return {'success': False, 'error': 'Agent not found'}
     
@@ -1743,6 +1860,7 @@ def trigger_batched_proximity_broadcast(
     skipped_idle_priority = []
     is_exempt = _is_agent_exempt_from_idle_priority(agent)
     for task_id in task_ids:
+        task_id = str(task_id)
         task = fleet_state.get_task(task_id)
         if task and task.status == TaskStatus.UNASSIGNED:
             # Skip tasks in idle-priority window (unless this agent is exempt or was one of the idle agents)
@@ -2100,12 +2218,13 @@ def trigger_batched_proximity_broadcast(
         
         if feasible_tasks:
             now = time.time()
-            task_ids = set(t['task_id'] for t in feasible_tasks)
+            task_ids = set(str(t['task_id']) for t in feasible_tasks)
             with _proximity_lock:
                 last_sig = _last_batch_signature.get(agent_id)
                 if last_sig:
                     last_ts, last_tasks = last_sig
-                    if last_tasks == task_ids and (now - last_ts) * 1000 < PROXIMITY_DEBOUNCE_MS:
+                    last_task_ids = set(str(task_id) for task_id in last_tasks)
+                    if last_task_ids == task_ids and (now - last_ts) * 1000 < PROXIMITY_DEBOUNCE_MS:
                         log_event(f"[ProximityBroadcast] ⏭️ BATCHED duplicate suppressed for {agent_name} (same tasks within debounce)")
                         return {'success': True, 'debounced': True}
         
@@ -2118,6 +2237,40 @@ def trigger_batched_proximity_broadcast(
                 'tasks_checked': len(valid_tasks)
             }
         
+        reservation_requests = [
+            {
+                'agent_id': agent_id,
+                'agent_name': agent_name,
+                'task_id': task_info['task_id'],
+                'bearing': task_info.get('bearing'),
+                'has_route': task_info.get('has_route', True)
+            }
+            for task_info in feasible_tasks
+        ]
+        reserved_recommendations, dropped_reservations = reserve_pending_broadcasts(reservation_requests)
+
+        if dropped_reservations:
+            dropped_details = [
+                f"{d.get('task_id')}({d['reason']})"
+                for d in dropped_reservations
+            ]
+            log_event(f"[ProximityBroadcast] 🚫 BATCHED final reservation dropped {len(dropped_reservations)} task(s) for {agent_name}: {dropped_details}")
+
+        reserved_task_ids = {r['task_id'] for r in reserved_recommendations}
+        feasible_tasks = [
+            task_info for task_info in feasible_tasks
+            if str(task_info['task_id']) in reserved_task_ids
+        ]
+
+        if not feasible_tasks:
+            log_event(f"[ProximityBroadcast] ⚠️ Batched: No tasks with reserved capacity for {agent_name}; recommendation not emitted")
+            return {
+                'success': False,
+                'error': 'No tasks with reserved broadcast capacity',
+                'agent_id': agent_id,
+                'reservation_drops': dropped_reservations
+            }
+
         # Track first_offered_at for each task
         with _proximity_lock:
             for ft in feasible_tasks:
@@ -2143,10 +2296,19 @@ def trigger_batched_proximity_broadcast(
             'dashboard_url': dashboard_url
         }
         
-        socketio.emit('proximity:batched_broadcast', batched_payload)
+        try:
+            socketio.emit('proximity:batched_broadcast', batched_payload)
+        except Exception as e:
+            release_pending_broadcasts(reserved_recommendations)
+            log_event(f"[ProximityBroadcast] ❌ BATCHED emit failed for {agent_name}; released reserved capacity: {e}", level='error')
+            return {
+                'success': False,
+                'error': f'batched_proximity_emit_failed: {str(e)}',
+                'agent_id': agent_id
+            }
         
         with _proximity_lock:
-            _last_batch_signature[agent_id] = (now, set(t['task_id'] for t in feasible_tasks))
+            _last_batch_signature[agent_id] = (now, set(str(t['task_id']) for t in feasible_tasks))
         
         task_names = [t['restaurant_name'] for t in feasible_tasks]
         log_event(f"[ProximityBroadcast] 📦 BATCHED: {agent_name} can do {len(feasible_tasks)} tasks: {task_names}")
@@ -2201,15 +2363,8 @@ def trigger_batched_proximity_broadcast(
                 socketio.emit('task:proximity', individual_payload)
                 log_event(f"[ProximityBroadcast] 📡 {task.restaurant_name} → {agent_name} (batched with {len(feasible_tasks)-1} others)")
         
-        # Track pending broadcasts and increment broadcast counts for this agent
-        # Pass bearing so future broadcasts can check directional compatibility
+        # Pending broadcasts were reserved before emit; now count the emitted recommendations.
         for task_info in feasible_tasks:
-            add_pending_broadcast(
-                agent_id,
-                task_info['task_id'],
-                task_info.get('bearing'),
-                task_info.get('has_route', True)
-            )
             increment_task_broadcast_count(task_info['task_id'], agent_id)
         
         # PROACTIVE CHECK: After batched broadcast, check for existing tasks near
