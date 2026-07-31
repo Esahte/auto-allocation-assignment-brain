@@ -15,7 +15,7 @@ The abstract map enables:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any, ClassVar
+from typing import Dict, List, Optional, Set, Tuple, Any, ClassVar, Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import threading
@@ -232,6 +232,7 @@ class AgentState:
     tags: List[str] = field(default_factory=list)  # ["cash_enabled", "bike", "zone_a"]
     wallet_balance: float = 0.0  # Cash on hand for cash orders
     priority: Optional[int] = None  # Priority level: 1 = highest priority (premium tasks only)
+    blocked_merchants: List[str] = field(default_factory=list)
     # Timestamps
     last_location_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -353,7 +354,10 @@ class FleetState:
         max_distance_km: float = 3.0,
         optimization_cooldown_seconds: float = 30.0,
         max_lateness_minutes: int = 45,
-        max_pickup_delay_minutes: int = 60
+        max_pickup_delay_minutes: int = 60,
+        road_distance_provider: Optional[
+            Callable[[List[Location], List[Location]], Tuple[List[List[float]], str]]
+        ] = None
     ):
         """
         Initialize the fleet state.
@@ -377,6 +381,21 @@ class FleetState:
         self.premium_delivery_fee_threshold = TaskState.PREMIUM_DELIVERY_FEE_THRESHOLD
         self.default_max_capacity = 2  # Default max tasks per agent
         self.direction_coherence_mode = os.environ.get('DIRECTION_COHERENCE_MODE', 'solver').lower()  # "prefilter" = hard block, "solver" = OR-Tools penalty
+        self.merchant_agent_exclusions: Dict[str, List[str]] = {}
+        self._road_distance_provider = road_distance_provider
+        self._road_distance_cache: Dict[
+            Tuple[float, float, float, float],
+            Tuple[float, float, str]
+        ] = {}
+        self._road_distance_cache_ttl_seconds = float(
+            os.environ.get('ROAD_DISTANCE_CACHE_TTL_SECONDS', '30')
+        )
+        self._road_distance_fallback_cache_ttl_seconds = float(
+            os.environ.get('ROAD_DISTANCE_FALLBACK_CACHE_TTL_SECONDS', '5')
+        )
+        self._road_distance_timeout_seconds = float(
+            os.environ.get('ROAD_DISTANCE_TIMEOUT_SECONDS', '5')
+        )
         
         # State storage
         self._agents: Dict[str, AgentState] = {}
@@ -461,7 +480,8 @@ class FleetState:
         priority: Optional[int] = None,
         max_capacity: Optional[int] = None,
         tags: Optional[List[str]] = None,
-        wallet_balance: Optional[float] = None
+        wallet_balance: Optional[float] = None,
+        blocked_merchants: Optional[List[str]] = None
     ) -> Optional[AgentState]:
         """
         Mark agent as online with full profile data (same format as sync).
@@ -493,6 +513,8 @@ class FleetState:
                     agent.tags = tags
                 if wallet_balance is not None:
                     agent.wallet_balance = wallet_balance
+                if blocked_merchants is not None:
+                    agent.blocked_merchants = list(blocked_merchants)
                 agent.last_updated = datetime.now(timezone.utc)
                 priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
                 logger.info(f"[FleetState] Agent online: {agent.name}{priority_str}")
@@ -507,7 +529,8 @@ class FleetState:
                     priority=priority,
                     max_capacity=max_capacity or 2,
                     tags=tags or [],
-                    wallet_balance=wallet_balance or 0.0
+                    wallet_balance=wallet_balance or 0.0,
+                    blocked_merchants=list(blocked_merchants or [])
                 )
                 self._agents[agent_id] = agent
                 priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
@@ -534,6 +557,7 @@ class FleetState:
         tags: Optional[List[str]] = None,
         priority: Optional[int] = None,
         wallet_balance: Optional[float] = None,
+        blocked_merchants: Optional[List[str]] = None,
         priority_explicitly_set: bool = False
     ) -> Optional[AgentState]:
         """
@@ -563,9 +587,191 @@ class FleetState:
                 agent.priority = priority
             if wallet_balance is not None:
                 agent.wallet_balance = wallet_balance
+            if blocked_merchants is not None:
+                agent.blocked_merchants = list(blocked_merchants)
             
             agent.last_updated = datetime.now(timezone.utc)
             return agent
+
+    @staticmethod
+    def _normalize_merchant_name(merchant_name: Any) -> str:
+        """Normalize dashboard merchant names for policy matching."""
+        return str(merchant_name or '').strip().casefold()
+
+    def set_merchant_agent_exclusions(self, exclusions: Dict[str, List[Any]]):
+        """Replace the canonical merchant-to-agent exclusion map."""
+        normalized: Dict[str, List[str]] = {}
+        if isinstance(exclusions, dict):
+            for merchant, agent_ids in exclusions.items():
+                merchant_key = self._normalize_merchant_name(merchant)
+                if not merchant_key or not isinstance(agent_ids, (list, tuple, set)):
+                    continue
+                normalized[merchant_key] = list(dict.fromkeys(
+                    str(agent_id).strip()
+                    for agent_id in agent_ids
+                    if agent_id is not None and str(agent_id).strip()
+                ))
+
+        with self._lock:
+            self.merchant_agent_exclusions = normalized
+        logger.info(
+            f"[FleetState] Replaced merchant-agent exclusions with "
+            f"{len(normalized)} merchant(s)"
+        )
+
+    def _merchant_exemption_source(
+        self,
+        agent: AgentState,
+        task: TaskState
+    ) -> Optional[str]:
+        """Return A, C, or A+C when a merchant filter blocks this pairing."""
+        merchant_key = self._normalize_merchant_name(task.restaurant_name)
+        if not merchant_key:
+            return None
+
+        blocked_by_agent = any(
+            blocked_merchant
+            and blocked_merchant in merchant_key
+            for blocked_merchant in (
+                self._normalize_merchant_name(name)
+                for name in agent.blocked_merchants
+            )
+        )
+        blocked_by_config = any(
+            merchant_filter in merchant_key
+            and str(agent.id) in blocked_agent_ids
+            for merchant_filter, blocked_agent_ids
+            in self.merchant_agent_exclusions.items()
+        )
+
+        if blocked_by_agent and blocked_by_config:
+            return "A+C"
+        if blocked_by_agent:
+            return "A"
+        if blocked_by_config:
+            return "C"
+        return None
+
+    @staticmethod
+    def _road_distance_cache_key(
+        origin: Location,
+        destination: Location
+    ) -> Tuple[float, float, float, float]:
+        """Round coordinates to about 11m so location updates can reuse results."""
+        return (
+            round(float(origin.lat), 4),
+            round(float(origin.lng), 4),
+            round(float(destination.lat), 4),
+            round(float(destination.lng), 4)
+        )
+
+    def _get_assignment_road_distance(
+        self,
+        agent: AgentState,
+        task: TaskState
+    ) -> Tuple[float, str]:
+        """
+        Return the shortest road distance from the agent's current/projected
+        location to pickup. OSRM is primary; Haversine is the failure fallback.
+        """
+        origins = [agent.current_location]
+        if agent.current_tasks:
+            projected = agent.projected_location
+            if self._road_distance_cache_key(
+                projected, task.restaurant_location
+            ) != self._road_distance_cache_key(
+                agent.current_location, task.restaurant_location
+            ):
+                origins.append(projected)
+
+        destination = task.restaurant_location
+        now = time.time()
+        distances: List[float] = []
+        sources: List[str] = []
+        missing_origins: List[Location] = []
+
+        for origin in origins:
+            key = self._road_distance_cache_key(origin, destination)
+            cached = self._road_distance_cache.get(key)
+            if cached and cached[1] > now:
+                distances.append(cached[0])
+                sources.append(cached[2])
+            else:
+                missing_origins.append(origin)
+
+        if missing_origins:
+            try:
+                if self._road_distance_provider:
+                    matrix, source = self._road_distance_provider(
+                        missing_origins, [destination]
+                    )
+                else:
+                    from fleet_optimizer import (
+                        Location as OptimizerLocation,
+                        get_osrm_distances_matrix_with_source
+                    )
+                    optimizer_origins = [
+                        OptimizerLocation(origin.lat, origin.lng)
+                        for origin in missing_origins
+                    ]
+                    optimizer_destination = OptimizerLocation(
+                        destination.lat, destination.lng
+                    )
+                    matrix, source = get_osrm_distances_matrix_with_source(
+                        optimizer_origins,
+                        [optimizer_destination],
+                        timeout_seconds=self._road_distance_timeout_seconds,
+                        use_retries=False
+                    )
+
+                if len(matrix) != len(missing_origins) or any(
+                    len(row) != 1 or row[0] is None for row in matrix
+                ):
+                    raise ValueError(
+                        "Road-distance provider returned an invalid matrix"
+                    )
+            except Exception as exc:
+                source = "haversine_fallback"
+                matrix = [[origin.distance_to(destination)] for origin in missing_origins]
+                logger.warning(
+                    f"[Distance] OSRM road-distance lookup failed for "
+                    f"agent={agent.id} task={task.id}; using Haversine: {exc}"
+                )
+
+            cache_ttl = (
+                self._road_distance_cache_ttl_seconds
+                if source == "osrm"
+                else self._road_distance_fallback_cache_ttl_seconds
+            )
+            for index, origin in enumerate(missing_origins):
+                distance = float(matrix[index][0])
+                key = self._road_distance_cache_key(origin, destination)
+                self._road_distance_cache[key] = (
+                    distance, now + cache_ttl, source
+                )
+                distances.append(distance)
+                sources.append(source)
+
+            if source != "osrm":
+                logger.warning(
+                    f"[Distance] Max-distance check used {source}: "
+                    f"agent={agent.id} task={task.id}"
+                )
+
+        # Opportunistically discard expired entries to bound cache growth.
+        if len(self._road_distance_cache) > 1000:
+            self._road_distance_cache = {
+                key: value
+                for key, value in self._road_distance_cache.items()
+                if value[1] > now
+            }
+
+        distance = min(distances)
+        source = (
+            "osrm" if sources and all(item == "osrm" for item in sources)
+            else "haversine_fallback"
+        )
+        return distance, source
     
     def update_agent_tasks(
         self,
@@ -1366,6 +1572,7 @@ class FleetState:
                                       (used when radius is expanded in proximity broadcast)
         
         Business Rules Checked:
+        0. Merchant exemptions - agent or config policy blocks this merchant
         0. Priority - Priority 1 agents only get premium tasks (configurable thresholds)
         0b. Tag Matching - TEST agents only get TEST tasks, tagged tasks go to matching agents
         1. Declined - Agent hasn't declined this task
@@ -1376,7 +1583,16 @@ class FleetState:
         6. Geofence - Agent is assigned to task's pickup zone
         7. Max Distance - Agent is within allowed distance (bypassed for Priority 1 on premium tasks)
         """
-        # 0. PRIORITY AGENT RULES
+        # 0. MERCHANT-AGENT EXEMPTIONS
+        exemption_source = self._merchant_exemption_source(agent, task)
+        if exemption_source:
+            logger.info(
+                f"[MerchantExemption] Skipping agent={agent.id} "
+                f"merchant={task.restaurant_name!r} source={exemption_source}"
+            )
+            return f"merchant_exemption_{exemption_source}"
+
+        # 0a. PRIORITY AGENT RULES
         # Priority 1 agents ONLY get premium tasks (configurable thresholds)
         if agent.priority == 1:
             if not task.is_premium_task:
@@ -1508,12 +1724,6 @@ class FleetState:
         skip_distance_check = (agent.priority == 1 and task.is_premium_task)
         
         if not skip_distance_check and not skip_distance_for_region:
-            if agent.current_tasks:
-                # Use projected location for busy agents
-                distance = agent.projected_location.distance_to(task.restaurant_location)
-            else:
-                distance = agent.current_location.distance_to(task.restaurant_location)
-            
             # Use override if provided (for expanded radius), otherwise task-specific, otherwise global
             if override_max_distance_km is not None:
                 max_dist = override_max_distance_km
@@ -1521,9 +1731,16 @@ class FleetState:
                 max_dist = task.max_distance_km
             else:
                 max_dist = self.max_distance_km
-            
-            if max_dist is not None and distance > max_dist:
-                return f"too_far ({distance:.1f}km > {max_dist}km)"
+
+            if max_dist is not None:
+                distance, distance_source = self._get_assignment_road_distance(
+                    agent, task
+                )
+                if distance > max_dist:
+                    return (
+                        f"too_far ({distance:.1f}km road > {max_dist}km, "
+                        f"source={distance_source})"
+                    )
         
         # 8. Direction Coherence - New task delivery should be in same direction as existing tasks
         # Prevents inefficient zig-zag routes
@@ -1950,6 +2167,7 @@ class FleetState:
                     agent.wallet_balance = float(agent_data.get('wallet_balance', agent.wallet_balance))
                     agent.max_capacity = int(agent_data.get('max_capacity', agent.max_capacity))
                     agent.priority = final_priority
+                    agent.blocked_merchants = list(agent_data.get('blocked_merchants', []))
                 else:
                     agent = AgentState(
                         id=agent_id,
@@ -1959,7 +2177,8 @@ class FleetState:
                         tags=agent_data.get('tags', []),
                         wallet_balance=float(agent_data.get('wallet_balance') or 0),
                         max_capacity=int(agent_data.get('max_capacity', 2)),
-                        priority=final_priority
+                        priority=final_priority,
+                        blocked_merchants=list(agent_data.get('blocked_merchants', []))
                     )
                     self._agents[agent_id] = agent
                 
@@ -2555,6 +2774,8 @@ class FleetState:
             self._agents.clear()
             self._tasks.clear()
             self._last_optimization_time.clear()
+            self.merchant_agent_exclusions = {}
+            self._road_distance_cache.clear()
             logger.info("[FleetState] State cleared")
     
     # =========================================================================
@@ -2608,6 +2829,7 @@ class FleetState:
                     'current_location': [agent.current_location.lat, agent.current_location.lng],  # Agent.from_dict expects 'current_location'
                     'current_tasks': current_tasks,
                     'wallet_balance': agent.wallet_balance,
+                    'blocked_merchants': list(agent.blocked_merchants),
                     '_meta': {
                         'max_tasks': agent.max_capacity,
                         'available_capacity': agent.available_capacity,
@@ -2636,7 +2858,11 @@ class FleetState:
                     'walletNoCashThreshold': self.wallet_threshold,
                     'maxDistanceKm': self.max_distance_km,
                     'maxLatenessMinutes': self.max_lateness_minutes,
-                    'maxPickupDelayMinutes': self.max_pickup_delay_minutes
+                    'maxPickupDelayMinutes': self.max_pickup_delay_minutes,
+                    'merchantAgentExclusions': {
+                        merchant: list(agent_ids)
+                        for merchant, agent_ids in self.merchant_agent_exclusions.items()
+                    }
                 }
             }
     

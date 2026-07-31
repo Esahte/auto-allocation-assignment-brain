@@ -140,6 +140,57 @@ class ReliableLifecycleEventTests(unittest.TestCase):
         self.assertTrue(created_ack["ignored_terminal"])
         self.assertIsNone(app_module.fleet_state.get_task("ghost-task"))
 
+    def test_unknown_pickup_completion_is_stale_noop_success(self):
+        payload = {
+            "id": "ghost-pickup",
+            "agent_id": "agent-1",
+            "agent_name": "Agent One",
+            "event_id": "evt-ghost-pickup",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        first_ack = self.client.emit("pickup:completed", payload, callback=True)
+        second_ack = self.client.emit("pickup:completed", payload, callback=True)
+
+        self.assertTrue(first_ack["success"])
+        self.assertTrue(first_ack["stale_noop"])
+        self.assertTrue(first_ack["unknown_task"])
+        self.assertEqual(first_ack["reason"], "pickup_completion_for_unknown_or_terminal_task")
+        self.assertTrue(second_ack["success"])
+        self.assertTrue(second_ack["duplicate"])
+
+    def test_unknown_task_updated_is_stale_noop_success(self):
+        self.client.emit(
+            "task:updated",
+            {
+                "id": "ghost-update",
+                "event_id": "evt-ghost-update",
+                "status": "Unassigned",
+            },
+        )
+
+        received = self.client.get_received()
+        ack_packets = [packet for packet in received if packet["name"] == "task:updated_ack"]
+        self.assertEqual(len(ack_packets), 1)
+        ack = ack_packets[0]["args"][0]
+        self.assertTrue(ack["success"])
+        self.assertTrue(ack["stale_noop"])
+        self.assertTrue(ack["unknown_task"])
+        self.assertEqual(ack["reason"], "task_not_found")
+
+    def test_missing_pickup_completion_task_id_still_fails(self):
+        ack = self.client.emit(
+            "pickup:completed",
+            {
+                "agent_id": "agent-1",
+                "event_id": "evt-missing-task-id",
+            },
+            callback=True,
+        )
+
+        self.assertFalse(ack["success"])
+        self.assertEqual(ack["error"], "Missing task id")
+
 
 class FakeSocketClient:
     def __init__(self, responses):

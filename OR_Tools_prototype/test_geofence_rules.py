@@ -76,11 +76,25 @@ LOC_OUTSIDE = Location(17.90, -76.50)
 FUTURE = datetime.now(timezone.utc) + timedelta(hours=2)
 
 
+def _test_road_distance_provider(origins, destinations):
+    """Deterministic stand-in for OSRM in eligibility unit tests."""
+    return [
+        [
+            Location(origin.lat, origin.lng).distance_to(
+                Location(destination.lat, destination.lng)
+            )
+            for destination in destinations
+        ]
+        for origin in origins
+    ], "osrm"
+
+
 def _make_fleet_state() -> FleetState:
     """Create a fresh FleetState with generous defaults."""
     fs = FleetState(
         assignment_radius_km=10.0,
         max_distance_km=10.0,
+        road_distance_provider=_test_road_distance_provider,
     )
     return fs
 
@@ -479,6 +493,12 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
             geofence_regions=[],
         )
 
+    def _make_checker(self, **kwargs):
+        return CompatibilityChecker(
+            road_distance_provider=_test_road_distance_provider,
+            **kwargs
+        )
+
     def setUp(self):
         self.kgn_geofence = GeofenceRegion(
             region_id='region_kgn',
@@ -507,7 +527,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
     def test_region_agent_compatible_distance_bypassed(self):
         """Agent in Kingston region + task in Kingston -> compatible, even far away."""
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[self.kgn_geofence, self.mobay_geofence],
             max_distance_km=1.0,  # Very short distance
         )
@@ -523,7 +543,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
     def test_non_region_agent_blocked(self):
         """Agent NOT in Kingston region + task in Kingston (region staffed) -> blocked."""
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[self.kgn_geofence, self.mobay_geofence],
             max_distance_km=50.0,
         )
@@ -540,7 +560,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
     def test_no_region_agents_in_solver_fallback(self):
         """Task in region but no region agents in solver -> fallback to global rules."""
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[self.kgn_geofence],
             max_distance_km=50.0,
         )
@@ -558,7 +578,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
     def test_task_in_no_region(self):
         """Task outside all regions -> normal rules, no region restriction."""
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[self.kgn_geofence],
             max_distance_km=50.0,
         )
@@ -581,7 +601,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
             is_scooter_agent=True,
             geofence_regions=['Scooter Zone Kingston'],
         )
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[self.scooter_geofence],
             max_distance_km=50.0,
         )
@@ -599,7 +619,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
     def test_backward_compat_no_geofences(self):
         """No geofences in checker -> no region restriction."""
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[],
             max_distance_km=50.0,
         )
@@ -615,7 +635,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
     def test_pickup_region_priority_over_delivery(self):
         """Pickup in Kingston, delivery in MoBay -> Kingston region used."""
-        checker = CompatibilityChecker(
+        checker = self._make_checker(
             geofence_regions=[self.kgn_geofence, self.mobay_geofence],
             max_distance_km=50.0,
         )

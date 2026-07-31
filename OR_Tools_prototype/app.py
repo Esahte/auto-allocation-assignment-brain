@@ -332,6 +332,30 @@ def _emit_lifecycle_ack(ack_event: str, ack: Dict[str, Any]) -> Dict[str, Any]:
     emit(ack_event, ack)
     return ack
 
+
+def _stale_noop_ack(
+    task_id: str,
+    event_id: Optional[str],
+    reason: str,
+    **extra: Any
+) -> Dict[str, Any]:
+    """Acknowledge obsolete events so dashboard retries do not block fresh work."""
+    ack = {
+        'success': True,
+        'stale_noop': True,
+        'unknown_task': True,
+        'reason': reason,
+        'error': None,
+        'id': task_id,
+        'task_id': task_id,
+        'event_id': event_id,
+        'received_at': _lifecycle_now_iso(),
+        'duplicate': False,
+        'state_applied': False
+    }
+    ack.update(extra)
+    return ack
+
 # =============================================================================
 # MARKETPLACE BROADCAST SYSTEM
 # =============================================================================
@@ -3356,6 +3380,15 @@ def handle_fleet_sync(data):
                 fleet_state.wallet_threshold = float(config['wallet_threshold'])
                 print(f"[FleetState] → wallet_threshold = ${fleet_state.wallet_threshold}")
 
+            if 'merchant_agent_exclusions' in config:
+                fleet_state.set_merchant_agent_exclusions(
+                    config.get('merchant_agent_exclusions') or {}
+                )
+                print(
+                    f"[FleetState] → merchant_agent_exclusions = "
+                    f"{len(fleet_state.merchant_agent_exclusions)} merchant(s)"
+                )
+
             if 'premium_tip_threshold' in config:
                 fleet_state.premium_tip_threshold = float(config['premium_tip_threshold'])
                 TaskState.PREMIUM_TIP_THRESHOLD = fleet_state.premium_tip_threshold
@@ -3436,7 +3469,11 @@ def handle_fleet_sync(data):
                 'chain_lookahead_radius_km': fleet_state.chain_lookahead_radius_km,
                 'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
                 'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
-                'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT
+                'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+                'merchant_agent_exclusions': {
+                    merchant: list(agent_ids)
+                    for merchant, agent_ids in fleet_state.merchant_agent_exclusions.items()
+                }
             },
             'fleet_stats': stats
         })
@@ -3558,6 +3595,16 @@ def handle_config_update(data):
                 if agent.max_capacity == old_val:
                     agent.max_capacity = new_capacity
             changes.append(f"max_tasks_per_agent: {old_val} → {new_capacity}")
+
+        if 'merchant_agent_exclusions' in config:
+            old_count = len(fleet_state.merchant_agent_exclusions)
+            fleet_state.set_merchant_agent_exclusions(
+                config.get('merchant_agent_exclusions') or {}
+            )
+            changes.append(
+                f"merchant_agent_exclusions: {old_count} → "
+                f"{len(fleet_state.merchant_agent_exclusions)} merchant(s)"
+            )
         
         # chain_lookahead_radius_km is now synced with max_distance_km automatically
         # No need to update it separately in config updates
@@ -3615,7 +3662,11 @@ def handle_config_update(data):
                 'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
                 'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
                 'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
-                'direction_coherence_mode': fleet_state.direction_coherence_mode
+                'direction_coherence_mode': fleet_state.direction_coherence_mode,
+                'merchant_agent_exclusions': {
+                    merchant: list(agent_ids)
+                    for merchant, agent_ids in fleet_state.merchant_agent_exclusions.items()
+                }
             }
         })
         
@@ -4146,6 +4197,7 @@ def handle_task_declined(data):
             
             emit('task:declined_ack', {
                 'id': task_id,
+                'success': True,
                 'declined_by': declined_by,
                 'event_id': data.get('event_id'),
                 'received_at': datetime.now().isoformat(),
@@ -4206,6 +4258,7 @@ def handle_task_declined(data):
     
     emit('task:declined_ack', {
         'id': task_id,
+        'success': True,
         'declined_by': declined_by,
         'event_id': data.get('event_id'),
         'received_at': datetime.now().isoformat(),
@@ -4382,6 +4435,18 @@ def handle_task_completed(data):
         }
         if task:
             ack = _remember_lifecycle_ack(event_id, ack)
+        else:
+            ack = _remember_lifecycle_ack(
+                event_id,
+                _stale_noop_ack(
+                    task_id,
+                    event_id,
+                    'pickup_completion_for_unknown_or_terminal_task',
+                    agent_id=agent_id,
+                    task_removed=False,
+                    pickup_completed=False
+                )
+            )
 
         _emit_lifecycle_ack('task:completed_ack', ack)
 
@@ -4545,6 +4610,18 @@ def handle_pickup_completed(data):
     }
     if task:
         ack = _remember_lifecycle_ack(event_id, ack)
+    else:
+        ack = _remember_lifecycle_ack(
+            event_id,
+            _stale_noop_ack(
+                task_id,
+                event_id,
+                'pickup_completion_for_unknown_or_terminal_task',
+                agent_id=agent_id,
+                task_removed=False,
+                pickup_completed=False
+            )
+        )
 
     return _emit_lifecycle_ack('pickup:completed_ack', ack)
 
@@ -4679,13 +4756,14 @@ def handle_task_updated(data):
     existing_task = fleet_state.get_task(task_id)
     if not existing_task:
         log_event(f"[WebSocket] task:updated: {str(task_id)[:20]}... (task not found in fleet state)")
-        emit('task:updated_ack', {
-            'id': task_id,
-            'success': False,
-            'error': 'Task not found',
-            'event_id': data.get('event_id'),
-            'received_at': datetime.now().isoformat()
-        })
+        emit('task:updated_ack', _stale_noop_ack(
+            task_id,
+            data.get('event_id'),
+            'task_not_found',
+            changes=[],
+            status_changed_to_unassigned=False,
+            triggered_optimization=False
+        ))
         return
     
     # Track what fields changed
@@ -5115,6 +5193,7 @@ def handle_task_assigned(data):
         'agent_id': agent_id,
         'agent_name': agent_name,
         'event_id': data.get('event_id'),
+        'success': True,
         'received_at': datetime.now().isoformat()
     })
 
@@ -5191,6 +5270,7 @@ def handle_task_accepted(data):
         'agent_id': agent_id,
         'agent_name': agent_name,
         'event_id': data.get('event_id'),
+        'success': True,
         'received_at': datetime.now().isoformat()
     })
 
@@ -5208,6 +5288,7 @@ def handle_agent_online(data):
         "tags": ["NoCash", "scooter"],
         "wallet_balance": 1500.00,
         "priority": 1,              // Optional: only for priority agents
+        "blocked_merchants": ["KFC St. John's"],
         "dashboard_url": "..."
     }
     """
@@ -5224,6 +5305,7 @@ def handle_agent_online(data):
     max_capacity = data.get('max_capacity')
     tags = data.get('tags', [])
     wallet_balance = data.get('wallet_balance')
+    blocked_merchants = data.get('blocked_merchants', [])
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     # Build log string with key info
@@ -5241,7 +5323,8 @@ def handle_agent_online(data):
             priority=priority,
             max_capacity=int(max_capacity) if max_capacity else None,
             tags=tags,
-            wallet_balance=float(wallet_balance) if wallet_balance is not None else None
+            wallet_balance=float(wallet_balance) if wallet_balance is not None else None,
+            blocked_merchants=blocked_merchants
         )
         if agent:
             print(f"[FleetState] Agent online: {name} at {agent.current_location}{priority_str} capacity={agent.max_capacity}")
@@ -5280,6 +5363,7 @@ def handle_agent_online(data):
         'current_tasks': len(agent.current_tasks) if agent else 0,
         'tags': tags,
         'priority': priority,
+        'blocked_merchants': blocked_merchants,
         'timestamp': datetime.now(timezone.utc).isoformat()
     })
     
@@ -5377,6 +5461,7 @@ def handle_agent_update(data):
         "tags": ["INTERNAL", "HEAVY"],
         "priority": 1,
         "wallet_balance": 500.00,
+        "blocked_merchants": ["Subway"],
         "dashboard_url": "https://..."
     }
     """
@@ -5388,6 +5473,7 @@ def handle_agent_update(data):
     tags = data.get('tags')
     priority = data.get('priority')
     wallet_balance = data.get('wallet_balance')
+    blocked_merchants = data.get('blocked_merchants')
     
     # Build update summary for logging
     updates = []
@@ -5399,6 +5485,8 @@ def handle_agent_update(data):
         updates.append(f"priority={priority}")
     if wallet_balance is not None:
         updates.append(f"wallet=${wallet_balance}")
+    if blocked_merchants is not None:
+        updates.append(f"blocked_merchants={blocked_merchants}")
     
     update_str = ", ".join(updates) if updates else "no changes"
     print(f"[WebSocket] agent:update: {name or agent_id} → {update_str}")
@@ -5413,12 +5501,16 @@ def handle_agent_update(data):
             tags=tags,
             priority=priority,
             wallet_balance=float(wallet_balance) if wallet_balance is not None else None,
+            blocked_merchants=blocked_merchants,
             priority_explicitly_set=True  # agent:update is SOURCE OF TRUTH for priority
         )
         if agent:
             updated = True
             priority_str = f", priority={agent.priority}" if agent.priority else ""
-            print(f"[FleetState] ✓ Updated {agent.name}: capacity={agent.max_capacity}, tags={agent.tags}{priority_str}")
+            print(
+                f"[FleetState] ✓ Updated {agent.name}: capacity={agent.max_capacity}, "
+                f"tags={agent.tags}, blocked_merchants={agent.blocked_merchants}{priority_str}"
+            )
         else:
             print(f"[FleetState] ⚠️ Agent {agent_id} not found in fleet state")
     

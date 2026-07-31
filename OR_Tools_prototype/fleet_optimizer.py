@@ -18,7 +18,7 @@ logger = logging.getLogger('fleet_optimizer')
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Tuple, Any, ClassVar
+from typing import List, Dict, Optional, Tuple, Any, ClassVar, Callable
 from dataclasses import dataclass, field
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
@@ -110,6 +110,10 @@ class Task:
     meta: Dict[str, Any] = field(default_factory=dict)
     tips: float = 0.0
     delivery_fee: float = 0.0
+
+    @property
+    def restaurant_name(self) -> str:
+        return self.meta.get('restaurant_name', 'Unknown Restaurant')
     
     @property
     def is_premium_task(self) -> bool:
@@ -196,6 +200,7 @@ class Agent:
     is_scooter_agent: bool = False
     geofence_regions: List[str] = field(default_factory=list)
     priority: Optional[int] = None  # Priority level: 1 = highest (premium tasks only)
+    blocked_merchants: List[str] = field(default_factory=list)
     
     @classmethod
     def from_dict(cls, data: dict) -> 'Agent':
@@ -225,7 +230,8 @@ class Agent:
             has_no_cash_tag=meta.get('has_no_cash_tag', False),
             is_scooter_agent=meta.get('is_scooter_agent', False),
             geofence_regions=meta.get('geofence_regions', []),
-            priority=meta.get('priority')  # None if not a priority agent
+            priority=meta.get('priority'),  # None if not a priority agent
+            blocked_merchants=list(data.get('blocked_merchants') or [])
         )
 
 
@@ -300,13 +306,53 @@ def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, floa
 # COMPATIBILITY MATRIX
 # =============================================================================
 
-def get_osrm_distances_matrix(origins: List[Location], destinations: List[Location]) -> List[List[float]]:
+def get_osrm_distances_matrix_with_source(
+    origins: List[Location],
+    destinations: List[Location],
+    timeout_seconds: float = 30.0,
+    use_retries: bool = True
+) -> Tuple[List[List[float]], str]:
     """
     Get road distances from multiple origins to multiple destinations using OSRM.
-    Returns distances in kilometers.
+    Returns (distances in kilometers, source), where source is ``osrm`` or
+    ``haversine_fallback``.
     """
     if not origins or not destinations:
-        return []
+        return [], "empty"
+
+    # Keep each full OSRM table small enough for URL and table-size limits.
+    # The server has been unreliable with sources/destinations filters, so use
+    # independent full matrices and stitch their origin→destination subsets.
+    max_locations_per_request = 80
+    if len(origins) + len(destinations) > max_locations_per_request:
+        chunk_size = max_locations_per_request // 2
+        combined = [
+            [0.0 for _ in destinations]
+            for _ in origins
+        ]
+        aggregate_source = "osrm"
+        for origin_start in range(0, len(origins), chunk_size):
+            origin_chunk = origins[origin_start:origin_start + chunk_size]
+            for destination_start in range(0, len(destinations), chunk_size):
+                destination_chunk = destinations[
+                    destination_start:destination_start + chunk_size
+                ]
+                chunk_matrix, chunk_source = (
+                    get_osrm_distances_matrix_with_source(
+                        origin_chunk,
+                        destination_chunk,
+                        timeout_seconds=timeout_seconds,
+                        use_retries=use_retries
+                    )
+                )
+                if chunk_source != "osrm":
+                    aggregate_source = "haversine_fallback"
+                for row_index, row in enumerate(chunk_matrix):
+                    combined[origin_start + row_index][
+                        destination_start:
+                        destination_start + len(destination_chunk)
+                    ] = row
+        return combined, aggregate_source
     
     try:
         # Build coordinates: origins first, then destinations
@@ -318,8 +364,8 @@ def get_osrm_distances_matrix(origins: List[Location], destinations: List[Locati
         # (the sources/destinations filter causes "InvalidQuery" on some OSRM servers)
         url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance"
         
-        session = get_osrm_session()
-        response = session.get(url, timeout=30)
+        session = get_osrm_session() if use_retries else requests
+        response = session.get(url, timeout=timeout_seconds)
         
         if response.status_code != 200:
             # Get more details about the error
@@ -354,10 +400,13 @@ def get_osrm_distances_matrix(origins: List[Location], destinations: List[Locati
                     d = full_distances[i][j]
                     row.append(d / 1000.0 if d is not None else float('inf'))
                 result.append(row)
-            return result
+            return result, "osrm"
         else:
             print(f"[OSRM] Unexpected response code: {data.get('code')} - {data.get('message', '')}")
     except Exception as e:
+        logger.warning(
+            f"[OSRM] Road-distance matrix failed; using Haversine fallback: {e}"
+        )
         print(f"[OSRM] Distance matrix error: {e}, falling back to Haversine")
     
     # Fallback to Haversine
@@ -368,7 +417,16 @@ def get_osrm_distances_matrix(origins: List[Location], destinations: List[Locati
             dist = _haversine_km(origin.lat, origin.lng, dest.lat, dest.lng)
             row.append(dist)
         result.append(row)
-    return result
+    return result, "haversine_fallback"
+
+
+def get_osrm_distances_matrix(
+    origins: List[Location],
+    destinations: List[Location]
+) -> List[List[float]]:
+    """Backward-compatible road-distance matrix helper."""
+    distances, _ = get_osrm_distances_matrix_with_source(origins, destinations)
+    return distances
 
 
 class CompatibilityChecker:
@@ -392,7 +450,11 @@ class CompatibilityChecker:
                  max_pickup_delay_minutes: int = DEFAULT_MAX_PICKUP_DELAY_MINUTES,
                  direction_coherence_mode: str = "prefilter",
                  premium_tip_threshold: float = DEFAULT_PREMIUM_TIP_THRESHOLD,
-                 premium_delivery_fee_threshold: float = DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD):
+                 premium_delivery_fee_threshold: float = DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD,
+                 merchant_agent_exclusions: Dict[str, List[str]] = None,
+                 road_distance_provider: Optional[
+                     Callable[[List[Location], List[Location]], Tuple[List[List[float]], str]]
+                 ] = None):
         self.wallet_threshold = wallet_threshold
         self.geofence_regions = geofence_regions or []
         self.max_distance_km = max_distance_km  # Max distance for assignment
@@ -402,6 +464,19 @@ class CompatibilityChecker:
         self.direction_coherence_mode = direction_coherence_mode  # "prefilter" or "solver"
         self.premium_tip_threshold = premium_tip_threshold
         self.premium_delivery_fee_threshold = premium_delivery_fee_threshold
+        self.road_distance_provider = (
+            road_distance_provider or get_osrm_distances_matrix_with_source
+        )
+        self.merchant_agent_exclusions = {
+            self._normalize_merchant_name(merchant): {
+                str(agent_id).strip()
+                for agent_id in agent_ids
+                if agent_id is not None and str(agent_id).strip()
+            }
+            for merchant, agent_ids in (merchant_agent_exclusions or {}).items()
+            if self._normalize_merchant_name(merchant)
+            and isinstance(agent_ids, (list, tuple, set))
+        }
         self.distance_cache = {}  # Cache for agent-task distances
         # Build lookup for geofence by name
         self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
@@ -411,6 +486,10 @@ class CompatibilityChecker:
         
         if not prefilter_distance:
             print(f"[CompatibilityChecker] THOROUGH mode - max_distance_km={max_distance_km}km still enforced as hard constraint")
+
+    @staticmethod
+    def _normalize_merchant_name(merchant_name: Any) -> str:
+        return str(merchant_name or '').strip().casefold()
     
     def _get_task_region(self, task: Task) -> Optional[GeofenceRegion]:
         """
@@ -496,12 +575,8 @@ class CompatibilityChecker:
     
     def precompute_distances(self, agents: List[Agent], tasks: List[Task]):
         """
-        Precompute Haversine (straight-line) distances from all agents to all task pickup locations.
-        
-        Uses Haversine instead of OSRM for:
-        - Faster computation (no API calls)
-        - More reliable (no network dependency)
-        - Sufficient accuracy for proximity checks
+        Precompute OSRM road distances from agents to task pickup locations.
+        The provider falls back to Haversine when OSRM is unavailable.
         
         For agents with existing tasks, we compute BOTH:
         1. Distance from CURRENT location (for opportunistic pickups)
@@ -522,31 +597,52 @@ class CompatibilityChecker:
                 print(f"[CompatibilityChecker] {agent.name}: current=({agent.current_location.lat:.4f}, {agent.current_location.lng:.4f}), "
                       f"projected=({proj_loc.lat:.4f}, {proj_loc.lng:.4f})")
         
-        print(f"[CompatibilityChecker] Computing Haversine distances for {len(agents)} agents x {len(tasks)} tasks...")
-        
-        # Compute distances using Haversine (fast, no API calls)
-        for agent in agents:
-            proj_loc = self._get_agent_projected_location(agent)
-            curr_loc = agent.current_location
-            
-            for task in tasks:
-                task_loc = task.restaurant_location
-                
-                # Calculate both distances using Haversine
-                proj_dist = _haversine_km(proj_loc.lat, proj_loc.lng, task_loc.lat, task_loc.lng)
-                curr_dist = _haversine_km(curr_loc.lat, curr_loc.lng, task_loc.lat, task_loc.lng)
-                
-                # Use the MINIMUM distance - if agent is near NOW or will be near LATER
-                min_dist = min(proj_dist, curr_dist)
-                self.distance_cache[(agent.id, task.id)] = min_dist
-                
-                # Also store both for logging
-                self.projected_distance_cache = getattr(self, 'projected_distance_cache', {})
-                self.current_distance_cache = getattr(self, 'current_distance_cache', {})
-                self.projected_distance_cache[(agent.id, task.id)] = proj_dist
-                self.current_distance_cache[(agent.id, task.id)] = curr_dist
-        
-        print(f"[CompatibilityChecker] Cached {len(self.distance_cache)} Haversine distances (using MIN of current and projected)")
+        print(
+            f"[CompatibilityChecker] Computing OSRM road distances for "
+            f"{len(agents)} agents x {len(tasks)} tasks..."
+        )
+
+        current_origins = [agent.current_location for agent in agents]
+        projected_origins = [
+            self._get_agent_projected_location(agent) for agent in agents
+        ]
+        destinations = [task.restaurant_location for task in tasks]
+        matrix, source = self.road_distance_provider(
+            current_origins + projected_origins,
+            destinations
+        )
+
+        expected_rows = len(agents) * 2
+        if len(matrix) != expected_rows or any(
+            len(row) != len(tasks) for row in matrix
+        ):
+            raise ValueError(
+                "Road-distance provider returned an invalid matrix shape"
+            )
+
+        self.projected_distance_cache = {}
+        self.current_distance_cache = {}
+        self.distance_source_cache = {}
+
+        for agent_index, agent in enumerate(agents):
+            for task_index, task in enumerate(tasks):
+                curr_dist = matrix[agent_index][task_index]
+                proj_dist = matrix[len(agents) + agent_index][task_index]
+                cache_key = (agent.id, task.id)
+                self.distance_cache[cache_key] = min(curr_dist, proj_dist)
+                self.current_distance_cache[cache_key] = curr_dist
+                self.projected_distance_cache[cache_key] = proj_dist
+                self.distance_source_cache[cache_key] = source
+
+        if source != "osrm":
+            logger.warning(
+                f"[CompatibilityChecker] Max-distance checks are using "
+                f"{source} for {len(self.distance_cache)} agent-task pair(s)"
+            )
+        print(
+            f"[CompatibilityChecker] Cached {len(self.distance_cache)} "
+            f"road distances via {source} (using MIN of current and projected)"
+        )
     
     def is_compatible(self, agent: Agent, task: Task) -> Tuple[bool, str]:
         """
@@ -556,7 +652,35 @@ class CompatibilityChecker:
             (is_compatible, reason) tuple
         """
         # =================================================================
-        # CAPACITY CHECK (Check FIRST - no point checking other rules if at capacity)
+        # MERCHANT-AGENT EXEMPTIONS
+        # =================================================================
+        merchant_key = self._normalize_merchant_name(task.restaurant_name)
+        blocked_by_agent = any(
+            blocked_merchant
+            and blocked_merchant in merchant_key
+            for blocked_merchant in (
+                self._normalize_merchant_name(name)
+                for name in agent.blocked_merchants
+            )
+        )
+        blocked_by_config = any(
+            merchant_filter in merchant_key
+            and str(agent.id) in blocked_agent_ids
+            for merchant_filter, blocked_agent_ids
+            in self.merchant_agent_exclusions.items()
+        )
+        if blocked_by_agent or blocked_by_config:
+            source = "A+C" if blocked_by_agent and blocked_by_config else (
+                "A" if blocked_by_agent else "C"
+            )
+            logger.info(
+                f"[MerchantExemption] Skipping agent={agent.id} "
+                f"merchant={task.restaurant_name!r} source={source}"
+            )
+            return False, f"merchant_exemption_{source}"
+
+        # =================================================================
+        # CAPACITY CHECK
         # =================================================================
         if agent.available_capacity <= 0:
             return False, "at_max_capacity"
@@ -692,17 +816,8 @@ class CompatibilityChecker:
             if cache_key in self.distance_cache:
                 distance = self.distance_cache[cache_key]
             else:
-                # Fallback to Haversine - check BOTH current and projected
-                curr_distance = _haversine_km(
-                    agent.current_location.lat, agent.current_location.lng,
-                    task.restaurant_location.lat, task.restaurant_location.lng
-                )
-                projected_loc = self._get_agent_projected_location(agent)
-                proj_distance = _haversine_km(
-                    projected_loc.lat, projected_loc.lng,
-                    task.restaurant_location.lat, task.restaurant_location.lng
-                )
-                distance = min(curr_distance, proj_distance)
+                self.precompute_distances([agent], [task])
+                distance = self.distance_cache[cache_key]
             
             if distance > self.max_distance_km:
                 # Get both distances for detailed logging
@@ -2676,6 +2791,7 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     max_pickup_delay_minutes = settings.get('maxPickupDelayMinutes', DEFAULT_MAX_PICKUP_DELAY_MINUTES)  # Max delay after food ready
     premium_tip_threshold = settings.get('premiumTipThreshold', DEFAULT_PREMIUM_TIP_THRESHOLD)
     premium_delivery_fee_threshold = settings.get('premiumDeliveryFeeThreshold', DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD)
+    merchant_agent_exclusions = settings.get('merchantAgentExclusions', {})
 
     # Apply thresholds globally to parsed Task objects for this optimization call.
     Task.PREMIUM_TIP_THRESHOLD = float(premium_tip_threshold)
@@ -2695,7 +2811,8 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         max_pickup_delay_minutes=max_pickup_delay_minutes,
         direction_coherence_mode=direction_coherence_mode,
         premium_tip_threshold=Task.PREMIUM_TIP_THRESHOLD,
-        premium_delivery_fee_threshold=Task.PREMIUM_DELIVERY_FEE_THRESHOLD
+        premium_delivery_fee_threshold=Task.PREMIUM_DELIVERY_FEE_THRESHOLD,
+        merchant_agent_exclusions=merchant_agent_exclusions
     )
     
     # Run optimizer
