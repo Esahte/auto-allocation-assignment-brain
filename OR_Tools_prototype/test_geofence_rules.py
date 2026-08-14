@@ -490,7 +490,6 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
             current_location=location,
             tags=tags or [],
             priority=priority,
-            geofence_regions=[],
         )
 
     def _make_checker(self, **kwargs):
@@ -592,14 +591,10 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
         is_compat, reason = checker.is_compatible(self.agent_outside, task)
         self.assertTrue(is_compat, f"Expected compatible, got: {reason}")
 
-    def test_scooter_region_unchanged(self):
-        """Scooter agent + scooter geofence rule still requires both locations inside."""
-        scooter_agent = Agent(
-            id='agent_4',
-            name='ScooterGuy',
-            current_location=OptimizerLocation(18.02, -76.78),
-            is_scooter_agent=True,
-            geofence_regions=['Scooter Zone Kingston'],
+    def test_scooter_region_blocks_trip_leaving_zone(self):
+        """Agent in a scooter region's fleet_ids -> both locations must be inside."""
+        scooter_agent = self._make_optimizer_agent(
+            'agent_4', 'ScooterGuy', OptimizerLocation(18.02, -76.78)
         )
         checker = self._make_checker(
             geofence_regions=[self.scooter_geofence],
@@ -615,7 +610,45 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
         )
         is_compat, reason = checker.is_compatible(scooter_agent, task)
         self.assertFalse(is_compat)
-        self.assertEqual(reason, 'outside_scooter_geofence')
+        self.assertIn('outside_scooter_geofence', reason)
+
+    def test_scooter_region_allows_trip_inside_zone(self):
+        """Agent in a scooter region -> trip staying fully inside is compatible."""
+        scooter_agent = self._make_optimizer_agent(
+            'agent_4', 'ScooterGuy', OptimizerLocation(18.02, -76.78)
+        )
+        checker = self._make_checker(
+            geofence_regions=[self.scooter_geofence],
+            max_distance_km=50.0,
+        )
+        checker._all_agents = [scooter_agent]
+
+        task = self._make_optimizer_task(
+            't1',
+            OptimizerLocation(18.02, -76.78),    # Inside scooter zone
+            OptimizerLocation(18.025, -76.775),  # Also inside
+        )
+        is_compat, reason = checker.is_compatible(scooter_agent, task)
+        self.assertTrue(is_compat, f"Expected compatible, got: {reason}")
+
+    def test_scooter_rule_ignores_agent_tags(self):
+        """A 'scooter'-tagged agent NOT in the region is not scooter-restricted."""
+        tagged_agent = self._make_optimizer_agent(
+            'agent_99', 'Zara', OptimizerLocation(18.02, -76.78), tags=['Scooter']
+        )
+        checker = self._make_checker(
+            geofence_regions=[self.scooter_geofence],
+            max_distance_km=50.0,
+        )
+        checker._all_agents = [tagged_agent]
+
+        task = self._make_optimizer_task(
+            't1',
+            OptimizerLocation(18.02, -76.78),  # Inside scooter zone
+            OptimizerLocation(17.90, -76.50),   # Outside
+        )
+        is_compat, reason = checker.is_compatible(tagged_agent, task)
+        self.assertTrue(is_compat, f"Expected compatible, got: {reason}")
 
     def test_backward_compat_no_geofences(self):
         """No geofences in checker -> no region restriction."""

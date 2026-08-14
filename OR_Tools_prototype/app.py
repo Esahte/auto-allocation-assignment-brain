@@ -3095,8 +3095,7 @@ def trigger_incremental_optimization(
                     'max_tasks': agent.max_capacity,
                     'available_capacity': agent.available_capacity,
                     'tags': agent.tags,
-                    'has_no_cash_tag': any('nocash' in t.lower().replace('-', '').replace('_', '').replace(' ', '') for t in agent.tags),
-                    'is_scooter_agent': 'scooter' in [t.lower() for t in agent.tags]
+                    'has_no_cash_tag': any('nocash' in t.lower().replace('-', '').replace('_', '').replace(' ', '') for t in agent.tags)
                 }
             }],
             'geofence_data': _export_geofence_data(),
@@ -3389,6 +3388,15 @@ def handle_fleet_sync(data):
                     f"{len(fleet_state.merchant_agent_exclusions)} merchant(s)"
                 )
 
+            if 'customer_agent_exclusions' in config:
+                fleet_state.set_customer_agent_exclusions(
+                    config.get('customer_agent_exclusions') or {}
+                )
+                print(
+                    f"[FleetState] → customer_agent_exclusions = "
+                    f"{len(fleet_state.customer_agent_exclusions)} customer(s)"
+                )
+
             if 'premium_tip_threshold' in config:
                 fleet_state.premium_tip_threshold = float(config['premium_tip_threshold'])
                 TaskState.PREMIUM_TIP_THRESHOLD = fleet_state.premium_tip_threshold
@@ -3473,6 +3481,10 @@ def handle_fleet_sync(data):
                 'merchant_agent_exclusions': {
                     merchant: list(agent_ids)
                     for merchant, agent_ids in fleet_state.merchant_agent_exclusions.items()
+                },
+                'customer_agent_exclusions': {
+                    customer: list(agent_ids)
+                    for customer, agent_ids in fleet_state.customer_agent_exclusions.items()
                 }
             },
             'fleet_stats': stats
@@ -3605,6 +3617,16 @@ def handle_config_update(data):
                 f"merchant_agent_exclusions: {old_count} → "
                 f"{len(fleet_state.merchant_agent_exclusions)} merchant(s)"
             )
+
+        if 'customer_agent_exclusions' in config:
+            old_count = len(fleet_state.customer_agent_exclusions)
+            fleet_state.set_customer_agent_exclusions(
+                config.get('customer_agent_exclusions') or {}
+            )
+            changes.append(
+                f"customer_agent_exclusions: {old_count} → "
+                f"{len(fleet_state.customer_agent_exclusions)} customer(s)"
+            )
         
         # chain_lookahead_radius_km is now synced with max_distance_km automatically
         # No need to update it separately in config updates
@@ -3666,6 +3688,10 @@ def handle_config_update(data):
                 'merchant_agent_exclusions': {
                     merchant: list(agent_ids)
                     for merchant, agent_ids in fleet_state.merchant_agent_exclusions.items()
+                },
+                'customer_agent_exclusions': {
+                    customer: list(agent_ids)
+                    for customer, agent_ids in fleet_state.customer_agent_exclusions.items()
                 }
             }
         })
@@ -5289,6 +5315,7 @@ def handle_agent_online(data):
         "wallet_balance": 1500.00,
         "priority": 1,              // Optional: only for priority agents
         "blocked_merchants": ["KFC St. John's"],
+        "blocked_customers": ["JohnDoe"],
         "dashboard_url": "..."
     }
     """
@@ -5306,6 +5333,7 @@ def handle_agent_online(data):
     tags = data.get('tags', [])
     wallet_balance = data.get('wallet_balance')
     blocked_merchants = data.get('blocked_merchants', [])
+    blocked_customers = data.get('blocked_customers', [])
     dashboard_url = data.get('dashboard_url', os.environ.get('DASHBOARD_URL', 'http://localhost:8000'))
     
     # Build log string with key info
@@ -5324,7 +5352,8 @@ def handle_agent_online(data):
             max_capacity=int(max_capacity) if max_capacity else None,
             tags=tags,
             wallet_balance=float(wallet_balance) if wallet_balance is not None else None,
-            blocked_merchants=blocked_merchants
+            blocked_merchants=blocked_merchants,
+            blocked_customers=blocked_customers
         )
         if agent:
             print(f"[FleetState] Agent online: {name} at {agent.current_location}{priority_str} capacity={agent.max_capacity}")
@@ -5462,6 +5491,7 @@ def handle_agent_update(data):
         "priority": 1,
         "wallet_balance": 500.00,
         "blocked_merchants": ["Subway"],
+        "blocked_customers": ["JohnDoe"],
         "dashboard_url": "https://..."
     }
     """
@@ -5474,6 +5504,7 @@ def handle_agent_update(data):
     priority = data.get('priority')
     wallet_balance = data.get('wallet_balance')
     blocked_merchants = data.get('blocked_merchants')
+    blocked_customers = data.get('blocked_customers')
     
     # Build update summary for logging
     updates = []
@@ -5487,6 +5518,8 @@ def handle_agent_update(data):
         updates.append(f"wallet=${wallet_balance}")
     if blocked_merchants is not None:
         updates.append(f"blocked_merchants={blocked_merchants}")
+    if blocked_customers is not None:
+        updates.append(f"blocked_customers={blocked_customers}")
     
     update_str = ", ".join(updates) if updates else "no changes"
     print(f"[WebSocket] agent:update: {name or agent_id} → {update_str}")
@@ -5502,6 +5535,7 @@ def handle_agent_update(data):
             priority=priority,
             wallet_balance=float(wallet_balance) if wallet_balance is not None else None,
             blocked_merchants=blocked_merchants,
+            blocked_customers=blocked_customers,
             priority_explicitly_set=True  # agent:update is SOURCE OF TRUTH for priority
         )
         if agent:
@@ -5509,7 +5543,8 @@ def handle_agent_update(data):
             priority_str = f", priority={agent.priority}" if agent.priority else ""
             print(
                 f"[FleetState] ✓ Updated {agent.name}: capacity={agent.max_capacity}, "
-                f"tags={agent.tags}, blocked_merchants={agent.blocked_merchants}{priority_str}"
+                f"tags={agent.tags}, blocked_merchants={agent.blocked_merchants}, "
+                f"blocked_customers={agent.blocked_customers}{priority_str}"
             )
         else:
             print(f"[FleetState] ⚠️ Agent {agent_id} not found in fleet state")

@@ -233,6 +233,7 @@ class AgentState:
     wallet_balance: float = 0.0  # Cash on hand for cash orders
     priority: Optional[int] = None  # Priority level: 1 = highest priority (premium tasks only)
     blocked_merchants: List[str] = field(default_factory=list)
+    blocked_customers: List[str] = field(default_factory=list)
     # Timestamps
     last_location_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -382,6 +383,7 @@ class FleetState:
         self.default_max_capacity = 2  # Default max tasks per agent
         self.direction_coherence_mode = os.environ.get('DIRECTION_COHERENCE_MODE', 'solver').lower()  # "prefilter" = hard block, "solver" = OR-Tools penalty
         self.merchant_agent_exclusions: Dict[str, List[str]] = {}
+        self.customer_agent_exclusions: Dict[str, List[str]] = {}
         self._road_distance_provider = road_distance_provider
         self._road_distance_cache: Dict[
             Tuple[float, float, float, float],
@@ -481,7 +483,8 @@ class FleetState:
         max_capacity: Optional[int] = None,
         tags: Optional[List[str]] = None,
         wallet_balance: Optional[float] = None,
-        blocked_merchants: Optional[List[str]] = None
+        blocked_merchants: Optional[List[str]] = None,
+        blocked_customers: Optional[List[str]] = None
     ) -> Optional[AgentState]:
         """
         Mark agent as online with full profile data (same format as sync).
@@ -515,6 +518,8 @@ class FleetState:
                     agent.wallet_balance = wallet_balance
                 if blocked_merchants is not None:
                     agent.blocked_merchants = list(blocked_merchants)
+                if blocked_customers is not None:
+                    agent.blocked_customers = list(blocked_customers)
                 agent.last_updated = datetime.now(timezone.utc)
                 priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
                 logger.info(f"[FleetState] Agent online: {agent.name}{priority_str}")
@@ -530,7 +535,8 @@ class FleetState:
                     max_capacity=max_capacity or 2,
                     tags=tags or [],
                     wallet_balance=wallet_balance or 0.0,
-                    blocked_merchants=list(blocked_merchants or [])
+                    blocked_merchants=list(blocked_merchants or []),
+                    blocked_customers=list(blocked_customers or [])
                 )
                 self._agents[agent_id] = agent
                 priority_str = f" [Priority {agent.priority}]" if agent.priority else ""
@@ -558,6 +564,7 @@ class FleetState:
         priority: Optional[int] = None,
         wallet_balance: Optional[float] = None,
         blocked_merchants: Optional[List[str]] = None,
+        blocked_customers: Optional[List[str]] = None,
         priority_explicitly_set: bool = False
     ) -> Optional[AgentState]:
         """
@@ -589,6 +596,8 @@ class FleetState:
                 agent.wallet_balance = wallet_balance
             if blocked_merchants is not None:
                 agent.blocked_merchants = list(blocked_merchants)
+            if blocked_customers is not None:
+                agent.blocked_customers = list(blocked_customers)
             
             agent.last_updated = datetime.now(timezone.utc)
             return agent
@@ -642,6 +651,69 @@ class FleetState:
             and str(agent.id) in blocked_agent_ids
             for merchant_filter, blocked_agent_ids
             in self.merchant_agent_exclusions.items()
+        )
+
+        if blocked_by_agent and blocked_by_config:
+            return "A+C"
+        if blocked_by_agent:
+            return "A"
+        if blocked_by_config:
+            return "C"
+        return None
+
+    @staticmethod
+    def _exact_customer_username(customer_name: Any) -> str:
+        """Preserve Tookan usernames exactly: case, spaces, special characters."""
+        if customer_name is None:
+            return ''
+        return str(customer_name)
+
+    def set_customer_agent_exclusions(self, exclusions: Dict[str, List[Any]]):
+        """Replace the canonical customer-username-to-agent exclusion map."""
+        normalized: Dict[str, List[str]] = {}
+        if isinstance(exclusions, dict):
+            for customer, agent_ids in exclusions.items():
+                customer_key = self._exact_customer_username(customer)
+                if customer_key == '' or not isinstance(agent_ids, (list, tuple, set)):
+                    continue
+                ids = list(dict.fromkeys(
+                    str(agent_id).strip()
+                    for agent_id in agent_ids
+                    if agent_id is not None and str(agent_id).strip()
+                ))
+                if customer_key in normalized:
+                    normalized[customer_key] = list(dict.fromkeys(
+                        normalized[customer_key] + ids
+                    ))
+                else:
+                    normalized[customer_key] = ids
+
+        with self._lock:
+            self.customer_agent_exclusions = normalized
+        logger.info(
+            f"[FleetState] Replaced customer-agent exclusions with "
+            f"{len(normalized)} customer(s)"
+        )
+
+    def _customer_exemption_source(
+        self,
+        agent: AgentState,
+        task: TaskState
+    ) -> Optional[str]:
+        """Return A, C, or A+C when an exact customer username blocks this pairing."""
+        customer_key = self._exact_customer_username(
+            task.meta.get('customer_name') if task.meta else None
+        )
+        if customer_key == '':
+            return None
+
+        blocked_by_agent = any(
+            self._exact_customer_username(name) == customer_key
+            for name in agent.blocked_customers
+        )
+        blocked_by_config = (
+            customer_key in self.customer_agent_exclusions
+            and str(agent.id) in self.customer_agent_exclusions[customer_key]
         )
 
         if blocked_by_agent and blocked_by_config:
@@ -1573,6 +1645,7 @@ class FleetState:
         
         Business Rules Checked:
         0. Merchant exemptions - agent or config policy blocks this merchant
+        0. Customer exemptions - agent or config policy blocks this exact username
         0. Priority - Priority 1 agents only get premium tasks (configurable thresholds)
         0b. Tag Matching - TEST agents only get TEST tasks, tagged tasks go to matching agents
         1. Declined - Agent hasn't declined this task
@@ -1591,6 +1664,15 @@ class FleetState:
                 f"merchant={task.restaurant_name!r} source={exemption_source}"
             )
             return f"merchant_exemption_{exemption_source}"
+
+        # 0. CUSTOMER-AGENT EXEMPTIONS (exact username match)
+        customer_exemption_source = self._customer_exemption_source(agent, task)
+        if customer_exemption_source:
+            logger.info(
+                f"[CustomerExemption] Skipping agent={agent.id} "
+                f"customer={task.meta.get('customer_name')!r} source={customer_exemption_source}"
+            )
+            return f"customer_exemption_{customer_exemption_source}"
 
         # 0a. PRIORITY AGENT RULES
         # Priority 1 agents ONLY get premium tasks (configurable thresholds)
@@ -2168,6 +2250,7 @@ class FleetState:
                     agent.max_capacity = int(agent_data.get('max_capacity', agent.max_capacity))
                     agent.priority = final_priority
                     agent.blocked_merchants = list(agent_data.get('blocked_merchants', []))
+                    agent.blocked_customers = list(agent_data.get('blocked_customers', []))
                 else:
                     agent = AgentState(
                         id=agent_id,
@@ -2178,7 +2261,8 @@ class FleetState:
                         wallet_balance=float(agent_data.get('wallet_balance') or 0),
                         max_capacity=int(agent_data.get('max_capacity', 2)),
                         priority=final_priority,
-                        blocked_merchants=list(agent_data.get('blocked_merchants', []))
+                        blocked_merchants=list(agent_data.get('blocked_merchants', [])),
+                        blocked_customers=list(agent_data.get('blocked_customers', []))
                     )
                     self._agents[agent_id] = agent
                 
@@ -2775,6 +2859,7 @@ class FleetState:
             self._tasks.clear()
             self._last_optimization_time.clear()
             self.merchant_agent_exclusions = {}
+            self.customer_agent_exclusions = {}
             self._road_distance_cache.clear()
             logger.info("[FleetState] State cleared")
     
@@ -2830,13 +2915,13 @@ class FleetState:
                     'current_tasks': current_tasks,
                     'wallet_balance': agent.wallet_balance,
                     'blocked_merchants': list(agent.blocked_merchants),
+                    'blocked_customers': list(agent.blocked_customers),
                     '_meta': {
                         'max_tasks': agent.max_capacity,
                         'available_capacity': agent.available_capacity,
                         'tags': agent.tags,
                         # Check if 'nocash' appears anywhere in any tag (handles AbsolutelyNoCash, etc.)
                         'has_no_cash_tag': any('nocash' in t.lower().replace('-', '').replace('_', '').replace(' ', '') for t in agent.tags),
-                        'is_scooter_agent': 'scooter' in [t.lower() for t in agent.tags],
                         'priority': agent.priority  # None if not a priority agent
                     }
                 })
@@ -2862,6 +2947,10 @@ class FleetState:
                     'merchantAgentExclusions': {
                         merchant: list(agent_ids)
                         for merchant, agent_ids in self.merchant_agent_exclusions.items()
+                    },
+                    'customerAgentExclusions': {
+                        customer: list(agent_ids)
+                        for customer, agent_ids in self.customer_agent_exclusions.items()
                     }
                 }
             }

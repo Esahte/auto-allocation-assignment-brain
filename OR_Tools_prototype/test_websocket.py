@@ -44,9 +44,7 @@ SAMPLE_AGENTS = [
             "max_tasks": 3,
             "available_capacity": 3,
             "tags": [],
-            "has_no_cash_tag": False,
-            "is_scooter_agent": False,
-            "geofence_regions": []
+            "has_no_cash_tag": False
         }
     },
     {
@@ -59,9 +57,7 @@ SAMPLE_AGENTS = [
             "max_tasks": 3,
             "available_capacity": 3,
             "tags": [],
-            "has_no_cash_tag": False,
-            "is_scooter_agent": False,
-            "geofence_regions": []
+            "has_no_cash_tag": False
         }
     }
 ]

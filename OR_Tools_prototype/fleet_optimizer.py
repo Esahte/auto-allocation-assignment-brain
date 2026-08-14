@@ -114,6 +114,10 @@ class Task:
     @property
     def restaurant_name(self) -> str:
         return self.meta.get('restaurant_name', 'Unknown Restaurant')
+
+    @property
+    def customer_name(self) -> str:
+        return self.meta.get('customer_name', 'Unknown Customer')
     
     @property
     def is_premium_task(self) -> bool:
@@ -197,10 +201,9 @@ class Agent:
     available_capacity: int = 2
     tags: List[str] = field(default_factory=list)
     has_no_cash_tag: bool = False
-    is_scooter_agent: bool = False
-    geofence_regions: List[str] = field(default_factory=list)
     priority: Optional[int] = None  # Priority level: 1 = highest (premium tasks only)
     blocked_merchants: List[str] = field(default_factory=list)
+    blocked_customers: List[str] = field(default_factory=list)
     
     @classmethod
     def from_dict(cls, data: dict) -> 'Agent':
@@ -228,10 +231,9 @@ class Agent:
             available_capacity=meta.get('available_capacity', 2),
             tags=meta.get('tags', []),
             has_no_cash_tag=meta.get('has_no_cash_tag', False),
-            is_scooter_agent=meta.get('is_scooter_agent', False),
-            geofence_regions=meta.get('geofence_regions', []),
             priority=meta.get('priority'),  # None if not a priority agent
-            blocked_merchants=list(data.get('blocked_merchants') or [])
+            blocked_merchants=list(data.get('blocked_merchants') or []),
+            blocked_customers=list(data.get('blocked_customers') or [])
         )
 
 
@@ -452,6 +454,7 @@ class CompatibilityChecker:
                  premium_tip_threshold: float = DEFAULT_PREMIUM_TIP_THRESHOLD,
                  premium_delivery_fee_threshold: float = DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD,
                  merchant_agent_exclusions: Dict[str, List[str]] = None,
+                 customer_agent_exclusions: Dict[str, List[str]] = None,
                  road_distance_provider: Optional[
                      Callable[[List[Location], List[Location]], Tuple[List[List[float]], str]]
                  ] = None):
@@ -477,10 +480,17 @@ class CompatibilityChecker:
             if self._normalize_merchant_name(merchant)
             and isinstance(agent_ids, (list, tuple, set))
         }
+        self.customer_agent_exclusions = {
+            self._exact_customer_username(customer): {
+                str(agent_id).strip()
+                for agent_id in agent_ids
+                if agent_id is not None and str(agent_id).strip()
+            }
+            for customer, agent_ids in (customer_agent_exclusions or {}).items()
+            if self._exact_customer_username(customer)
+            and isinstance(agent_ids, (list, tuple, set))
+        }
         self.distance_cache = {}  # Cache for agent-task distances
-        # Build lookup for geofence by name
-        self.geofence_by_name = {g.region_name: g for g in self.geofence_regions}
-        
         # Build lookup for geofence by ID (for non-scooter region logic)
         self.geofence_by_id = {str(g.region_id): g for g in self.geofence_regions}
         
@@ -490,6 +500,12 @@ class CompatibilityChecker:
     @staticmethod
     def _normalize_merchant_name(merchant_name: Any) -> str:
         return str(merchant_name or '').strip().casefold()
+
+    @staticmethod
+    def _exact_customer_username(customer_name: Any) -> str:
+        if customer_name is None:
+            return ''
+        return str(customer_name)
     
     def _get_task_region(self, task: Task) -> Optional[GeofenceRegion]:
         """
@@ -550,6 +566,26 @@ class CompatibilityChecker:
         agent_id_str = str(agent.id)
         for gf in self.geofence_regions:
             if gf.is_scooter:
+                continue
+            if agent_id_str in [str(fid) for fid in gf.fleet_ids]:
+                regions.append(gf)
+        return regions
+
+    def _get_agent_scooter_regions(self, agent: Agent) -> List[GeofenceRegion]:
+        """
+        Get list of scooter geofence regions this agent is assigned to.
+
+        Membership comes from the geofence's fleet_ids, exactly like the
+        non-scooter rules - never from agent tags.
+        Returns empty list if agent is not in any scooter region.
+        """
+        if not self.geofence_regions:
+            return []
+
+        regions = []
+        agent_id_str = str(agent.id)
+        for gf in self.geofence_regions:
+            if not gf.is_scooter:
                 continue
             if agent_id_str in [str(fid) for fid in gf.fleet_ids]:
                 regions.append(gf)
@@ -680,6 +716,29 @@ class CompatibilityChecker:
             return False, f"merchant_exemption_{source}"
 
         # =================================================================
+        # CUSTOMER-AGENT EXEMPTIONS (exact username match)
+        # =================================================================
+        customer_key = self._exact_customer_username(task.meta.get('customer_name'))
+        blocked_by_customer_agent = customer_key != '' and any(
+            self._exact_customer_username(name) == customer_key
+            for name in agent.blocked_customers
+        )
+        blocked_by_customer_config = (
+            customer_key != ''
+            and customer_key in self.customer_agent_exclusions
+            and str(agent.id) in self.customer_agent_exclusions[customer_key]
+        )
+        if blocked_by_customer_agent or blocked_by_customer_config:
+            source = "A+C" if blocked_by_customer_agent and blocked_by_customer_config else (
+                "A" if blocked_by_customer_agent else "C"
+            )
+            logger.info(
+                f"[CustomerExemption] Skipping agent={agent.id} "
+                f"customer={task.meta.get('customer_name')!r} source={source}"
+            )
+            return False, f"customer_exemption_{source}"
+
+        # =================================================================
         # CAPACITY CHECK
         # =================================================================
         if agent.available_capacity <= 0:
@@ -752,21 +811,31 @@ class CompatibilityChecker:
             if not any(tag in non_test_agent_tags for tag in non_test_task_tags):
                 return False, "tag_mismatch"
         
-        # Rule 5: Scooter Geofence - Both locations must be in geofence
-        if agent.is_scooter_agent and agent.geofence_regions:
-            for region_name in agent.geofence_regions:
-                if region_name in self.geofence_by_name:
-                    geofence = self.geofence_by_name[region_name]
-                    pickup_in = point_in_polygon(
-                        task.restaurant_location.to_tuple(), 
-                        geofence.polygon
-                    )
-                    delivery_in = point_in_polygon(
-                        task.delivery_location.to_tuple(),
-                        geofence.polygon
-                    )
-                    if not (pickup_in and delivery_in):
-                        return False, "outside_scooter_geofence"
+        # Rule 5: Scooter Geofence - agents assigned to a scooter region may only
+        # take trips that stay entirely inside one of those regions (both pickup
+        # AND delivery). Membership is resolved from the geofence's fleet_ids,
+        # the same source used by rules 5b/5c below.
+        scooter_regions = self._get_agent_scooter_regions(agent)
+        if scooter_regions:
+            task_fully_inside = False
+            for geofence in scooter_regions:
+                if not geofence.polygon:
+                    continue
+                pickup_in = point_in_polygon(
+                    task.restaurant_location.to_tuple(),
+                    geofence.polygon
+                )
+                delivery_in = point_in_polygon(
+                    task.delivery_location.to_tuple(),
+                    geofence.polygon
+                )
+                if pickup_in and delivery_in:
+                    task_fully_inside = True
+                    break
+
+            if not task_fully_inside:
+                region_names = ', '.join(gf.region_name for gf in scooter_regions)
+                return False, f"outside_scooter_geofence ({region_names})"
         
         # Rule 5b: Non-scooter Geofence Region Restriction
         # If task is in a non-scooter region AND at least one region agent is in the solver:
@@ -2792,6 +2861,7 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     premium_tip_threshold = settings.get('premiumTipThreshold', DEFAULT_PREMIUM_TIP_THRESHOLD)
     premium_delivery_fee_threshold = settings.get('premiumDeliveryFeeThreshold', DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD)
     merchant_agent_exclusions = settings.get('merchantAgentExclusions', {})
+    customer_agent_exclusions = settings.get('customerAgentExclusions', {})
 
     # Apply thresholds globally to parsed Task objects for this optimization call.
     Task.PREMIUM_TIP_THRESHOLD = float(premium_tip_threshold)
@@ -2812,7 +2882,8 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         direction_coherence_mode=direction_coherence_mode,
         premium_tip_threshold=Task.PREMIUM_TIP_THRESHOLD,
         premium_delivery_fee_threshold=Task.PREMIUM_DELIVERY_FEE_THRESHOLD,
-        merchant_agent_exclusions=merchant_agent_exclusions
+        merchant_agent_exclusions=merchant_agent_exclusions,
+        customer_agent_exclusions=customer_agent_exclusions
     )
     
     # Run optimizer
