@@ -112,7 +112,7 @@ print(f"[Logging] Important events: important_events.log")
 
 # Import Fleet State (Abstract Map)
 try:
-    from fleet_state import fleet_state, AgentStatus, TaskStatus, TaskState
+    from fleet_state import fleet_state, AgentStatus, TaskStatus, TaskState, _extract_incoming_task_tags
     FLEET_STATE_AVAILABLE = True
     print("[FleetState] Abstract Map loaded successfully")
     
@@ -383,12 +383,12 @@ _idle_priority_tasks = {}  # Track P2+ priority rollout: {task_id: {'start_time'
 
 
 def _is_agent_exempt_from_idle_priority(agent) -> bool:
-    """Check if an agent is exempt from the idle-priority rule (P1 or region-based)."""
+    """Check if an agent is exempt from idle priority (P1 or Region-first member)."""
     if agent.priority == 1:
         return True
     if fleet_state:
         regions = fleet_state._get_agent_regions(agent)
-        if regions:
+        if any(region.get('sharing_mode') == 'region_first' for region in regions):
             return True
     return False
 
@@ -438,10 +438,19 @@ def _export_geofence_data() -> list:
             'region_id': gf['id'],
             'region_name': gf['name'],
             'polygon': gf['polygon'],
-            'fleet_ids': list(gf['agent_ids'])
+            'fleet_ids': list(gf['agent_ids']),
+            'sharing_mode': gf.get('sharing_mode'),
+            'route_coverage': gf.get('route_coverage')
         }
         for gf in fleet_state._geofences.values()
     ]
+
+
+def _export_online_agent_ids() -> list:
+    """Export the full online set so single-agent solver checks preserve staffing."""
+    if not fleet_state:
+        return []
+    return [str(agent.id) for agent in fleet_state.get_online_agents()]
 
 
 def _get_agent_broadcast_capacity_unlocked(agent_id: str) -> int:
@@ -625,6 +634,11 @@ def trigger_perceived_projected_check(agent_id: str, broadcast_task_id: str, das
                 # Check per-task broadcast limit
                 bcast_count = get_task_broadcast_count_for_agent(task.id, agent_id)
                 if bcast_count < PROXIMITY_MAX_BROADCASTS_PER_AGENT:
+                    eligibility = fleet_state._check_eligibility(
+                        agent, task, override_max_distance_km=search_radius
+                    )
+                    if eligibility is not None:
+                        continue
                     compatible_tasks.append(task)
                     # Limit to remaining capacity
                     if len(compatible_tasks) >= broadcast_capacity:
@@ -1466,6 +1480,7 @@ def trigger_proximity_broadcast(
                     'priority': agent.priority
                 }
             }],
+            'online_agent_ids': _export_online_agent_ids(),
             'geofence_data': _export_geofence_data(),
             'settings_used': {
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
@@ -1493,7 +1508,8 @@ def trigger_proximity_broadcast(
                     'customer_name': task.meta.get('customer_name', 'Unknown'),
                     'delivery_fee': task.delivery_fee,
                     'tips': task.tips,
-                    'payment_type': payment_type  # Required for NoCash tag filtering
+                    'payment_type': payment_type,  # Required for NoCash tag filtering
+                    'tags': task.tags
                 }
             }]
         }
@@ -1882,6 +1898,7 @@ def trigger_batched_proximity_broadcast(
     skipped_at_limit = []
     skipped_declined = []
     skipped_idle_priority = []
+    skipped_ineligible = []
     is_exempt = _is_agent_exempt_from_idle_priority(agent)
     for task_id in task_ids:
         task_id = str(task_id)
@@ -1909,6 +1926,14 @@ def trigger_batched_proximity_broadcast(
             if bcast_count >= PROXIMITY_MAX_BROADCASTS_PER_AGENT:
                 skipped_at_limit.append((task.restaurant_name, bcast_count))
                 continue
+
+            search_radius = _task_expanded_radius.get(task.id, PROXIMITY_DEFAULT_RADIUS_KM)
+            eligibility = fleet_state._check_eligibility(
+                agent, task, override_max_distance_km=search_radius
+            )
+            if eligibility is not None:
+                skipped_ineligible.append((task.restaurant_name, eligibility))
+                continue
             
             valid_tasks.append(task)
             # Stop when we hit broadcast capacity limit
@@ -1923,6 +1948,9 @@ def trigger_batched_proximity_broadcast(
     
     if skipped_at_limit:
         log_event(f"[ProximityBroadcast] 🔁 Batched: Skipping {len(skipped_at_limit)} tasks at limit for {agent_name}: {skipped_at_limit}")
+
+    if skipped_ineligible:
+        log_event(f"[ProximityBroadcast] 🚫 Batched: Skipping {len(skipped_ineligible)} ineligible tasks for {agent_name}: {skipped_ineligible}")
     
     if not valid_tasks:
         return {'success': False, 'error': 'No valid tasks (all at broadcast limit)'}
@@ -2000,19 +2028,20 @@ def trigger_batched_proximity_broadcast(
     
     log_event(f"[ProximityBroadcast] 📦 Batched check for {agent_name}: {len(valid_tasks)} tasks (capacity: {broadcast_capacity})")
     
-    # Log geofence region decisions for batched tasks (non-trivial cases only)
+    # Log policy decisions for batched tasks (eligibility itself was already checked).
     if fleet_state and fleet_state._geofences and valid_tasks:
         for vt in valid_tasks:
-            task_region = fleet_state._get_task_region(vt)
-            if task_region and not task_region['is_scooter']:
-                region_id = task_region['id']
-                online_region_agents = fleet_state._get_online_region_agents(region_id)
-                agent_in_region = str(agent_id) in online_region_agents
+            task_regions = fleet_state._get_task_regions(vt)
+            if task_regions:
+                region_names = ', '.join(region['name'] for region in task_regions)
+                policies = ', '.join(
+                    f"{region['sharing_mode']}/{region['route_coverage']}"
+                    for region in task_regions
+                )
                 log_event(
                     f"[ProximityBroadcast] [Geofence] Batched: task={vt.id[:20]} "
-                    f"region={task_region['name']} region_agents_online={len(online_region_agents)} "
-                    f"agent={agent_name} in_region={agent_in_region} "
-                    f"{'distance_bypass=True' if agent_in_region else 'BLOCKED'}"
+                    f"regions=[{region_names}] agent={agent_name} "
+                    f"policies=[{policies}]"
                 )
     
     # Debounce batched broadcast per agent
@@ -2080,6 +2109,7 @@ def trigger_batched_proximity_broadcast(
                 'priority': agent.priority
             }
         }],
+        'online_agent_ids': _export_online_agent_ids(),
         'geofence_data': _export_geofence_data(),
         'settings_used': {
             'walletNoCashThreshold': fleet_state.wallet_threshold,
@@ -2110,7 +2140,8 @@ def trigger_batched_proximity_broadcast(
                 'delivery_fee': task.delivery_fee,
                 'tips': task.tips,
                 'search_radius_km': search_radius,
-                'payment_type': payment_type  # Required for NoCash tag filtering
+                'payment_type': payment_type,  # Required for NoCash tag filtering
+                'tags': task.tags
             }
         })
     
@@ -3098,6 +3129,7 @@ def trigger_incremental_optimization(
                     'has_no_cash_tag': any('nocash' in t.lower().replace('-', '').replace('_', '').replace(' ', '') for t in agent.tags)
                 }
             }],
+            'online_agent_ids': _export_online_agent_ids(),
             'geofence_data': _export_geofence_data(),
             'settings_used': {
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
@@ -3244,6 +3276,7 @@ def handle_connect():
             'task:get_recommendations',
             'fleet:optimize_request',
             'fleet:sync',  # Initial state sync
+            'geofences:update',
             # Task events
             'task:created',
             'task:assigned',
@@ -3271,6 +3304,46 @@ def handle_ping(data):
         'sent_at': data.get('sent_at'),
         'server_time': datetime.now().isoformat()
     })
+
+
+@socketio.on('geofences:update')
+def handle_geofences_update(data):
+    """Apply saved region policies immediately without replacing fleet state."""
+    performance_stats["websocket_events"] += 1
+    request_id = data.get('request_id')
+    geofences = data.get('geofences') or []
+    if not FLEET_STATE_AVAILABLE or not fleet_state:
+        emit('geofences:update_ack', {
+            'success': False,
+            'request_id': request_id,
+            'error': 'Fleet state not available',
+        })
+        return
+    if not geofences:
+        emit('geofences:update_ack', {
+            'success': False,
+            'request_id': request_id,
+            'error': 'No geofences supplied',
+        })
+        return
+
+    try:
+        fleet_state.sync_geofences(geofences)
+        update_last_event_time('geofences:update')
+        log_event(f"[WebSocket] geofences:update applied: {len(geofences)} regions")
+        emit('geofences:update_ack', {
+            'success': True,
+            'request_id': request_id,
+            'received_at': datetime.now().isoformat(),
+            'synced': {'geofences': len(geofences)},
+        })
+    except Exception as error:
+        log_event(f"[WebSocket] geofences:update rejected: {error}", 'error')
+        emit('geofences:update_ack', {
+            'success': False,
+            'request_id': request_id,
+            'error': str(error),
+        })
 
 @socketio.on('fleet:sync')
 def handle_fleet_sync(data):
@@ -4903,10 +4976,13 @@ def handle_task_updated(data):
         except Exception:
             pass
     
-    # Business rule updates
-    if 'tags' in data:
-        new_tags = data['tags'] or []
-        if existing_task.tags != new_tags:
+    # Business rule updates. Empty tags on a later update must not wipe
+    # Task_Category tags (HEAVY, etc.) that arrived on task:created.
+    if 'tags' in data or (isinstance(data.get('custom_fields'), dict) and (
+        data['custom_fields'].get('Task_Category') or data['custom_fields'].get('task_category')
+    )):
+        new_tags = _extract_incoming_task_tags(data, data.get('_meta'))
+        if new_tags and existing_task.tags != new_tags:
             existing_task.tags = new_tags
             changes.append('tags')
     

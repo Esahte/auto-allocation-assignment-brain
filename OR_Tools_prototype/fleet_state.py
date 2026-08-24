@@ -25,6 +25,8 @@ import logging
 import os
 import re
 
+from region_policy import evaluate_region_eligibility, matching_regions, normalize_region
+
 
 def _parse_datetime(dt_str: str) -> datetime:
     """
@@ -66,6 +68,50 @@ def _parse_datetime(dt_str: str) -> datetime:
     # Fallback: return current time
     logger.warning(f"[FleetState] Could not parse datetime: {dt_str}, using current time")
     return datetime.now(timezone.utc)
+
+
+def _normalize_tag_list(raw) -> List[str]:
+    """Normalize tags from string, list, or Tookan {tag_name} objects."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [t.strip() for t in raw.split(',') if t.strip()]
+    if isinstance(raw, (list, tuple)):
+        tags = []
+        for item in raw:
+            if isinstance(item, dict):
+                item = item.get('tag_name') or item.get('name') or ''
+            tag = str(item).strip()
+            if tag:
+                tags.append(tag)
+        return tags
+    return []
+
+
+def _extract_incoming_task_tags(task_data: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Build the assignment tag list from top-level tags, _meta.tags, and Task_Category.
+    Task_Category (HEAVY, EV Scooter, etc.) is how the dashboard marks tagged tasks.
+    """
+    meta = meta or {}
+    tags = _normalize_tag_list(task_data.get('tags'))
+    tags.extend(_normalize_tag_list(meta.get('tags')))
+
+    custom_fields = task_data.get('custom_fields') or meta.get('custom_fields') or {}
+    if isinstance(custom_fields, dict):
+        category = custom_fields.get('Task_Category') or custom_fields.get('task_category')
+        if isinstance(category, str) and category.strip():
+            tags.append(category.strip())
+        tags.extend(_normalize_tag_list(custom_fields.get('tags')))
+
+    seen = set()
+    deduped = []
+    for tag in tags:
+        key = tag.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(tag)
+    return deduped
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1222,8 +1268,8 @@ class FleetState:
             assigned_agent = str(assigned_agent_raw) if assigned_agent_raw else None
             status = TaskStatus.ASSIGNED if assigned_agent else TaskStatus.UNASSIGNED
             
-            # Parse business rule fields
-            tags = task_data.get('tags', [])
+            # Parse business rule fields (include Task_Category so HEAVY/etc. match)
+            tags = _extract_incoming_task_tags(task_data, meta)
             payment_method = task_data.get('payment_method', 'card')
             delivery_fee = float(task_data.get('delivery_fee', 0))
             tips = float(task_data.get('tips', 0))
@@ -1726,79 +1772,26 @@ class FleetState:
             if agent.wallet_balance > self.wallet_threshold:
                 return f"wallet_too_high ({agent.wallet_balance:.2f} > {self.wallet_threshold:.2f})"
         
-        # 6. Non-scooter geofence region restriction
-        # If task is in a non-scooter region AND at least one region agent is online:
-        #   - Only agents assigned to that region may be considered
-        #   - Distance constraints are bypassed for those region-matched agents
-        # If no region agents are online, or task is in no region: fallback to global rules
-        skip_distance_for_region = False
-        task_region = self._get_task_region(task)
-        if task_region and not task_region['is_scooter']:
-            region_id = task_region['id']
-            online_region_agents = self._get_online_region_agents(region_id)
-            if online_region_agents:
-                # Region is staffed -> restrict to region agents
-                if agent.id not in online_region_agents:
-                    return f"not_in_task_region ({task_region['name']})"
-                else:
-                    # Agent IS in region -> bypass distance
-                    skip_distance_for_region = True
-                    logger.info(
-                        f"[Geofence] task={task.id[:20]} region={task_region['name']} "
-                        f"region_agents_online={len(online_region_agents)} "
-                        f"agent={agent.name} region_matched=True distance_bypass=True"
-                    )
-            else:
-                # No region agents online -> fallback to normal rules
-                logger.info(
-                    f"[Geofence] task={task.id[:20]} region={task_region['name']} "
-                    f"region_agents_online=0 fallback=global_rules"
-                )
-        
-        # 6b. Reverse geofence: Region agents can ONLY get tasks in their region
-        # If an agent is assigned to a non-scooter geofence region, they must only
-        # receive tasks that are within that region. This prevents region-locked agents
-        # from being assigned tasks outside their designated area.
-        if not skip_distance_for_region:
-            agent_regions = self._get_agent_regions(agent)
-            if agent_regions:
-                # Agent is assigned to at least one non-scooter region
-                task_in_agent_region = False
-                if task_region and not task_region['is_scooter']:
-                    for ar in agent_regions:
-                        if ar['id'] == task_region['id']:
-                            task_in_agent_region = True
-                            break
-                
-                if not task_in_agent_region:
-                    region_names = ', '.join(ar['name'] for ar in agent_regions)
-                    logger.info(
-                        f"[Geofence] REVERSE BLOCK: agent={agent.name} ({agent.id}) "
-                        f"is assigned to region(s) [{region_names}] but task={task.id[:20]} "
-                        f"is NOT in any of those regions"
-                    )
-                    return f"agent_restricted_to_region ({region_names})"
-        
-        # 6c. Scooter region restriction: Scooter agents can only take tasks where
-        # BOTH pickup AND delivery are fully within their scooter region.
-        # Unlike traditional regions, scooter regions don't block other agents —
-        # they only prevent scooter agents from leaving their designated area.
-        scooter_regions = self._get_agent_scooter_regions(agent)
-        if scooter_regions:
-            task_fully_in_scooter_region = False
-            for sr in scooter_regions:
-                if self._is_task_fully_within_scooter_region(task, sr['id']):
-                    task_fully_in_scooter_region = True
-                    break
-            
-            if not task_fully_in_scooter_region:
-                region_names = ', '.join(sr['name'] for sr in scooter_regions)
-                logger.info(
-                    f"[Geofence] SCOOTER BLOCK: agent={agent.name} ({agent.id}) "
-                    f"is assigned to scooter region(s) [{region_names}] but task={task.id[:20]} "
-                    f"pickup and/or delivery is outside those regions"
-                )
-                return f"agent_restricted_to_scooter_region ({region_names})"
+        # 6. Shared region policy: overlap union, Region-first precedence/fallback,
+        # route coverage, and subscribed-agent reverse locks.
+        online_agent_ids = [
+            agent_id for agent_id, current_agent in self._agents.items()
+            if current_agent.is_online
+        ]
+        region_decision = evaluate_region_eligibility(
+            agent.id, task, self._geofences.values(), online_agent_ids
+        )
+        if not region_decision['eligible']:
+            matched_names = ', '.join(
+                region['name'] for region in region_decision['matching_regions']
+            )
+            logger.info(
+                f"[Geofence] BLOCK: agent={agent.name} ({agent.id}) "
+                f"task={task.id[:20]} reason={region_decision['reason']} "
+                f"matched=[{matched_names}]"
+            )
+            return region_decision['reason']
+        skip_distance_for_region = region_decision['distance_bypass']
         
         # 7. Check max distance (using current or projected location)
         # Priority 1 agents BYPASS distance for premium tasks (but NOT direction check!)
@@ -1933,75 +1926,9 @@ class FleetState:
         else:  # -67.5 <= angle < -22.5
             return "NW"
     
-    def _get_task_region(self, task: 'TaskState') -> Optional[Dict[str, Any]]:
-        """
-        Determine which non-scooter geofence region a task belongs to.
-        
-        Checks BOTH pickup (restaurant) and delivery locations.
-        - If both are in different regions, pickup region takes priority.
-        - If only one location is in a region, use that region.
-        - If neither is in a region, return None.
-        - Scooter regions (name contains 'scooter') are excluded from non-scooter logic.
-        
-        Returns: {'id': str, 'name': str, 'is_scooter': bool} or None
-        """
-        if not self._geofences:
-            return None
-        
-        pickup_region = None
-        delivery_region = None
-        
-        for gf in self._geofences.values():
-            polygon = gf.get('polygon', [])
-            if not polygon:
-                continue
-            
-            region_name = gf.get('name', '')
-            is_scooter = 'scooter' in region_name.lower()
-            region_info = {'id': gf['id'], 'name': region_name, 'is_scooter': is_scooter}
-            
-            # Check pickup location
-            if pickup_region is None and task.restaurant_location and self._point_in_polygon(
-                task.restaurant_location.lat, task.restaurant_location.lng, polygon
-            ):
-                pickup_region = region_info
-            
-            # Check delivery location
-            if delivery_region is None and task.delivery_location and self._point_in_polygon(
-                task.delivery_location.lat, task.delivery_location.lng, polygon
-            ):
-                delivery_region = region_info
-        
-        # Priority: pickup region first, then delivery region
-        if pickup_region and not pickup_region['is_scooter']:
-            return pickup_region
-        if delivery_region and not delivery_region['is_scooter']:
-            return delivery_region
-        # If only scooter regions matched, return None for non-scooter logic
-        return None
-
-    def _is_task_fully_within_scooter_region(self, task: 'TaskState', region_id: str) -> bool:
-        """
-        Check if BOTH pickup and delivery locations are within the given scooter region.
-        Scooter agents can only take tasks where the entire trip stays in their region.
-        """
-        gf = self._geofences.get(region_id)
-        if not gf:
-            return False
-        polygon = gf.get('polygon', [])
-        if not polygon:
-            return False
-        
-        pickup_inside = (
-            task.restaurant_location and
-            self._point_in_polygon(task.restaurant_location.lat, task.restaurant_location.lng, polygon)
-        )
-        delivery_inside = (
-            task.delivery_location and
-            self._point_in_polygon(task.delivery_location.lat, task.delivery_location.lng, polygon)
-        )
-        
-        return pickup_inside and delivery_inside
+    def _get_task_regions(self, task: 'TaskState') -> List[Dict[str, Any]]:
+        """Return every policy-matching region for the task."""
+        return matching_regions(task, self._geofences.values())
 
     def _get_online_region_agents(self, region_id: str) -> List[str]:
         """
@@ -2023,44 +1950,18 @@ class FleetState:
         return online_ids
     
     def _get_agent_regions(self, agent: 'AgentState') -> List[Dict[str, Any]]:
-        """
-        Get list of non-scooter geofence regions this agent is assigned to.
-
-        Checks all geofences' agent_ids to find which regions include this agent.
-        Returns list of {'id': str, 'name': str} for non-scooter regions only.
-        Returns empty list if agent is not in any non-scooter region.
-        """
+        """Get every policy region this agent is subscribed to."""
         if not self._geofences:
             return []
         
         regions = []
         agent_id_str = str(agent.id)
-        for gf_id, gf in self._geofences.items():
-            region_name = gf.get('name', '')
-            if 'scooter' in region_name.lower():
-                continue
-            if agent_id_str in gf.get('agent_ids', set()):
-                regions.append({'id': gf_id, 'name': region_name})
+        for gf in self._geofences.values():
+            normalized = normalize_region(gf)
+            if agent_id_str in normalized['agent_ids']:
+                regions.append(normalized)
         return regions
 
-    def _get_agent_scooter_regions(self, agent: 'AgentState') -> List[Dict[str, Any]]:
-        """
-        Get list of scooter geofence regions this agent is assigned to.
-        Returns list of {'id': str, 'name': str} for scooter regions only.
-        """
-        if not self._geofences:
-            return []
-        
-        regions = []
-        agent_id_str = str(agent.id)
-        for gf_id, gf in self._geofences.items():
-            region_name = gf.get('name', '')
-            if 'scooter' not in region_name.lower():
-                continue
-            if agent_id_str in gf.get('agent_ids', set()):
-                regions.append({'id': gf_id, 'name': region_name})
-        return regions
-    
     def _point_in_polygon(self, lat: float, lng: float, polygon: List[List[float]]) -> bool:
         """
         Ray casting algorithm to check if point is inside polygon.
@@ -2457,18 +2358,16 @@ class FleetState:
             if not geofences_data:
                 logger.info("[FleetState] sync_geofences called with empty list - preserving existing geofences")
                 return
-            
-            self._geofences.clear()
-            
+
+            # Validate and normalize the entire payload before replacing live state.
+            next_geofences = {}
             for gf_data in geofences_data:
-                gf_id = str(gf_data.get('id', ''))
+                normalized = normalize_region(gf_data)
+                gf_id = normalized['id']
                 if gf_id:
-                    self._geofences[gf_id] = {
-                        'id': gf_id,
-                        'name': gf_data.get('name', ''),
-                        'polygon': gf_data.get('polygon', []),
-                        'agent_ids': set(str(a) for a in gf_data.get('agent_ids', []))
-                    }
+                    next_geofences[gf_id] = normalized
+
+            self._geofences = next_geofences
             
             logger.info(f"[FleetState] Synced {len(self._geofences)} geofences")
     
@@ -2933,11 +2832,14 @@ class FleetState:
                     'id': gf.get('id', ''),
                     'name': gf.get('name', ''),
                     'polygon': gf.get('polygon', []),
-                    'agent_ids': list(gf.get('agent_ids', []))
+                    'agent_ids': list(gf.get('agent_ids', [])),
+                    'sharing_mode': gf.get('sharing_mode'),
+                    'route_coverage': gf.get('route_coverage')
                 })
             
             return {
                 'agents': agents_list,
+                'online_agent_ids': [agent.id for agent in self._agents.values() if agent.is_online],
                 'geofence_data': geofence_data,
                 'settings_used': {
                     'walletNoCashThreshold': self.wallet_threshold,
@@ -3017,4 +2919,3 @@ fleet_state = FleetState(
     max_lateness_minutes=45,  # Reject assignments that would cause >45min late deliveries
     max_pickup_delay_minutes=60  # Reject if pickup would be >60min after food ready
 )
-

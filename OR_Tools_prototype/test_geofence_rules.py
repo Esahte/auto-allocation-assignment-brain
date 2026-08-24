@@ -133,8 +133,8 @@ def _make_task(task_id: str, pickup: Location, delivery: Location,
 # FleetState tests
 # ===========================================================================
 
-class TestGetTaskRegion(unittest.TestCase):
-    """Test FleetState._get_task_region()"""
+class TestGetTaskRegions(unittest.TestCase):
+    """Test FleetState returns the full policy match union."""
 
     def setUp(self):
         self.fs = _make_fleet_state()
@@ -160,47 +160,39 @@ class TestGetTaskRegion(unittest.TestCase):
         }
 
     def test_pickup_in_region(self):
-        """Pickup is in Kingston, delivery outside -> returns Kingston region."""
+        """Any-endpoint coverage matches pickup in Kingston."""
         task = _make_task('t1', LOC_IN_KINGSTON, LOC_OUTSIDE)
-        result = self.fs._get_task_region(task)
-        self.assertIsNotNone(result)
-        self.assertEqual(result['id'], 'region_kgn')
-        self.assertFalse(result['is_scooter'])
+        result = self.fs._get_task_regions(task)
+        self.assertEqual([region['id'] for region in result], ['region_kgn'])
 
     def test_delivery_in_region(self):
         """Pickup outside, delivery in Kingston -> returns Kingston region."""
         task = _make_task('t2', LOC_OUTSIDE, LOC_IN_KINGSTON)
-        result = self.fs._get_task_region(task)
-        self.assertIsNotNone(result)
-        self.assertEqual(result['id'], 'region_kgn')
+        result = self.fs._get_task_regions(task)
+        self.assertEqual([region['id'] for region in result], ['region_kgn'])
 
-    def test_both_in_different_regions_pickup_priority(self):
-        """Pickup in Kingston, delivery in MoBay -> pickup region (Kingston) wins."""
+    def test_both_in_different_regions_form_union(self):
+        """Pickup in Kingston and delivery in MoBay match both regions."""
         task = _make_task('t3', LOC_IN_KINGSTON, LOC_IN_MOBAY)
-        result = self.fs._get_task_region(task)
-        self.assertIsNotNone(result)
-        self.assertEqual(result['id'], 'region_kgn')
+        result = self.fs._get_task_regions(task)
+        self.assertEqual(
+            {region['id'] for region in result},
+            {'region_kgn', 'region_mobay'},
+        )
 
     def test_neither_in_region(self):
-        """Both locations outside all regions -> returns None."""
+        """Both locations outside all regions returns an empty match set."""
         task = _make_task('t4', LOC_OUTSIDE, LOC_OUTSIDE)
-        result = self.fs._get_task_region(task)
-        self.assertIsNone(result)
+        self.assertEqual(self.fs._get_task_regions(task), [])
 
-    def test_scooter_region_excluded(self):
-        """Location only in scooter region -> returns None (scooter excluded from non-scooter logic)."""
+    def test_entire_route_region_does_not_match_partial_route(self):
+        """Legacy scooter defaults map to entire-route without special runtime logic."""
         task = _make_task('t5', LOC_IN_SCOOTER, LOC_OUTSIDE)
-        # LOC_IN_SCOOTER is inside both Kingston and Scooter regions
-        # Kingston is non-scooter, so it should match Kingston first
-        result = self.fs._get_task_region(task)
-        # Since LOC_IN_SCOOTER (18.02, -76.78) is inside Kingston polygon too, 
-        # it should return the non-scooter Kingston region
-        self.assertIsNotNone(result)
-        self.assertFalse(result['is_scooter'])
+        result = self.fs._get_task_regions(task)
+        self.assertEqual([region['id'] for region in result], ['region_kgn'])
 
     def test_only_scooter_region(self):
-        """Location ONLY in scooter region (and no other) -> returns None."""
-        # Clear non-scooter regions so only scooter region remains
+        """An entire-route region alone does not match a route leaving it."""
         self.fs._geofences = {
             'region_scooter': {
                 'id': 'region_scooter',
@@ -210,15 +202,13 @@ class TestGetTaskRegion(unittest.TestCase):
             },
         }
         task = _make_task('t6', LOC_IN_SCOOTER, LOC_OUTSIDE)
-        result = self.fs._get_task_region(task)
-        self.assertIsNone(result)
+        self.assertEqual(self.fs._get_task_regions(task), [])
 
     def test_no_geofences(self):
-        """No geofences loaded -> returns None."""
+        """No geofences loaded returns no matches."""
         self.fs._geofences = {}
         task = _make_task('t7', LOC_IN_KINGSTON, LOC_IN_KINGSTON)
-        result = self.fs._get_task_region(task)
-        self.assertIsNone(result)
+        self.assertEqual(self.fs._get_task_regions(task), [])
 
 
 class TestGetOnlineRegionAgents(unittest.TestCase):
@@ -378,9 +368,8 @@ class TestDeliveryOnlyRegion(unittest.TestCase):
     def test_delivery_only_in_region(self):
         """DELIVERY_ONLY task with delivery in Kingston -> region restricted."""
         task = _make_task('t1', LOC_OUTSIDE, LOC_IN_KINGSTON, job_type='DELIVERY_ONLY')
-        result = self.fs._get_task_region(task)
-        self.assertIsNotNone(result)
-        self.assertEqual(result['id'], 'region_kgn')
+        result = self.fs._get_task_regions(task)
+        self.assertEqual([region['id'] for region in result], ['region_kgn'])
 
 
 class TestMultipleRegionAgent(unittest.TestCase):
@@ -439,8 +428,9 @@ class TestGeofenceRegionFromDict(unittest.TestCase):
         self.assertEqual(gf.region_id, 42)
         self.assertEqual(gf.region_name, 'Kingston Zone')
         self.assertEqual(len(gf.polygon), 4)
-        self.assertEqual(gf.fleet_ids, ['a1', 'a2'])
-        self.assertFalse(gf.is_scooter)
+        self.assertCountEqual(gf.fleet_ids, ['a1', 'a2'])
+        self.assertEqual(gf.sharing_mode, 'region_first')
+        self.assertEqual(gf.route_coverage, 'any_endpoint')
 
     def test_new_format(self):
         data = {
@@ -452,10 +442,11 @@ class TestGeofenceRegionFromDict(unittest.TestCase):
         gf = GeofenceRegion.from_dict(data)
         self.assertEqual(gf.region_id, 99)
         self.assertEqual(gf.region_name, 'Montego Bay')
-        self.assertEqual(gf.fleet_ids, ['101', '102'])
-        self.assertFalse(gf.is_scooter)
+        self.assertCountEqual(gf.fleet_ids, ['101', '102'])
+        self.assertEqual(gf.sharing_mode, 'region_first')
+        self.assertEqual(gf.route_coverage, 'any_endpoint')
 
-    def test_scooter_detection(self):
+    def test_legacy_missing_fields_seed_scooter_behavior(self):
         data = {
             'id': 5,
             'name': 'Scooter Zone Kingston',
@@ -463,7 +454,8 @@ class TestGeofenceRegionFromDict(unittest.TestCase):
             'agent_ids': ['a4'],
         }
         gf = GeofenceRegion.from_dict(data)
-        self.assertTrue(gf.is_scooter)
+        self.assertEqual(gf.sharing_mode, 'open_access')
+        self.assertEqual(gf.route_coverage, 'entire_route')
 
 
 class TestOptimizerNonScooterGeofence(unittest.TestCase):
@@ -610,7 +602,7 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
         )
         is_compat, reason = checker.is_compatible(scooter_agent, task)
         self.assertFalse(is_compat)
-        self.assertIn('outside_scooter_geofence', reason)
+        self.assertIn('agent_restricted_to_region', reason)
 
     def test_scooter_region_allows_trip_inside_zone(self):
         """Agent in a scooter region -> trip staying fully inside is compatible."""
@@ -666,8 +658,8 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
         is_compat, reason = checker.is_compatible(self.agent_outside, task)
         self.assertTrue(is_compat, f"Expected compatible, got: {reason}")
 
-    def test_pickup_region_priority_over_delivery(self):
-        """Pickup in Kingston, delivery in MoBay -> Kingston region used."""
+    def test_cross_region_route_uses_union_of_subscribers(self):
+        """Pickup in Kingston and delivery in MoBay permits both subscriber pools."""
         checker = self._make_checker(
             geofence_regions=[self.kgn_geofence, self.mobay_geofence],
             max_distance_km=50.0,
@@ -679,14 +671,12 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
             OptimizerLocation(18.03, -76.77),  # Inside Kingston
             OptimizerLocation(18.47, -77.92),   # Inside MoBay
         )
-        # Kingston agent should be compatible (pickup region = Kingston)
+        # Both endpoint regions participate in the permitted member union.
         is_compat_kgn, reason_kgn = checker.is_compatible(self.agent_in_kgn, task)
         self.assertTrue(is_compat_kgn, f"Expected Kingston agent compatible, got: {reason_kgn}")
-        
-        # MoBay agent should be blocked (not in Kingston region)
+
         is_compat_mobay, reason_mobay = checker.is_compatible(self.agent_in_mobay, task)
-        self.assertFalse(is_compat_mobay)
-        self.assertIn('not_in_task_region', reason_mobay)
+        self.assertTrue(is_compat_mobay, f"Expected MoBay agent compatible, got: {reason_mobay}")
 
 
 # ===========================================================================
